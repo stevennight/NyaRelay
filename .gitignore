@@ -1,0 +1,11 @@
+.gocache/
+.npm-cache/
+bin/
+data/
+node-data/
+dist/
+node_modules/
+*.tsbuildinfo
+*.db
+*.db-shm
+*.db-wal

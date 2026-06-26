@@ -1,0 +1,10 @@
+.git
+.idea
+.agents
+.gocache
+.npm-cache
+.tmp-webdist
+bin
+web/app/node_modules
+web/app/.vite
+**/*.log

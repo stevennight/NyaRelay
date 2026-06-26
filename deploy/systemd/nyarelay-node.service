@@ -1,0 +1,19 @@
+[Unit]
+Description=NyaRelay node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/nyarelay/node.env
+ExecStart=/usr/local/bin/nyarelay-node
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/nyarelay
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,17 @@
+services:
+  controller:
+    build:
+      context: ../..
+    container_name: nyarelay-controller
+    restart: unless-stopped
+    environment:
+      NYARELAY_LISTEN: ":8080"
+      NYARELAY_DATA: "/data"
+      NYARELAY_PUBLIC_URL: "https://relay.example.com"
+    volumes:
+      - nyarelay-data:/data
+    ports:
+      - "127.0.0.1:8080:8080"
+
+volumes:
+  nyarelay-data:
