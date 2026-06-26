@@ -1,0 +1,171 @@
+package controller
+
+import (
+	"fmt"
+	"strings"
+
+	"nyarelay/internal/shared/model"
+)
+
+type NodeInstallInfo struct {
+	Node      model.Node `json:"node"`
+	Token     string     `json:"token"`
+	ScriptURL string     `json:"script_url,omitempty"`
+	BinaryURL string     `json:"binary_url,omitempty"`
+	Command   string     `json:"command,omitempty"`
+}
+
+func buildNodeInstallInfo(controllerURL, signingKey string, node model.Node, token string) NodeInstallInfo {
+	return NodeInstallInfo{
+		Node:      node,
+		Token:     token,
+		ScriptURL: installScriptURL(controllerURL),
+		BinaryURL: nodeBinaryURL(controllerURL),
+		Command:   installCommand(controllerURL, node.ID, token, signingKey),
+	}
+}
+
+func installScript() string {
+	return strings.TrimLeft(`#!/bin/sh
+set -eu
+
+controller=""
+node_id=""
+node_token=""
+signing_key=""
+
+usage() {
+	cat <<'EOF'
+Usage: install.sh --controller https://relay.example.com --id node_x --token token_x --signing-key controller_public_key
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		--controller)
+			controller="${2:-}"
+			shift 2
+			;;
+		--id|--node-id)
+			node_id="${2:-}"
+			shift 2
+			;;
+		--token)
+			node_token="${2:-}"
+			shift 2
+			;;
+		--signing-key)
+			signing_key="${2:-}"
+			shift 2
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+		*)
+			echo "unknown argument: $1" >&2
+			usage >&2
+			exit 1
+			;;
+	esac
+done
+
+if [ -z "$controller" ] || [ -z "$node_id" ] || [ -z "$node_token" ] || [ -z "$signing_key" ]; then
+	echo "missing required arguments" >&2
+	usage >&2
+	exit 1
+fi
+
+if [ "$(id -u)" -ne 0 ]; then
+	echo "please run as root" >&2
+	exit 1
+fi
+
+command -v curl >/dev/null 2>&1 || { echo "curl is required" >&2; exit 1; }
+command -v systemctl >/dev/null 2>&1 || { echo "systemd is required" >&2; exit 1; }
+
+tmpdir="$(mktemp -d)"
+trap 'rm -rf "$tmpdir"' EXIT
+
+binary_url="${controller%/}/downloads/nyarelay-node"
+curl -fsSL "$binary_url" -o "$tmpdir/nyarelay-node"
+install -m 0755 "$tmpdir/nyarelay-node" /usr/local/bin/nyarelay-node
+
+install -d -m 0755 /etc/nyarelay
+install -d -m 0755 /var/lib/nyarelay
+
+cat > /etc/nyarelay/node.env <<EOF
+NYARELAY_CONTROLLER=$controller
+NYARELAY_NODE_ID=$node_id
+NYARELAY_NODE_TOKEN=$node_token
+NYARELAY_SIGNING_KEY=$signing_key
+NYARELAY_DATA=/var/lib/nyarelay
+NYARELAY_LOG_LEVEL=info
+EOF
+chmod 600 /etc/nyarelay/node.env
+
+cat > /etc/systemd/system/nyarelay-node.service <<'EOF'
+[Unit]
+Description=NyaRelay node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/nyarelay/node.env
+ExecStart=/usr/local/bin/nyarelay-node
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/nyarelay
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now nyarelay-node
+echo "nyarelay node installed"
+`, "\n")
+}
+
+func installCommand(controllerURL, nodeID, token, signingKey string) string {
+	controllerURL = strings.TrimRight(controllerURL, "/")
+	if controllerURL == "" {
+		return ""
+	}
+	return fmt.Sprintf(
+		"curl -fsSL %s | sudo sh -s -- --controller %s --id %s --token %s --signing-key %s",
+		shellQuote(installScriptURL(controllerURL)),
+		shellQuote(controllerURL),
+		shellQuote(nodeID),
+		shellQuote(token),
+		shellQuote(signingKey),
+	)
+}
+
+func installScriptURL(controllerURL string) string {
+	controllerURL = strings.TrimRight(controllerURL, "/")
+	if controllerURL == "" {
+		return "/install.sh"
+	}
+	return controllerURL + "/install.sh"
+}
+
+func nodeBinaryURL(controllerURL string) string {
+	controllerURL = strings.TrimRight(controllerURL, "/")
+	if controllerURL == "" {
+		return "/downloads/nyarelay-node"
+	}
+	return controllerURL + "/downloads/nyarelay-node"
+}
+
+func shellQuote(value string) string {
+	if value == "" {
+		return "''"
+	}
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}

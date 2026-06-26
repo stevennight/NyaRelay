@@ -32,7 +32,7 @@ const emptyRouteForm = (): RouteForm => ({
   name: '',
   protocol: 'tcp',
   entry_node: '',
-  listen: '0.0.0.0:8443',
+  listen: '',
   target: '',
   enabled: true,
 })
@@ -192,6 +192,10 @@ function RouteEditor({
     queryKey: ['links'],
     queryFn: () => api<LinkInfo[]>('/api/links'),
   })
+  const activeNodes = useMemo(
+    () => (nodesQuery.data ?? []).filter((node) => !node.revoked),
+    [nodesQuery.data],
+  )
   const [form, setForm] = useState<RouteForm>(emptyRouteForm())
   const [hopIds, setHopIds] = useState<string[]>([])
   const [selectedHop, setSelectedHop] = useState('')
@@ -231,6 +235,10 @@ function RouteEditor({
     () => hopIds.map((id) => (linksQuery.data ?? []).find((link) => link.id === id)).filter(Boolean) as LinkInfo[],
     [hopIds, linksQuery.data],
   )
+  const selectedNode = useMemo(
+    () => activeNodes.find((node) => node.id === form.entry_node),
+    [activeNodes, form.entry_node],
+  )
 
   return (
     <form
@@ -263,7 +271,7 @@ function RouteEditor({
             onChange={(event) => setForm((current) => ({ ...current, entry_node: event.target.value }))}
           >
             <option value="">选择节点</option>
-            {(nodesQuery.data ?? []).map((node) => (
+            {activeNodes.map((node) => (
               <option key={node.id} value={node.id}>
                 {node.name}
               </option>
@@ -274,6 +282,7 @@ function RouteEditor({
           <input
             value={form.listen}
             onChange={(event) => setForm((current) => ({ ...current, listen: event.target.value }))}
+            placeholder="留空自动分配，如 0.0.0.0:10000"
           />
         </Field>
         <Field label="目标地址">
@@ -314,6 +323,18 @@ function RouteEditor({
           </div>
         </Field>
       </FieldGrid>
+      {selectedNode ? (
+        <Panel>
+          <h2>入口信息</h2>
+          <DetailGrid
+            items={[
+              { label: '公开入口', value: selectedNode.public_host || selectedNode.system?.ip || '-' },
+              { label: '可用端口范围', value: `${selectedNode.port_min ?? 10000}-${selectedNode.port_max ?? 65535}` },
+              { label: '监听策略', value: initialRoute ? '编辑时默认保留原端口，可手动修改。' : '新建时留空会自动分配未占用端口。' },
+            ]}
+          />
+        </Panel>
+      ) : null}
       <Panel>
         <h2>当前跳点</h2>
         {selectedLinks.length === 0 ? (

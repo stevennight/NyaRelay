@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -65,6 +66,9 @@ func (s *Store) migrate(ctx context.Context) error {
 			status TEXT NOT NULL,
 			version TEXT NOT NULL DEFAULT '',
 			labels_json TEXT NOT NULL DEFAULT '{}',
+			public_host TEXT NOT NULL DEFAULT '',
+			port_min INTEGER NOT NULL DEFAULT 10000,
+			port_max INTEGER NOT NULL DEFAULT 65535,
 			approved INTEGER NOT NULL DEFAULT 1,
 			revoked INTEGER NOT NULL DEFAULT 0,
 			last_seen TEXT NOT NULL DEFAULT '',
@@ -122,7 +126,51 @@ func (s *Store) migrate(ctx context.Context) error {
 			return err
 		}
 	}
+	return s.ensureNodeColumns(ctx)
+}
+
+func (s *Store) ensureNodeColumns(ctx context.Context) error {
+	columns, err := s.tableColumns(ctx, "nodes")
+	if err != nil {
+		return err
+	}
+	if !columns["public_host"] {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE nodes ADD COLUMN public_host TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	if !columns["port_min"] {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE nodes ADD COLUMN port_min INTEGER NOT NULL DEFAULT 10000`); err != nil {
+			return err
+		}
+	}
+	if !columns["port_max"] {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE nodes ADD COLUMN port_max INTEGER NOT NULL DEFAULT 65535`); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func (s *Store) tableColumns(ctx context.Context, table string) (map[string]bool, error) {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	columns := make(map[string]bool)
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notNull int
+		var dflt any
+		var pk int
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
+			return nil, err
+		}
+		columns[name] = true
+	}
+	return columns, rows.Err()
 }
 
 func (s *Store) UserCount(ctx context.Context) (int, error) {
@@ -190,6 +238,23 @@ func (s *Store) GetSetting(ctx context.Context, key string) (string, bool, error
 	return value, true, nil
 }
 
+func (s *Store) SettingsPrefix(ctx context.Context, prefix string) (map[string]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT key, value FROM settings WHERE key LIKE ?`, prefix+"%")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]string)
+	for rows.Next() {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
+			return nil, err
+		}
+		out[key] = value
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) SetSetting(ctx context.Context, key, value string) error {
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO settings (key, value) VALUES (?, ?)
@@ -204,6 +269,7 @@ func (s *Store) UpsertNode(ctx context.Context, node model.Node, token string) e
 	if node.CreatedAt.IsZero() {
 		node.CreatedAt = now
 	}
+	normalizeNodePorts(&node)
 	node.UpdatedAt = now
 	labels, _ := json.Marshal(emptyMap(node.Labels))
 	system, _ := json.Marshal(node.System)
@@ -213,23 +279,44 @@ func (s *Store) UpsertNode(ctx context.Context, node model.Node, token string) e
 	}
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO nodes
-		 (id, name, token, status, version, labels_json, approved, revoked, last_seen, created_at, updated_at, system_json)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 (id, name, token, status, version, labels_json, public_host, port_min, port_max, approved, revoked, last_seen, created_at, updated_at, system_json)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET
 		   name = excluded.name,
 		   status = excluded.status,
 		   version = excluded.version,
 		   labels_json = excluded.labels_json,
+		   public_host = excluded.public_host,
+		   port_min = excluded.port_min,
+		   port_max = excluded.port_max,
 		   approved = excluded.approved,
 		   revoked = excluded.revoked,
 		   last_seen = excluded.last_seen,
 		   updated_at = excluded.updated_at,
 		   system_json = excluded.system_json`,
-		node.ID, node.Name, token, string(node.Status), node.Version, string(labels),
+		node.ID, node.Name, token, string(node.Status), node.Version, string(labels), node.PublicHost, node.PortMin, node.PortMax,
 		boolInt(node.Approved), boolInt(node.Revoked), lastSeen,
 		node.CreatedAt.UTC().Format(time.RFC3339Nano), node.UpdatedAt.UTC().Format(time.RFC3339Nano), string(system),
 	)
 	return err
+}
+
+func (s *Store) UpdateNode(ctx context.Context, node model.Node) error {
+	now := time.Now().UTC()
+	normalizeNodePorts(&node)
+	node.UpdatedAt = now
+	labels, _ := json.Marshal(emptyMap(node.Labels))
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE nodes SET name = ?, labels_json = ?, public_host = ?, port_min = ?, port_max = ?, updated_at = ? WHERE id = ? AND revoked = 0`,
+		node.Name, string(labels), node.PublicHost, node.PortMin, node.PortMax, node.UpdatedAt.UTC().Format(time.RFC3339Nano), node.ID,
+	)
+	if err != nil {
+		return err
+	}
+	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
+		return errors.New("node not found")
+	}
+	return nil
 }
 
 func (s *Store) AuthenticateNode(ctx context.Context, id, token string) (model.Node, error) {
@@ -245,7 +332,7 @@ func (s *Store) AuthenticateNode(ctx context.Context, id, token string) (model.N
 
 func (s *Store) GetNodeWithToken(ctx context.Context, id string) (model.Node, string, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, name, token, status, version, labels_json, approved, revoked, last_seen, created_at, updated_at, system_json
+		`SELECT id, name, token, status, version, labels_json, public_host, port_min, port_max, approved, revoked, last_seen, created_at, updated_at, system_json
 		 FROM nodes WHERE id = ?`, id,
 	)
 	return scanNode(row)
@@ -253,8 +340,8 @@ func (s *Store) GetNodeWithToken(ctx context.Context, id string) (model.Node, st
 
 func (s *Store) ListNodes(ctx context.Context) ([]model.Node, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, name, token, status, version, labels_json, approved, revoked, last_seen, created_at, updated_at, system_json
-		 FROM nodes ORDER BY created_at DESC`,
+		`SELECT id, name, token, status, version, labels_json, public_host, port_min, port_max, approved, revoked, last_seen, created_at, updated_at, system_json
+		 FROM nodes WHERE revoked = 0 ORDER BY created_at DESC`,
 	)
 	if err != nil {
 		return nil, err
@@ -273,7 +360,7 @@ func (s *Store) ListNodes(ctx context.Context) ([]model.Node, error) {
 
 func (s *Store) GetNode(ctx context.Context, id string) (model.Node, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, name, token, status, version, labels_json, approved, revoked, last_seen, created_at, updated_at, system_json
+		`SELECT id, name, token, status, version, labels_json, public_host, port_min, port_max, approved, revoked, last_seen, created_at, updated_at, system_json
 		 FROM nodes WHERE id = ?`, id,
 	)
 	node, _, err := scanNode(row)
@@ -410,6 +497,45 @@ func (s *Store) ListRoutes(ctx context.Context) ([]model.Route, error) {
 		out = append(out, route)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) NodePortUsage(ctx context.Context, nodeID, excludeRouteID string) (map[string]bool, error) {
+	used := make(map[string]bool)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, listen FROM routes WHERE enabled = 1 AND entry_node = ?`, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, listen string
+		if err := rows.Scan(&id, &listen); err != nil {
+			return nil, err
+		}
+		if excludeRouteID != "" && id == excludeRouteID {
+			continue
+		}
+		if _, port, err := net.SplitHostPort(listen); err == nil {
+			used[port] = true
+		}
+	}
+	linkRows, err := s.db.QueryContext(ctx, `SELECT bind_addr FROM links WHERE enabled = 1 AND to_node = ?`, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	defer linkRows.Close()
+	for linkRows.Next() {
+		var bindAddr string
+		if err := linkRows.Scan(&bindAddr); err != nil {
+			return nil, err
+		}
+		if _, port, err := net.SplitHostPort(bindAddr); err == nil {
+			used[port] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return used, linkRows.Err()
 }
 
 func (s *Store) GetRoute(ctx context.Context, id string) (model.Route, error) {
@@ -554,13 +680,17 @@ type scanner interface {
 
 func scanNode(row scanner) (model.Node, string, error) {
 	var node model.Node
-	var token, status, labelsJSON, lastSeen, created, updated, systemJSON string
+	var token, status, labelsJSON, publicHost, lastSeen, created, updated, systemJSON string
+	var portMin, portMax int
 	var approved, revoked int
-	err := row.Scan(&node.ID, &node.Name, &token, &status, &node.Version, &labelsJSON, &approved, &revoked, &lastSeen, &created, &updated, &systemJSON)
+	err := row.Scan(&node.ID, &node.Name, &token, &status, &node.Version, &labelsJSON, &publicHost, &portMin, &portMax, &approved, &revoked, &lastSeen, &created, &updated, &systemJSON)
 	if err != nil {
 		return model.Node{}, "", err
 	}
 	node.Status = model.NodeStatus(status)
+	node.PublicHost = publicHost
+	node.PortMin = portMin
+	node.PortMax = portMax
 	node.Approved = approved == 1
 	node.Revoked = revoked == 1
 	node.LastSeen = parseTime(lastSeen)
@@ -569,6 +699,20 @@ func scanNode(row scanner) (model.Node, string, error) {
 	_ = json.Unmarshal([]byte(labelsJSON), &node.Labels)
 	_ = json.Unmarshal([]byte(systemJSON), &node.System)
 	return node, token, nil
+}
+
+func normalizeNodePorts(node *model.Node) {
+	if node.PortMin <= 0 && node.PortMax <= 0 {
+		node.PortMin = 10000
+		node.PortMax = 65535
+		return
+	}
+	if node.PortMin <= 0 {
+		node.PortMin = 10000
+	}
+	if node.PortMax <= 0 {
+		node.PortMax = 65535
+	}
 }
 
 func scanLink(row scanner) (model.Link, error) {

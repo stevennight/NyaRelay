@@ -11,6 +11,7 @@ type Config struct {
 	ListenAddr      string
 	DataDir         string
 	DBPath          string
+	NodeBinaryPath  string
 	LogLevel        string
 	SessionLifetime time.Duration
 	PublicURL       string
@@ -20,6 +21,7 @@ func parseConfig(args []string) Config {
 	cfg := Config{
 		ListenAddr:      env("NYARELAY_LISTEN", ":8080"),
 		DataDir:         env("NYARELAY_DATA", "./data"),
+		NodeBinaryPath:  env("NYARELAY_NODE_BINARY", "/usr/local/bin/nyarelay-node"),
 		LogLevel:        env("NYARELAY_LOG_LEVEL", "info"),
 		SessionLifetime: 24 * time.Hour,
 		PublicURL:       env("NYARELAY_PUBLIC_URL", ""),
@@ -27,6 +29,7 @@ func parseConfig(args []string) Config {
 	fs := flag.NewFlagSet("controller", flag.ExitOnError)
 	fs.StringVar(&cfg.ListenAddr, "listen", cfg.ListenAddr, "controller listen address")
 	fs.StringVar(&cfg.DataDir, "data", cfg.DataDir, "controller data directory")
+	fs.StringVar(&cfg.NodeBinaryPath, "node-binary", cfg.NodeBinaryPath, "node binary path")
 	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "log level")
 	fs.StringVar(&cfg.PublicURL, "public-url", cfg.PublicURL, "public URL shown in setup docs")
 	_ = fs.Parse(args)

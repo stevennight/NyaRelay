@@ -8,6 +8,9 @@ export interface NodeInfo {
   status: NodeStatus
   version: string
   labels?: Record<string, string>
+  public_host?: string
+  port_min?: number
+  port_max?: number
   approved: boolean
   revoked: boolean
   last_seen?: string
@@ -71,6 +74,14 @@ export interface ControllerInfo {
   signing_key: string
   public_url: string
   revision: number
+}
+
+export interface NodeInstallInfo {
+  node: NodeInfo
+  token: string
+  script_url: string
+  binary_url: string
+  command: string
 }
 
 export interface TrafficSummary {

@@ -1,7 +1,7 @@
 import { fireEvent, screen, waitFor } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 import { LoginPage, SetupPage } from './auth'
-import { SecuritySettingsPage } from './settings'
+import { ControllerSettingsPage, SecuritySettingsPage } from './settings'
 import { installFetch, jsonResponse, renderWithClient } from '../test/helpers'
 import { routerMocks } from '../test/router-mocks'
 
@@ -99,5 +99,34 @@ describe('auth and security flows', () => {
     const enableCall = fetchMock.mock.calls.find(([path]) => path === '/api/settings/totp/enable')
     expect(enableCall).toBeDefined()
     expect(JSON.parse(String(enableCall?.[1]?.body))).toEqual({ code: '654321' })
+  })
+
+  it('updates the controller public URL from settings', async () => {
+    const fetchMock = installFetch([
+      {
+        path: '/api/controller/info',
+        method: 'GET',
+        response: jsonResponse({
+          signing_key: 'pub-key',
+          public_url: 'https://old.example.com',
+          revision: 7,
+        }),
+      },
+      {
+        path: '/api/controller/info',
+        method: 'POST',
+        response: jsonResponse({ public_url: 'https://new.example.com' }),
+      },
+    ])
+
+    renderWithClient(<ControllerSettingsPage />)
+
+    expect(await screen.findByDisplayValue('https://old.example.com')).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('面板公开地址'), { target: { value: 'https://new.example.com' } })
+    fireEvent.click(screen.getByRole('button', { name: '保存公开地址' }))
+
+    expect(await screen.findByText('已保存')).toBeInTheDocument()
+    const saveCall = fetchMock.mock.calls.find(([path, init]) => path === '/api/controller/info' && init?.method === 'POST')
+    expect(JSON.parse(String(saveCall?.[1]?.body))).toEqual({ public_url: 'https://new.example.com' })
   })
 })

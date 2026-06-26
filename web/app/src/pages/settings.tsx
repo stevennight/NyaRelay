@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, Navigate } from '@tanstack/react-router'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { api, post } from '../api'
 import type { ControllerInfo } from '../types'
 import { Banner, DetailGrid, Field, FieldGrid, InlineActions, PageFrame, Panel, Subnav } from '../components/ui'
@@ -70,10 +70,27 @@ export function SecuritySettingsPage() {
 }
 
 export function ControllerSettingsPage() {
+  const queryClient = useQueryClient()
+  const [publicUrl, setPublicUrl] = useState('')
+  const [message, setMessage] = useState('')
   const info = useQuery({
     queryKey: ['controller-info'],
     queryFn: () => api<ControllerInfo>('/api/controller/info'),
   })
+  const update = useMutation({
+    mutationFn: () => post('/api/controller/info', { public_url: publicUrl }),
+    onSuccess: async () => {
+      setMessage('已保存')
+      await queryClient.invalidateQueries({ queryKey: ['controller-info'] })
+    },
+    onError: (err) => setMessage(err instanceof Error ? err.message : '保存失败'),
+  })
+
+  useEffect(() => {
+    if (info.data) {
+      setPublicUrl(info.data.public_url ?? '')
+    }
+  }, [info.data])
 
   return (
     <PageFrame title="控制器" subtitle="这里显示控制器公钥、公开地址和当前配置版本。">
@@ -90,6 +107,29 @@ export function ControllerSettingsPage() {
             ]}
           />
         )}
+      </Panel>
+      <Panel>
+        <h2>公开地址</h2>
+        <form
+          className="form"
+          onSubmit={(event) => {
+            event.preventDefault()
+            setMessage('')
+            update.mutate()
+          }}
+        >
+          <FieldGrid>
+            <Field label="面板公开地址" wide>
+              <input
+                value={publicUrl}
+                onChange={(event) => setPublicUrl(event.target.value)}
+                placeholder="https://relay.example.com"
+              />
+            </Field>
+          </FieldGrid>
+          <button type="submit" disabled={update.isPending}>保存公开地址</button>
+        </form>
+        {message && <p>{message}</p>}
       </Panel>
       <Panel>
         <h2>部署提醒</h2>

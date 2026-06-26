@@ -29,6 +29,17 @@ const nodes = [
     created_at: '2026-06-25T09:00:00Z',
     updated_at: '2026-06-25T09:00:00Z',
   },
+  {
+    id: 'revoked-node',
+    name: 'revoked-node',
+    status: 'revoked' as const,
+    version: '1.0.0',
+    labels: {},
+    approved: true,
+    revoked: true,
+    created_at: '2026-06-25T09:00:00Z',
+    updated_at: '2026-06-25T09:00:00Z',
+  },
 ] satisfies Array<Parameters<typeof jsonResponse>[0]>
 
 const link = {
@@ -116,11 +127,33 @@ describe('route and link pages', () => {
       name: 'cn-hk-us',
       protocol: 'udp',
       entry_node: '',
-      listen: '0.0.0.0:8443',
+      listen: '',
       target: '10.0.0.8:443',
       enabled: true,
       hops: [],
     })
+  })
+
+  it('hides revoked nodes in link and route selectors', async () => {
+    installFetch([
+      {
+        path: '/api/nodes',
+        method: 'GET',
+        response: jsonResponse(nodes),
+      },
+      {
+        path: '/api/links',
+        method: 'GET',
+        response: jsonResponse([]),
+      },
+    ])
+
+    renderWithClient(<RouteNewPage />)
+
+    expect(await screen.findByText('新建路由')).toBeInTheDocument()
+    expect(screen.getByRole('combobox', { name: '入口节点' })).toBeInTheDocument()
+    expect(await screen.findByRole('option', { name: 'cn-1' })).toBeInTheDocument()
+    expect(screen.queryByRole('option', { name: 'revoked-node' })).not.toBeInTheDocument()
   })
 
   it('edits an existing link and keeps secret material', async () => {

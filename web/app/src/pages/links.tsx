@@ -173,6 +173,7 @@ function LinkEditor({
     queryKey: ['nodes'],
     queryFn: () => api<NodeInfo[]>('/api/nodes'),
   })
+  const nodes = (nodesQuery.data ?? []).filter((node) => !node.revoked)
   const [form, setForm] = useState<LinkForm>(emptyLinkForm())
   const [error, setError] = useState('')
 
@@ -243,7 +244,7 @@ function LinkEditor({
             onChange={(event) => setForm((current) => ({ ...current, from_node: event.target.value }))}
           >
             <option value="">选择节点</option>
-            {(nodesQuery.data ?? []).map((node) => (
+            {nodes.map((node) => (
               <option key={node.id} value={node.id}>
                 {node.name}
               </option>
@@ -256,7 +257,7 @@ function LinkEditor({
             onChange={(event) => setForm((current) => ({ ...current, to_node: event.target.value }))}
           >
             <option value="">选择节点</option>
-            {(nodesQuery.data ?? []).map((node) => (
+            {nodes.map((node) => (
               <option key={node.id} value={node.id}>
                 {node.name}
               </option>

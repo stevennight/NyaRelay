@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	neturl "net/url"
 	"runtime"
@@ -119,5 +120,33 @@ func nodeSystem() model.NodeSystem {
 		Hostname: hostname(),
 		OS:       runtime.GOOS,
 		Arch:     runtime.GOARCH,
+		IP:       firstNonLoopbackIP(),
 	}
+}
+
+func firstNonLoopbackIP() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return ""
+	}
+	var fallback string
+	for _, addr := range addrs {
+		var ip net.IP
+		switch value := addr.(type) {
+		case *net.IPNet:
+			ip = value.IP
+		case *net.IPAddr:
+			ip = value.IP
+		}
+		if ip == nil || ip.IsLoopback() || ip.IsMulticast() || ip.IsUnspecified() {
+			continue
+		}
+		if ip4 := ip.To4(); ip4 != nil {
+			return ip4.String()
+		}
+		if fallback == "" {
+			fallback = ip.String()
+		}
+	}
+	return fallback
 }

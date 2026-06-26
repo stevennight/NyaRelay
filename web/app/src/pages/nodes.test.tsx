@@ -10,6 +10,9 @@ const node = {
   status: 'online' as const,
   version: '1.2.3',
   labels: { region: 'hk', tier: 'premium' },
+  public_host: 'hk.example.com',
+  port_min: 10000,
+  port_max: 65535,
   approved: true,
   revoked: false,
   last_seen: '2026-06-25T10:00:00Z',
@@ -39,17 +42,32 @@ describe('node pages', () => {
     expect(screen.getByText('先添加节点，然后让 node 服务主动连到控制器。')).toBeInTheDocument()
   })
 
+  it('hides revoked nodes from the list', async () => {
+    installFetch([
+      {
+        path: '/api/nodes',
+        method: 'GET',
+        response: jsonResponse([
+          node,
+          {
+            ...node,
+            id: 'node-2',
+            name: 'revoked-node',
+            revoked: true,
+            status: 'revoked',
+          },
+        ]),
+      },
+    ])
+
+    renderWithClient(<NodesPage />)
+
+    expect(await screen.findByText('hk-1')).toBeInTheDocument()
+    expect(screen.queryByText('revoked-node')).not.toBeInTheDocument()
+  })
+
   it('creates a node and shows the launch command', async () => {
     const fetchMock = installFetch([
-      {
-        path: '/api/controller/info',
-        method: 'GET',
-        response: jsonResponse({
-          signing_key: 'pub-key',
-          public_url: 'https://relay.example.com',
-          revision: 12,
-        }),
-      },
       {
         path: '/api/nodes',
         method: 'POST',
@@ -60,6 +78,9 @@ describe('node pages', () => {
             name: 'hk-2',
           },
           token: 'node-token-123',
+          script_url: 'https://relay.example.com/install.sh',
+          binary_url: 'https://relay.example.com/downloads/nyarelay-node',
+          command: 'curl -fsSL https://relay.example.com/install.sh | sudo sh -s -- --controller https://relay.example.com --id node-2 --token node-token-123 --signing-key pub-key',
         }),
       },
       {
@@ -77,10 +98,9 @@ describe('node pages', () => {
     })
     fireEvent.click(screen.getByRole('button', { name: '生成节点凭据' }))
 
-    expect(await screen.findByText('systemd 节点启动参数')).toBeInTheDocument()
-    expect(screen.getByText(/nyarelay-node --controller https:\/\/relay\.example\.com/)).toBeInTheDocument()
-    expect(screen.getByText(/--id node-2/)).toBeInTheDocument()
-    expect(screen.getByText(/--token node-token-123/)).toBeInTheDocument()
+    expect(await screen.findByText('节点安装命令')).toBeInTheDocument()
+    expect(screen.getByText(/curl -fsSL https:\/\/relay\.example\.com\/install\.sh/)).toBeInTheDocument()
+    expect(screen.getByText('下载脚本')).toBeInTheDocument()
     expect(screen.getByRole('link', { name: '节点详情' })).toHaveAttribute('href', '/nodes/node-2')
 
     const createCall = fetchMock.mock.calls.find(([path, init]) => path === '/api/nodes' && init?.method === 'POST')
@@ -91,14 +111,33 @@ describe('node pages', () => {
           region: 'hk',
           tier: 'premium',
         },
+        public_host: '',
+        port_min: 10000,
+        port_max: 65535,
       })
   })
 
-  it('renders node details and revokes the node', async () => {
+  it('renders node details, shows install command and revokes the node', async () => {
     const fetchMock = installFetch([
       {
         path: '/api/nodes/node-1',
         method: 'GET',
+        response: jsonResponse(node),
+      },
+      {
+        path: '/api/nodes/node-1/install',
+        method: 'GET',
+        response: jsonResponse({
+          node,
+          token: 'node-token-123',
+          script_url: 'https://relay.example.com/install.sh',
+          binary_url: 'https://relay.example.com/downloads/nyarelay-node',
+          command: 'curl -fsSL https://relay.example.com/install.sh | sudo sh -s -- --controller https://relay.example.com --id node-1 --token node-token-123 --signing-key pub-key',
+        }),
+      },
+      {
+        path: '/api/nodes/node-1',
+        method: 'PATCH',
         response: jsonResponse(node),
       },
       {
@@ -117,7 +156,16 @@ describe('node pages', () => {
 
     expect(await screen.findByText('hk-1')).toBeInTheDocument()
     expect(screen.getByText('hk-1.local')).toBeInTheDocument()
+    expect(screen.getByText('hk.example.com:10000-65535')).toBeInTheDocument()
     expect(screen.getByText('region=hk')).toBeInTheDocument()
+
+    fireEvent.change(screen.getByLabelText('公开 IP / 域名'), { target: { value: 'hk-new.example.com' } })
+    fireEvent.click(screen.getByRole('button', { name: '保存节点设置' }))
+    expect(await screen.findByText('已保存')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '显示安装命令' }))
+    expect(await screen.findByText('节点安装命令')).toBeInTheDocument()
+    expect(screen.getByText(/curl -fsSL https:\/\/relay\.example\.com\/install\.sh/)).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: '吊销节点' }))
 

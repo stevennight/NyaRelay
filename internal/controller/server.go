@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/big"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -29,9 +31,10 @@ import (
 )
 
 const (
-	sessionCookieName = "nyarelay_session"
-	signingKeySetting = "config_signing_private_key"
-	signingPubSetting = "config_signing_public_key"
+	sessionCookieName          = "nyarelay_session"
+	signingKeySetting          = "config_signing_private_key"
+	signingPubSetting          = "config_signing_public_key"
+	controllerPublicURLSetting = "controller_public_url"
 )
 
 type Server struct {
@@ -107,9 +110,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/settings/totp/disable", s.withAuth(s.handleTOTPDisable))
 	s.mux.HandleFunc("GET /api/dashboard", s.withAuth(s.handleDashboard))
 	s.mux.HandleFunc("GET /api/controller/info", s.withAuth(s.handleControllerInfo))
+	s.mux.HandleFunc("POST /api/controller/info", s.withAuth(s.handleUpdateControllerInfo))
 	s.mux.HandleFunc("GET /api/nodes", s.withAuth(s.handleListNodes))
 	s.mux.HandleFunc("GET /api/nodes/{id}", s.withAuth(s.handleGetNode))
+	s.mux.HandleFunc("GET /api/nodes/{id}/install", s.withAuth(s.handleGetNodeInstall))
 	s.mux.HandleFunc("POST /api/nodes", s.withAuth(s.handleCreateNode))
+	s.mux.HandleFunc("PATCH /api/nodes/{id}", s.withAuth(s.handleUpdateNode))
 	s.mux.HandleFunc("POST /api/nodes/revoke", s.withAuth(s.handleRevokeNode))
 	s.mux.HandleFunc("GET /api/links", s.withAuth(s.handleListLinks))
 	s.mux.HandleFunc("GET /api/links/{id}", s.withAuth(s.handleGetLink))
@@ -126,6 +132,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/node/events", s.withNode(s.handleNodeEvents))
 	s.mux.HandleFunc("POST /api/node/metrics", s.withNode(s.handleNodeMetrics))
 
+	s.mux.HandleFunc("GET /install.sh", s.handleInstallScript)
+	s.mux.HandleFunc("GET /downloads/nyarelay-node", s.handleDownloadNodeBinary)
 	s.mux.HandleFunc("/", s.handleWeb)
 }
 
@@ -151,7 +159,7 @@ func (s *Server) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, map[string]any{
 		"needs_setup": count == 0,
-		"public_url":  s.cfg.PublicURL,
+		"public_url":  s.controllerPublicURL(r.Context()),
 	})
 }
 
@@ -314,9 +322,10 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request, session
 		writeError(w, err, http.StatusInternalServerError)
 		return
 	}
+	nodes = activeNodes(nodes)
 	var online, activeRoutes int
 	for _, node := range nodes {
-		if node.Status == model.NodeOnline && !node.Revoked {
+		if node.Status == model.NodeOnline {
 			online++
 		}
 	}
@@ -343,9 +352,26 @@ func (s *Server) handleControllerInfo(w http.ResponseWriter, r *http.Request, se
 	}
 	writeJSON(w, map[string]any{
 		"signing_key": pub,
-		"public_url":  s.cfg.PublicURL,
+		"public_url":  s.controllerPublicURL(r.Context()),
 		"revision":    s.hub.Revision(),
 	})
+}
+
+func (s *Server) handleUpdateControllerInfo(w http.ResponseWriter, r *http.Request, session auth.Session) {
+	var req struct {
+		PublicURL string `json:"public_url"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
+	value := strings.TrimSpace(req.PublicURL)
+	if err := s.store.SetSetting(r.Context(), controllerPublicURLSetting, value); err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	_ = s.store.AddAudit(r.Context(), session.Username, "controller.public_url.update", "controller", map[string]string{"public_url": value})
+	writeJSON(w, map[string]string{"public_url": value})
 }
 
 func (s *Server) handleListNodes(w http.ResponseWriter, r *http.Request, session auth.Session) {
@@ -354,22 +380,47 @@ func (s *Server) handleListNodes(w http.ResponseWriter, r *http.Request, session
 		writeError(w, err, http.StatusInternalServerError)
 		return
 	}
+	nodes = activeNodes(nodes)
 	writeJSON(w, nodes)
 }
 
 func (s *Server) handleGetNode(w http.ResponseWriter, r *http.Request, session auth.Session) {
 	node, err := s.store.GetNode(r.Context(), r.PathValue("id"))
-	if err != nil {
-		writeError(w, err, http.StatusNotFound)
+	if err != nil || node.Revoked {
+		writeError(w, errors.New("node not found"), http.StatusNotFound)
 		return
 	}
 	writeJSON(w, node)
 }
 
+func (s *Server) handleGetNodeInstall(w http.ResponseWriter, r *http.Request, session auth.Session) {
+	node, token, err := s.store.GetNodeWithToken(r.Context(), r.PathValue("id"))
+	if err != nil || node.Revoked {
+		writeError(w, errors.New("node not found"), http.StatusNotFound)
+		return
+	}
+	controllerURL := controllerBaseURL(s.controllerPublicURL(r.Context()), r)
+	pub, _, err := s.store.GetSetting(r.Context(), signingPubSetting)
+	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, NodeInstallInfo{
+		Node:      node,
+		Token:     token,
+		ScriptURL: installScriptURL(controllerURL),
+		BinaryURL: nodeBinaryURL(controllerURL),
+		Command:   installCommand(controllerURL, node.ID, token, pub),
+	})
+}
+
 func (s *Server) handleCreateNode(w http.ResponseWriter, r *http.Request, session auth.Session) {
 	var req struct {
-		Name   string            `json:"name"`
-		Labels map[string]string `json:"labels"`
+		Name       string            `json:"name"`
+		Labels     map[string]string `json:"labels"`
+		PublicHost string            `json:"public_host"`
+		PortMin    int               `json:"port_min"`
+		PortMax    int               `json:"port_max"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, err, http.StatusBadRequest)
@@ -379,18 +430,31 @@ func (s *Server) handleCreateNode(w http.ResponseWriter, r *http.Request, sessio
 		writeError(w, errors.New("node name is required"), http.StatusBadRequest)
 		return
 	}
+	if err := validateNodePortRange(req.PortMin, req.PortMax); err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
+	controllerURL := controllerBaseURL(s.controllerPublicURL(r.Context()), r)
+	pub, _, err := s.store.GetSetting(r.Context(), signingPubSetting)
+	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
 	token, err := randomToken()
 	if err != nil {
 		writeError(w, err, http.StatusInternalServerError)
 		return
 	}
 	node := model.Node{
-		ID:        ids.New("node"),
-		Name:      strings.TrimSpace(req.Name),
-		Status:    model.NodeOffline,
-		Labels:    req.Labels,
-		Approved:  true,
-		CreatedAt: time.Now().UTC(),
+		ID:         ids.New("node"),
+		Name:       strings.TrimSpace(req.Name),
+		Status:     model.NodeOffline,
+		Labels:     req.Labels,
+		PublicHost: strings.TrimSpace(req.PublicHost),
+		PortMin:    req.PortMin,
+		PortMax:    req.PortMax,
+		Approved:   true,
+		CreatedAt:  time.Now().UTC(),
 	}
 	if err := s.store.UpsertNode(r.Context(), node, token); err != nil {
 		writeError(w, err, http.StatusBadRequest)
@@ -400,7 +464,48 @@ func (s *Server) handleCreateNode(w http.ResponseWriter, r *http.Request, sessio
 	s.hub.SetRevision(rev)
 	s.pushConfigs(r.Context())
 	_ = s.store.AddAudit(r.Context(), session.Username, "node.create", node.ID, map[string]string{"name": node.Name})
-	writeJSON(w, map[string]any{"node": node, "token": token})
+	writeJSON(w, buildNodeInstallInfo(controllerURL, pub, node, token))
+}
+
+func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request, session auth.Session) {
+	node, err := s.store.GetNode(r.Context(), r.PathValue("id"))
+	if err != nil || node.Revoked {
+		writeError(w, errors.New("node not found"), http.StatusNotFound)
+		return
+	}
+	var req struct {
+		Name       string            `json:"name"`
+		Labels     map[string]string `json:"labels"`
+		PublicHost string            `json:"public_host"`
+		PortMin    int               `json:"port_min"`
+		PortMax    int               `json:"port_max"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(req.Name) == "" {
+		writeError(w, errors.New("node name is required"), http.StatusBadRequest)
+		return
+	}
+	if err := validateNodePortRange(req.PortMin, req.PortMax); err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
+	node.Name = strings.TrimSpace(req.Name)
+	node.Labels = req.Labels
+	node.PublicHost = strings.TrimSpace(req.PublicHost)
+	node.PortMin = req.PortMin
+	node.PortMax = req.PortMax
+	if err := s.store.UpdateNode(r.Context(), node); err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
+	rev, _ := s.store.BumpRevision(r.Context())
+	s.hub.SetRevision(rev)
+	s.pushConfigs(r.Context())
+	_ = s.store.AddAudit(r.Context(), session.Username, "node.update", node.ID, node)
+	writeJSON(w, node)
 }
 
 func (s *Server) handleRevokeNode(w http.ResponseWriter, r *http.Request, session auth.Session) {
@@ -550,6 +655,17 @@ func (s *Server) handleUpsertRoute(w http.ResponseWriter, r *http.Request, sessi
 	}
 	if route.ID == "" {
 		route.ID = ids.New("route")
+	}
+	if strings.TrimSpace(route.Listen) == "" {
+		listen, err := s.suggestRouteListen(r.Context(), route, route.ID)
+		if err != nil {
+			writeError(w, err, http.StatusBadRequest)
+			return
+		}
+		route.Listen = listen
+	} else if err := s.ensureRouteListenAvailable(r.Context(), route, route.ID); err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
 	}
 	if err := validate.Route(route); err != nil {
 		writeError(w, err, http.StatusBadRequest)
@@ -716,6 +832,7 @@ func (s *Server) compileConfig(ctx context.Context, nodeID string) (model.Signed
 	if err != nil {
 		return model.SignedConfig{}, err
 	}
+	nodes = activeNodes(nodes)
 	routes, links = scopeConfigForNode(nodeID, routes, links)
 	cfg := model.RelayConfig{
 		Revision:  rev,
@@ -739,6 +856,17 @@ func (s *Server) compileConfig(ctx context.Context, nodeID string) (model.Signed
 		return model.SignedConfig{}, err
 	}
 	return model.SignedConfig{Config: cfg, Signature: sig, KeyID: pub}, nil
+}
+
+func activeNodes(nodes []model.Node) []model.Node {
+	out := make([]model.Node, 0, len(nodes))
+	for _, node := range nodes {
+		if node.Revoked {
+			continue
+		}
+		out = append(out, node)
+	}
+	return out
 }
 
 func scopeConfigForNode(nodeID string, routes []model.Route, links []model.Link) ([]model.Route, []model.Link) {
@@ -915,4 +1043,126 @@ func (s *Server) handleFallbackWeb(w http.ResponseWriter, r *http.Request) {
   </main>
 </body>
 </html>`))
+}
+
+func (s *Server) handleInstallScript(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="install.sh"`)
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write([]byte(installScript()))
+}
+
+func (s *Server) handleDownloadNodeBinary(w http.ResponseWriter, r *http.Request) {
+	path := s.cfg.NodeBinaryPath
+	if path == "" {
+		writeError(w, errors.New("node binary path is not configured"), http.StatusInternalServerError)
+		return
+	}
+	if _, err := os.Stat(path); err != nil {
+		writeError(w, errors.New("node binary not found"), http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", `attachment; filename="nyarelay-node"`)
+	http.ServeFile(w, r, path)
+}
+
+func controllerBaseURL(configured string, r *http.Request) string {
+	if configured != "" {
+		return configured
+	}
+	scheme := "http"
+	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		scheme = "https"
+	}
+	if host := r.Host; host != "" {
+		return scheme + "://" + host
+	}
+	return ""
+}
+
+func (s *Server) controllerPublicURL(ctx context.Context) string {
+	if value, ok, err := s.store.GetSetting(ctx, controllerPublicURLSetting); err == nil && ok {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return strings.TrimSpace(s.cfg.PublicURL)
+}
+
+func validateNodePortRange(portMin, portMax int) error {
+	if portMin == 0 && portMax == 0 {
+		return nil
+	}
+	if portMin == 0 || portMax == 0 {
+		return fmt.Errorf("port_min and port_max must be set together")
+	}
+	if portMin < 10000 || portMax > 65535 {
+		return fmt.Errorf("port range must be within 10000-65535")
+	}
+	if portMin > portMax {
+		return fmt.Errorf("port_min must be less than or equal to port_max")
+	}
+	return nil
+}
+
+func (s *Server) suggestRouteListen(ctx context.Context, route model.Route, routeID string) (string, error) {
+	if port := strings.TrimSpace(route.Listen); port != "" {
+		return port, nil
+	}
+	used, err := s.store.NodePortUsage(ctx, route.EntryNode, routeID)
+	if err != nil {
+		return "", err
+	}
+	nodes, err := s.store.ListNodes(ctx)
+	if err != nil {
+		return "", err
+	}
+	for _, node := range nodes {
+		if node.ID != route.EntryNode {
+			continue
+		}
+		min, max := node.PortMin, node.PortMax
+		if min <= 0 {
+			min = 10000
+		}
+		if max <= 0 {
+			max = 65535
+		}
+		if min > max {
+			continue
+		}
+		freePorts := make([]string, 0, max-min+1)
+		for port := min; port <= max; port++ {
+			portStr := strconv.Itoa(port)
+			if used[portStr] {
+				continue
+			}
+			freePorts = append(freePorts, portStr)
+		}
+		if len(freePorts) == 0 {
+			continue
+		}
+		index, err := rand.Int(rand.Reader, big.NewInt(int64(len(freePorts))))
+		if err != nil {
+			return "", err
+		}
+		return net.JoinHostPort("", freePorts[index.Int64()]), nil
+	}
+	return "", errors.New("no free route port available")
+}
+
+func (s *Server) ensureRouteListenAvailable(ctx context.Context, route model.Route, routeID string) error {
+	_, port, err := net.SplitHostPort(route.Listen)
+	if err != nil {
+		return fmt.Errorf("invalid listen address: %w", err)
+	}
+	used, err := s.store.NodePortUsage(ctx, route.EntryNode, routeID)
+	if err != nil {
+		return err
+	}
+	if used[port] {
+		return fmt.Errorf("listen port %s is already in use", port)
+	}
+	return nil
 }

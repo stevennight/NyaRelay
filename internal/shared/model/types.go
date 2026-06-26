@@ -27,17 +27,20 @@ const (
 )
 
 type Node struct {
-	ID        string            `json:"id"`
-	Name      string            `json:"name"`
-	Status    NodeStatus        `json:"status"`
-	Version   string            `json:"version"`
-	Labels    map[string]string `json:"labels,omitempty"`
-	Approved  bool              `json:"approved"`
-	Revoked   bool              `json:"revoked"`
-	LastSeen  time.Time         `json:"last_seen,omitempty"`
-	CreatedAt time.Time         `json:"created_at"`
-	UpdatedAt time.Time         `json:"updated_at"`
-	System    NodeSystem        `json:"system,omitempty"`
+	ID         string            `json:"id"`
+	Name       string            `json:"name"`
+	Status     NodeStatus        `json:"status"`
+	Version    string            `json:"version"`
+	Labels     map[string]string `json:"labels,omitempty"`
+	PublicHost string            `json:"public_host,omitempty"`
+	PortMin    int               `json:"port_min,omitempty"`
+	PortMax    int               `json:"port_max,omitempty"`
+	Approved   bool              `json:"approved"`
+	Revoked    bool              `json:"revoked"`
+	LastSeen   time.Time         `json:"last_seen,omitempty"`
+	CreatedAt  time.Time         `json:"created_at"`
+	UpdatedAt  time.Time         `json:"updated_at"`
+	System     NodeSystem        `json:"system,omitempty"`
 }
 
 type NodeSystem struct {

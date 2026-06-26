@@ -267,6 +267,96 @@ func TestControllerRestartAndNodeReconnectIntegration(t *testing.T) {
 	assertTCPRoundTrip(t, routeListen, "nya-after-restart")
 }
 
+func TestNodeInstallEndpointReturnsCommand(t *testing.T) {
+	h := newControllerHarness(t, "127.0.0.1:0")
+	_, _ = mustSigningKey(t, h.store), h
+
+	nodeNode, token := createNode(t, h.server, "installer")
+	req := httptest.NewRequest(http.MethodGet, "/api/nodes/"+nodeNode.ID+"/install", nil)
+	req.SetPathValue("id", nodeNode.ID)
+	req.Header.Set("X-NyaRelay-Node-ID", "admin")
+	req.Header.Set("X-NyaRelay-Node-Token", "admin-token")
+	rec := httptest.NewRecorder()
+	h.server.handleGetNodeInstall(rec, req, auth.Session{UserID: 1, Username: "admin"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("install endpoint failed: %d %s", rec.Code, rec.Body.String())
+	}
+	var resp NodeInstallInfo
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Node.ID != nodeNode.ID || resp.Token != token {
+		t.Fatalf("unexpected install info: %#v", resp)
+	}
+	if resp.Command == "" || resp.ScriptURL == "" || resp.BinaryURL == "" {
+		t.Fatalf("missing install fields: %#v", resp)
+	}
+}
+
+func TestRouteAutoAssignsPortWithinNodeRange(t *testing.T) {
+	h := newControllerHarness(t, "127.0.0.1:0")
+	nodeNode, _ := createNode(t, h.server, "entry-auto")
+	nodeNode.PortMin = 12000
+	nodeNode.PortMax = 12001
+	if err := h.store.UpdateNode(context.Background(), nodeNode); err != nil {
+		t.Fatal(err)
+	}
+
+	first := upsertRoute(t, h.server, model.Route{
+		ID:        "route_auto_1",
+		Name:      "auto-1",
+		Protocol:  model.ProtocolTCP,
+		EntryNode: nodeNode.ID,
+		Target:    "127.0.0.1:443",
+		Enabled:   true,
+	})
+	second := upsertRoute(t, h.server, model.Route{
+		ID:        "route_auto_2",
+		Name:      "auto-2",
+		Protocol:  model.ProtocolTCP,
+		EntryNode: nodeNode.ID,
+		Target:    "127.0.0.1:443",
+		Enabled:   true,
+	})
+	got := map[string]bool{first.Listen: true, second.Listen: true}
+	if len(got) != 2 || !got[":12000"] || !got[":12001"] {
+		t.Fatalf("auto ports = %q and %q, want :12000 and :12001 in any order", first.Listen, second.Listen)
+	}
+}
+
+func TestRouteRejectsDuplicatePortOnSameEntryNode(t *testing.T) {
+	h := newControllerHarness(t, "127.0.0.1:0")
+	nodeNode, _ := createNode(t, h.server, "entry-dup")
+	upsertRoute(t, h.server, model.Route{
+		ID:        "route_dup_1",
+		Name:      "dup-1",
+		Protocol:  model.ProtocolTCP,
+		EntryNode: nodeNode.ID,
+		Listen:    ":13000",
+		Target:    "127.0.0.1:443",
+		Enabled:   true,
+	})
+
+	payload, err := json.Marshal(model.Route{
+		ID:        "route_dup_2",
+		Name:      "dup-2",
+		Protocol:  model.ProtocolTCP,
+		EntryNode: nodeNode.ID,
+		Listen:    "0.0.0.0:13000",
+		Target:    "127.0.0.1:443",
+		Enabled:   true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/routes", bytes.NewReader(payload))
+	rec := httptest.NewRecorder()
+	h.server.handleUpsertRoute(rec, req, auth.Session{UserID: 1, Username: "admin"})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected duplicate route port to fail, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
 func mustSigningKey(t *testing.T, st *store.Store) string {
 	t.Helper()
 	pub, _, err := st.GetSetting(context.Background(), signingPubSetting)
