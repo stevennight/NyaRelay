@@ -350,7 +350,7 @@ function NodeFormFields({
           placeholder="hk-1"
         />
       </Field>
-      <Field label="公开 IP / 域名" hint="留空时会优先使用节点上报的地址。">
+      <Field label="节点 IP / 域名" hint="留空时会优先使用节点上报的地址。">
         <input
           value={form.public_host}
           onChange={(event) => onChange({ ...form, public_host: event.target.value })}
@@ -397,7 +397,7 @@ function NodeDetailsContent({ node }: { node: NodeInfo }) {
             { label: 'ID', value: node.id },
             { label: '状态', value: <StatusPill value={node.revoked ? 'revoked' : node.status} /> },
             { label: '版本', value: node.version || '-' },
-            { label: '公开入口', value: publicEndpoint(node) },
+            { label: '节点入口', value: publicEndpoint(node) },
             { label: '可用端口范围', value: `${node.port_min ?? 10000}-${node.port_max ?? 65535}` },
             { label: '最近心跳', value: formatTime(node.last_seen) },
             { label: '创建时间', value: formatTime(node.created_at) },

@@ -80,6 +80,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			name TEXT NOT NULL,
 			type TEXT NOT NULL,
 			transport TEXT NOT NULL,
+			entry_address TEXT NOT NULL DEFAULT '',
 			enabled INTEGER NOT NULL,
 			settings_json TEXT NOT NULL DEFAULT '{}',
 			created_at TEXT NOT NULL,
@@ -159,7 +160,10 @@ func (s *Store) migrate(ctx context.Context) error {
 			return err
 		}
 	}
-	return s.ensureNodeColumns(ctx)
+	if err := s.ensureNodeColumns(ctx); err != nil {
+		return err
+	}
+	return s.ensureTunnelColumns(ctx)
 }
 
 func (s *Store) ensureNodeColumns(ctx context.Context) error {
@@ -179,6 +183,19 @@ func (s *Store) ensureNodeColumns(ctx context.Context) error {
 	}
 	if !columns["port_max"] {
 		if _, err := s.db.ExecContext(ctx, `ALTER TABLE nodes ADD COLUMN port_max INTEGER NOT NULL DEFAULT 65535`); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) ensureTunnelColumns(ctx context.Context) error {
+	columns, err := s.tableColumns(ctx, "tunnels")
+	if err != nil {
+		return err
+	}
+	if !columns["entry_address"] {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE tunnels ADD COLUMN entry_address TEXT NOT NULL DEFAULT ''`); err != nil {
 			return err
 		}
 	}
@@ -441,16 +458,17 @@ func (s *Store) SaveTunnel(ctx context.Context, tunnel model.Tunnel, allocations
 	tunnel.UpdatedAt = now
 	settings, _ := json.Marshal(emptyMap(tunnel.Settings))
 	_, err = tx.ExecContext(ctx,
-		`INSERT INTO tunnels (id, name, type, transport, enabled, settings_json, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO tunnels (id, name, type, transport, entry_address, enabled, settings_json, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET
 		   name = excluded.name,
 		   type = excluded.type,
 		   transport = excluded.transport,
+		   entry_address = excluded.entry_address,
 		   enabled = excluded.enabled,
 		   settings_json = excluded.settings_json,
 		   updated_at = excluded.updated_at`,
-		tunnel.ID, tunnel.Name, string(tunnel.Type), string(tunnel.Transport), boolInt(tunnel.Enabled), string(settings),
+		tunnel.ID, tunnel.Name, string(tunnel.Type), string(tunnel.Transport), tunnel.EntryAddress, boolInt(tunnel.Enabled), string(settings),
 		tunnel.CreatedAt.UTC().Format(time.RFC3339Nano), tunnel.UpdatedAt.UTC().Format(time.RFC3339Nano),
 	)
 	if err != nil {
@@ -518,7 +536,7 @@ func (s *Store) SaveTunnel(ctx context.Context, tunnel model.Tunnel, allocations
 
 func (s *Store) ListTunnels(ctx context.Context) ([]model.Tunnel, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, name, type, transport, enabled, settings_json, created_at, updated_at
+		`SELECT id, name, type, transport, entry_address, enabled, settings_json, created_at, updated_at
 		 FROM tunnels ORDER BY created_at DESC`,
 	)
 	if err != nil {
@@ -549,7 +567,7 @@ func (s *Store) ListTunnels(ctx context.Context) ([]model.Tunnel, error) {
 
 func (s *Store) GetTunnel(ctx context.Context, id string) (model.Tunnel, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, name, type, transport, enabled, settings_json, created_at, updated_at
+		`SELECT id, name, type, transport, entry_address, enabled, settings_json, created_at, updated_at
 		 FROM tunnels WHERE id = ?`, id,
 	)
 	tunnel, err := scanTunnel(row)
@@ -1041,7 +1059,7 @@ func scanTunnel(row scanner) (model.Tunnel, error) {
 	var tunnel model.Tunnel
 	var tunnelType, transport, settingsJSON, created, updated string
 	var enabled int
-	err := row.Scan(&tunnel.ID, &tunnel.Name, &tunnelType, &transport, &enabled, &settingsJSON, &created, &updated)
+	err := row.Scan(&tunnel.ID, &tunnel.Name, &tunnelType, &transport, &tunnel.EntryAddress, &enabled, &settingsJSON, &created, &updated)
 	if err != nil {
 		return model.Tunnel{}, err
 	}

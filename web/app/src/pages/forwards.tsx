@@ -134,7 +134,7 @@ function ForwardsListView({
       if (entryNeedle) {
         const entryText = [
           formatForwardEndpoint(forward, tunnel, nodeMap),
-          ...entryHostsForTunnel(tunnel, nodeMap),
+          entryHostForTunnel(tunnel, nodeMap),
         ].join(' ').toLowerCase()
         if (!entryText.includes(entryNeedle)) {
           return false
@@ -551,24 +551,22 @@ function formatProtocols(protocols: ForwardProtocol[]) {
 
 function formatForwardEndpoint(forward: ForwardInfo, tunnel?: TunnelInfo, nodes?: Map<string, NodeInfo>) {
   const port = portFromListen(forward.listen)
-  const endpoints = entryHostsForTunnel(tunnel, nodes)
-  if (endpoints.length > 0) {
-    const hosts = endpoints.map((host) => hostForEndpoint(host))
-    if (port) {
-      return hosts.map((host) => `${host}:${port}`).join(' / ')
-    }
-    return hosts.join(' / ')
+  const entryHost = entryHostForTunnel(tunnel, nodes)
+  if (entryHost) {
+    const host = hostForEndpoint(entryHost)
+    return port ? `${host}:${port}` : host
   }
   return forward.listen || '自动分配'
 }
 
-function entryHostsForTunnel(tunnel?: TunnelInfo, nodes?: Map<string, NodeInfo>) {
-  const entryNodes = tunnel?.stages.find((stage) => stage.role === 'entry')?.nodes ?? []
-  return entryNodes
-    .map((entryNode) => nodes?.get(entryNode.node_id))
-    .filter((node): node is NodeInfo => Boolean(node))
-    .map((entryNode) => entryNode.public_host || entryNode.system?.ip)
-    .filter((host): host is string => Boolean(host))
+function entryHostForTunnel(tunnel?: TunnelInfo, nodes?: Map<string, NodeInfo>) {
+  const explicitHost = tunnel?.entry_address?.trim()
+  if (explicitHost) return explicitHost
+
+  const entryNodeID = tunnel?.stages.find((stage) => stage.role === 'entry')?.nodes[0]?.node_id
+  if (!entryNodeID) return ''
+  const entryNode = nodes?.get(entryNodeID)
+  return entryNode?.public_host || entryNode?.system?.ip || ''
 }
 
 function listenInputValue(listen: string) {

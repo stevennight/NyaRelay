@@ -161,7 +161,7 @@ describe('node pages', () => {
     expect(screen.getByText('region=hk')).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: '编辑' }))
-    fireEvent.change(screen.getByLabelText('公开 IP / 域名'), { target: { value: 'hk-new.example.com' } })
+    fireEvent.change(screen.getByLabelText('节点 IP / 域名'), { target: { value: 'hk-new.example.com' } })
     fireEvent.click(screen.getByRole('button', { name: '保存节点设置' }))
     expect(await screen.findByText('已保存')).toBeInTheDocument()
 

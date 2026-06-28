@@ -66,15 +66,16 @@ type NodeSystem struct {
 }
 
 type Tunnel struct {
-	ID        string            `json:"id"`
-	Name      string            `json:"name"`
-	Type      TunnelType        `json:"type"`
-	Transport TunnelTransport   `json:"transport"`
-	Enabled   bool              `json:"enabled"`
-	Settings  map[string]string `json:"settings,omitempty"`
-	Stages    []TunnelStage     `json:"stages"`
-	CreatedAt time.Time         `json:"created_at"`
-	UpdatedAt time.Time         `json:"updated_at"`
+	ID           string            `json:"id"`
+	Name         string            `json:"name"`
+	Type         TunnelType        `json:"type"`
+	Transport    TunnelTransport   `json:"transport"`
+	EntryAddress string            `json:"entry_address,omitempty"`
+	Enabled      bool              `json:"enabled"`
+	Settings     map[string]string `json:"settings,omitempty"`
+	Stages       []TunnelStage     `json:"stages"`
+	CreatedAt    time.Time         `json:"created_at"`
+	UpdatedAt    time.Time         `json:"updated_at"`
 }
 
 type TunnelStage struct {

@@ -70,6 +70,7 @@ const tunnel = {
   name: 'cn-sg-hk',
   type: 'chain' as const,
   transport: 'tls' as const,
+  entry_address: 'edge.example.com',
   enabled: true,
   settings: {},
   stages: [
@@ -166,6 +167,7 @@ describe('tunnels and forwards pages', () => {
     fireEvent.change(screen.getByLabelText('名称'), { target: { value: 'cn-sg-hk' } })
     fireEvent.change(screen.getByLabelText('类型'), { target: { value: 'chain' } })
     fireEvent.change(screen.getByLabelText('传输'), { target: { value: 'tls' } })
+    fireEvent.change(screen.getByLabelText('入口地址'), { target: { value: 'portal.example.com' } })
     fireEvent.change(screen.getByLabelText('候选节点 1-1'), { target: { value: 'cn-1' } })
     fireEvent.click(screen.getByRole('button', { name: '添加中间层' }))
     fireEvent.change(screen.getByLabelText('候选节点 2-1'), { target: { value: 'sg-1' } })
@@ -186,6 +188,7 @@ describe('tunnels and forwards pages', () => {
       name: 'cn-sg-hk',
       type: 'chain',
       transport: 'tls',
+      entry_address: 'portal.example.com',
       enabled: true,
       stages: [
         {
@@ -376,8 +379,8 @@ describe('tunnels and forwards pages', () => {
 
     expect(await screen.findByText('web-public')).toBeInTheDocument()
     expect(screen.getByText('admin-panel')).toBeInTheDocument()
-    expect(await screen.findByText('cn.example.com:8443')).toBeInTheDocument()
-    expect(await screen.findByText('sg.example.com:9443')).toBeInTheDocument()
+    expect(await screen.findByText('edge.example.com:8443')).toBeInTheDocument()
+    expect(await screen.findByText('edge.example.com:9443')).toBeInTheDocument()
 
     fireEvent.change(screen.getByLabelText('名称'), { target: { value: 'admin' } })
     expect(screen.queryByText('web-public')).not.toBeInTheDocument()
@@ -389,7 +392,7 @@ describe('tunnels and forwards pages', () => {
     expect(screen.queryByText('admin-panel')).not.toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: '重置' }))
-    fireEvent.change(screen.getByLabelText('入口地址'), { target: { value: 'sg.example.com' } })
+    fireEvent.change(screen.getByLabelText('入口地址'), { target: { value: 'edge.example.com:9443' } })
     expect(screen.queryByText('web-public')).not.toBeInTheDocument()
     expect(screen.getByText('admin-panel')).toBeInTheDocument()
   })

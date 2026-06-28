@@ -37,6 +37,7 @@ type TunnelForm = {
   name: string
   type: TunnelType
   transport: TunnelTransport
+  entry_address: string
   enabled: boolean
   stages: TunnelStageForm[]
 }
@@ -46,6 +47,7 @@ const emptyTunnelForm = (): TunnelForm => ({
   name: '',
   type: 'direct',
   transport: 'direct',
+  entry_address: '',
   enabled: true,
   stages: [emptyStageForm()],
 })
@@ -289,6 +291,7 @@ function TunnelDetailsContent({
             { label: 'ID', value: tunnel.id },
             { label: '类型', value: tunnel.type },
             { label: '传输', value: tunnel.transport },
+            { label: '入口地址', value: tunnel.entry_address || defaultTunnelEntryAddress(tunnel, nodes) || '-' },
             { label: '路径', value: formatTunnelPath(tunnel, nodes) },
             { label: '配置版本', value: String(revision ?? '-') },
             { label: '创建时间', value: formatTime(tunnel.created_at) },
@@ -345,6 +348,7 @@ function TunnelEditor({
       name: initialTunnel.name,
       type: initialTunnel.type,
       transport: initialTunnel.transport,
+      entry_address: initialTunnel.entry_address ?? '',
       enabled: initialTunnel.enabled,
       stages: initialTunnel.stages.length > 0
         ? initialTunnel.stages.map((stage) => ({
@@ -370,6 +374,7 @@ function TunnelEditor({
         name: form.name,
         type: form.type,
         transport: form.type === 'direct' ? 'direct' : form.transport,
+        entry_address: form.entry_address.trim(),
         enabled: form.enabled,
         stages: stages.map((stage, index) => ({
           id: stage.id,
@@ -438,6 +443,13 @@ function TunnelEditor({
             <option value="mtls">mTLS</option>
             <option value="ws-tls">WS over TLS</option>
           </select>
+        </Field>
+        <Field label="入口地址" hint="可填域名或 IP；留空时使用入口层第一个节点的节点 IP / 域名。">
+          <input
+            value={form.entry_address}
+            onChange={(event) => setForm((current) => ({ ...current, entry_address: event.target.value }))}
+            placeholder="edge.example.com"
+          />
         </Field>
         <ToggleField
           label="启用"
@@ -702,6 +714,13 @@ function formatTunnelPath(tunnel: TunnelInfo, nodes?: Map<string, NodeInfo>) {
     .sort((a, b) => a.index - b.index)
     .map((stage) => stage.nodes.map((node) => nodeDisplayName(node.node_id, nodes)).join('/'))
     .join(' -> ')
+}
+
+function defaultTunnelEntryAddress(tunnel: TunnelInfo, nodes?: Map<string, NodeInfo>) {
+  const entryNodeID = tunnel.stages.find((stage) => stage.role === 'entry')?.nodes[0]?.node_id
+  if (!entryNodeID) return ''
+  const entryNode = nodes?.get(entryNodeID)
+  return entryNode?.public_host || entryNode?.system?.ip || ''
 }
 
 function nodeDisplayName(nodeID: string, nodes?: Map<string, NodeInfo>) {

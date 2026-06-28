@@ -710,16 +710,17 @@ func (s *Server) setForwardEnabled(w http.ResponseWriter, r *http.Request, sessi
 }
 
 type tunnelRequest struct {
-	ID          string                `json:"id"`
-	Name        string                `json:"name"`
-	Type        model.TunnelType      `json:"type"`
-	Transport   model.TunnelTransport `json:"transport"`
-	Enabled     *bool                 `json:"enabled"`
-	Settings    map[string]string     `json:"settings"`
-	EntryNode   string                `json:"entry_node"`
-	MiddleNodes []string              `json:"middle_nodes"`
-	ExitNode    string                `json:"exit_node"`
-	Stages      []model.TunnelStage   `json:"stages"`
+	ID           string                `json:"id"`
+	Name         string                `json:"name"`
+	Type         model.TunnelType      `json:"type"`
+	Transport    model.TunnelTransport `json:"transport"`
+	EntryAddress *string               `json:"entry_address"`
+	Enabled      *bool                 `json:"enabled"`
+	Settings     map[string]string     `json:"settings"`
+	EntryNode    string                `json:"entry_node"`
+	MiddleNodes  []string              `json:"middle_nodes"`
+	ExitNode     string                `json:"exit_node"`
+	Stages       []model.TunnelStage   `json:"stages"`
 }
 
 type forwardRequest struct {
@@ -751,14 +752,21 @@ func (s *Server) prepareTunnel(ctx context.Context, req tunnelRequest) (model.Tu
 	if req.Enabled != nil {
 		enabled = *req.Enabled
 	}
+	entryAddress := ""
+	if req.EntryAddress == nil {
+		entryAddress = existing.EntryAddress
+	} else {
+		entryAddress = hostOnly(*req.EntryAddress)
+	}
 	tunnel := model.Tunnel{
-		ID:        strings.TrimSpace(req.ID),
-		Name:      strings.TrimSpace(req.Name),
-		Type:      req.Type,
-		Transport: req.Transport,
-		Enabled:   enabled,
-		Settings:  emptyStringMap(req.Settings),
-		Stages:    req.Stages,
+		ID:           strings.TrimSpace(req.ID),
+		Name:         strings.TrimSpace(req.Name),
+		Type:         req.Type,
+		Transport:    req.Transport,
+		EntryAddress: entryAddress,
+		Enabled:      enabled,
+		Settings:     emptyStringMap(req.Settings),
+		Stages:       req.Stages,
 	}
 	if tunnel.Settings == nil {
 		tunnel.Settings = emptyStringMap(existing.Settings)
@@ -899,6 +907,14 @@ func (s *Server) prepareTunnel(ctx context.Context, req tunnelRequest) (model.Tu
 				BindAddr:  node.ListenAddr,
 			})
 		}
+	}
+	if tunnel.EntryAddress == "" {
+		entryNodeID, err := tunnelEntryNodeID(tunnel)
+		if err != nil {
+			return model.Tunnel{}, nil, err
+		}
+		entryNode := nodeByID[entryNodeID]
+		tunnel.EntryAddress = defaultTunnelEntryAddress(entryNode)
 	}
 	return tunnel, outAllocations, nil
 }
@@ -1136,6 +1152,13 @@ func tunnelEntryNodeID(tunnel model.Tunnel) (string, error) {
 		return "", err
 	}
 	return ids[0], nil
+}
+
+func defaultTunnelEntryAddress(node model.Node) string {
+	if host := hostOnly(node.PublicHost); host != "" {
+		return host
+	}
+	return hostOnly(node.System.IP)
 }
 
 type usedPorts map[string]map[string]map[int]bool

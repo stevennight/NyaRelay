@@ -56,6 +56,7 @@ export interface TunnelInfo {
   name: string
   type: TunnelType
   transport: TunnelTransport
+  entry_address?: string
   enabled: boolean
   settings?: Record<string, string>
   stages: TunnelStage[]
