@@ -62,7 +62,7 @@ func Run(ctx context.Context, args []string) error {
 			log.Warn("cache config failed", "error", err)
 		}
 		currentRevision.Store(signed.Config.Revision)
-		log.Info("config applied", "source", source, "revision", signed.Config.Revision, "routes", len(signed.Config.Routes), "links", len(signed.Config.Links))
+		log.Info("config applied", "source", source, "revision", signed.Config.Revision, "forwards", len(signed.Config.Forwards), "tunnels", len(signed.Config.Tunnels))
 		return nil
 	}
 
@@ -78,10 +78,10 @@ func Run(ctx context.Context, args []string) error {
 				return
 			case <-ticker.C:
 				report := model.MetricsReport{
-					NodeID:     cfg.NodeID,
-					ObservedAt: time.Now().UTC(),
-					RouteStats: relayService.RouteStats(),
-					LinkStats:  relayService.LinkStats(),
+					NodeID:       cfg.NodeID,
+					ObservedAt:   time.Now().UTC(),
+					ForwardStats: relayService.ForwardStats(),
+					TunnelStats:  relayService.TunnelStats(),
 					Runtime: model.RuntimeStat{
 						UptimeSeconds: int64(time.Since(start).Seconds()),
 						Goroutines:    runtime.NumGoroutine(),

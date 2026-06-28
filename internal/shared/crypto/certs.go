@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-type LinkCertificates struct {
+type TunnelCertificates struct {
 	CACert     string
 	ServerCert string
 	ServerKey  string
@@ -21,10 +21,10 @@ type LinkCertificates struct {
 	ClientKey  string
 }
 
-func GenerateLinkCertificates(name string, serverName string) (LinkCertificates, error) {
+func GenerateTunnelCertificates(name string, serverName string) (TunnelCertificates, error) {
 	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return LinkCertificates{}, err
+		return TunnelCertificates{}, err
 	}
 	now := time.Now().UTC()
 	caTemplate := x509.Certificate{
@@ -38,35 +38,35 @@ func GenerateLinkCertificates(name string, serverName string) (LinkCertificates,
 	}
 	caDER, err := x509.CreateCertificate(rand.Reader, &caTemplate, &caTemplate, &caKey.PublicKey, caKey)
 	if err != nil {
-		return LinkCertificates{}, err
+		return TunnelCertificates{}, err
 	}
 	serverKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return LinkCertificates{}, err
+		return TunnelCertificates{}, err
 	}
 	serverTemplate := leafTemplate(name+" server", serverName, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth})
 	serverDER, err := x509.CreateCertificate(rand.Reader, &serverTemplate, &caTemplate, &serverKey.PublicKey, caKey)
 	if err != nil {
-		return LinkCertificates{}, err
+		return TunnelCertificates{}, err
 	}
 	clientKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return LinkCertificates{}, err
+		return TunnelCertificates{}, err
 	}
 	clientTemplate := leafTemplate(name+" client", "", []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
 	clientDER, err := x509.CreateCertificate(rand.Reader, &clientTemplate, &caTemplate, &clientKey.PublicKey, caKey)
 	if err != nil {
-		return LinkCertificates{}, err
+		return TunnelCertificates{}, err
 	}
 	serverKeyDER, err := x509.MarshalECPrivateKey(serverKey)
 	if err != nil {
-		return LinkCertificates{}, err
+		return TunnelCertificates{}, err
 	}
 	clientKeyDER, err := x509.MarshalECPrivateKey(clientKey)
 	if err != nil {
-		return LinkCertificates{}, err
+		return TunnelCertificates{}, err
 	}
-	return LinkCertificates{
+	return TunnelCertificates{
 		CACert:     pemString("CERTIFICATE", caDER),
 		ServerCert: pemString("CERTIFICATE", serverDER),
 		ServerKey:  pemString("EC PRIVATE KEY", serverKeyDER),

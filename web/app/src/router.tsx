@@ -3,11 +3,11 @@ import { AppFrame } from './components/layout'
 import { AuditPage } from './pages/audit'
 import { DashboardPage } from './pages/dashboard'
 import { LoginPage, SetupPage } from './pages/auth'
-import { LinkDetailPage, LinkNewPage, LinksPage } from './pages/links'
+import { ForwardDetailPage, ForwardNewPage, ForwardsPage } from './pages/forwards'
 import { NodeDetailPage, NodeNewPage, NodesPage } from './pages/nodes'
 import { ControllerSettingsPage, SecuritySettingsPage, SettingsIndexPage } from './pages/settings'
-import { RouteDetailPage, RouteNewPage, RoutesPage } from './pages/routes'
 import { TrafficPage } from './pages/traffic'
+import { TunnelDetailPage, TunnelNewPage, TunnelsPage } from './pages/tunnels'
 
 const rootRoute = createRootRoute({
   component: AppFrame,
@@ -60,50 +60,50 @@ function NodeDetailRouteComponent() {
   return <NodeDetailPage nodeId={nodeId} />
 }
 
-const linksRoute = createRoute({
+const tunnelsRoute = createRoute({
   getParentRoute: () => rootRoute,
-  path: 'links',
-  component: LinksPage,
+  path: 'tunnels',
+  component: TunnelsPage,
 })
 
-const linkNewRoute = createRoute({
+const tunnelNewRoute = createRoute({
   getParentRoute: () => rootRoute,
-  path: 'links/new',
-  component: LinkNewPage,
+  path: 'tunnels/new',
+  component: TunnelNewPage,
 })
 
-const linkDetailRoute = createRoute({
+const tunnelDetailRoute = createRoute({
   getParentRoute: () => rootRoute,
-  path: 'links/$linkId',
-  component: LinkDetailRouteComponent,
+  path: 'tunnels/$tunnelId',
+  component: TunnelDetailRouteComponent,
 })
 
-function LinkDetailRouteComponent() {
-  const { linkId } = linkDetailRoute.useParams()
-  return <LinkDetailPage linkId={linkId} />
+function TunnelDetailRouteComponent() {
+  const { tunnelId } = tunnelDetailRoute.useParams()
+  return <TunnelDetailPage tunnelId={tunnelId} />
 }
 
-const routesRoute = createRoute({
+const forwardsRoute = createRoute({
   getParentRoute: () => rootRoute,
-  path: 'routes',
-  component: RoutesPage,
+  path: 'forwards',
+  component: ForwardsPage,
 })
 
-const routeNewRoute = createRoute({
+const forwardNewRoute = createRoute({
   getParentRoute: () => rootRoute,
-  path: 'routes/new',
-  component: RouteNewPage,
+  path: 'forwards/new',
+  component: ForwardNewPage,
 })
 
-const routeDetailRoute = createRoute({
+const forwardDetailRoute = createRoute({
   getParentRoute: () => rootRoute,
-  path: 'routes/$routeId',
-  component: RouteDetailRouteComponent,
+  path: 'forwards/$forwardId',
+  component: ForwardDetailRouteComponent,
 })
 
-function RouteDetailRouteComponent() {
-  const { routeId } = routeDetailRoute.useParams()
-  return <RouteDetailPage routeId={routeId} />
+function ForwardDetailRouteComponent() {
+  const { forwardId } = forwardDetailRoute.useParams()
+  return <ForwardDetailPage forwardId={forwardId} />
 }
 
 const trafficRoute = createRoute({
@@ -144,12 +144,12 @@ const routeTree = rootRoute.addChildren([
   nodesRoute,
   nodeNewRoute,
   nodeDetailRoute,
-  linksRoute,
-  linkNewRoute,
-  linkDetailRoute,
-  routesRoute,
-  routeNewRoute,
-  routeDetailRoute,
+  tunnelsRoute,
+  tunnelNewRoute,
+  tunnelDetailRoute,
+  forwardsRoute,
+  forwardNewRoute,
+  forwardDetailRoute,
   trafficRoute,
   auditRoute,
   settingsIndexRoute,

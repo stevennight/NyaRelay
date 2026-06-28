@@ -6,47 +6,89 @@ import (
 	"nyarelay/internal/shared/model"
 )
 
-func TestScopeConfigForNodeLimitsLinkSecrets(t *testing.T) {
-	link := model.Link{
-		ID:       "link_1",
-		Type:     model.LinkMTLS,
-		FromNode: "entry",
-		ToNode:   "exit",
-		Settings: map[string]string{
-			"secret":      "relay-secret",
-			"ca_cert":     "ca",
-			"server_cert": "server-cert",
-			"server_key":  "server-key",
-			"client_cert": "client-cert",
-			"client_key":  "client-key",
+func TestScopeConfigForNodeLimitsTunnelSecrets(t *testing.T) {
+	tunnel := model.Tunnel{
+		ID:        "tun_1",
+		Name:      "chain",
+		Type:      model.TunnelChain,
+		Transport: model.TunnelTransportMTLS,
+		Enabled:   true,
+		Stages: []model.TunnelStage{
+			{
+				ID:       "stage_entry",
+				TunnelID: "tun_1",
+				Index:    0,
+				Role:     model.TunnelStageEntry,
+				Strategy: "single",
+				Nodes: []model.TunnelStageNode{{
+					ID:       "stage_node_entry",
+					TunnelID: "tun_1",
+					StageID:  "stage_entry",
+					NodeID:   "entry",
+				}},
+			},
+			{
+				ID:       "stage_exit",
+				TunnelID: "tun_1",
+				Index:    1,
+				Role:     model.TunnelStageExit,
+				Strategy: "single",
+				Nodes: []model.TunnelStageNode{{
+					ID:         "stage_node_exit",
+					TunnelID:   "tun_1",
+					StageID:    "stage_exit",
+					NodeID:     "exit",
+					ListenAddr: "127.0.0.1:9000",
+					PublicAddr: "127.0.0.1:9000",
+					Settings: map[string]string{
+						"secret":      "relay-secret",
+						"ca_cert":     "ca",
+						"server_cert": "server-cert",
+						"server_key":  "server-key",
+						"client_cert": "client-cert",
+						"client_key":  "client-key",
+					},
+				}},
+			},
 		},
 	}
-	route := model.Route{
-		ID:        "route_1",
-		EntryNode: "entry",
-		Hops:      []model.RouteHop{{LinkID: "link_1"}},
+	forward := model.Forward{
+		ID:        "fwd_1",
+		Name:      "fwd",
+		TunnelID:  "tun_1",
+		Protocols: []model.ForwardProtocol{model.ForwardProtocolTCP},
+		Listen:    "127.0.0.1:8443",
+		Target:    "127.0.0.1:443",
 		Enabled:   true,
 	}
 
-	_, entryLinks := scopeConfigForNode("entry", []model.Route{route}, []model.Link{link})
-	if len(entryLinks) != 1 {
-		t.Fatalf("expected entry link")
+	entryTunnels, entryForwards := scopeConfigForNode("entry", []model.Tunnel{tunnel}, []model.Forward{forward})
+	if len(entryTunnels) != 1 || len(entryForwards) != 1 {
+		t.Fatalf("expected entry tunnel and forward")
 	}
-	if entryLinks[0].Settings["server_key"] != "" {
-		t.Fatal("entry node must not receive server key")
+	entryNext := entryTunnels[0].Stages[1].Nodes[0]
+	if entryNext.Settings["server_key"] != "" {
+		t.Fatal("dialing entry node must not receive server key")
 	}
-	if entryLinks[0].Settings["client_key"] == "" {
-		t.Fatal("entry node must receive client key")
+	if entryNext.Settings["client_key"] == "" {
+		t.Fatal("dialing entry node must receive client key")
+	}
+	if entryForwards[0].Target != "" {
+		t.Fatal("chain entry node must not receive target")
 	}
 
-	_, exitLinks := scopeConfigForNode("exit", []model.Route{route}, []model.Link{link})
-	if len(exitLinks) != 1 {
-		t.Fatalf("expected exit link")
+	exitTunnels, exitForwards := scopeConfigForNode("exit", []model.Tunnel{tunnel}, []model.Forward{forward})
+	if len(exitTunnels) != 1 || len(exitForwards) != 1 {
+		t.Fatalf("expected exit tunnel and forward")
 	}
-	if exitLinks[0].Settings["client_key"] != "" {
-		t.Fatal("exit node must not receive client key")
+	exitLocal := exitTunnels[0].Stages[1].Nodes[0]
+	if exitLocal.Settings["client_key"] != "" {
+		t.Fatal("listener exit node must not receive client key")
 	}
-	if exitLinks[0].Settings["server_key"] == "" {
-		t.Fatal("exit node must receive server key")
+	if exitLocal.Settings["server_key"] == "" {
+		t.Fatal("listener exit node must receive server key")
+	}
+	if exitForwards[0].Target == "" {
+		t.Fatal("exit node must receive target")
 	}
 }

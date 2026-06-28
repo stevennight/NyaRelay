@@ -2,31 +2,34 @@ package relay
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"time"
 
+	"nyarelay/internal/node/metrics"
 	"nyarelay/internal/shared/model"
 	"nyarelay/internal/shared/protocol"
 )
 
-func (s *Service) listenUDPRoute(ctx context.Context, route model.Route) error {
-	addr, err := net.ResolveUDPAddr("udp", route.Listen)
+func (s *Service) listenUDPForward(ctx context.Context, forward model.ForwardRuntime, tunnel model.TunnelRuntime) error {
+	addr, err := net.ResolveUDPAddr("udp", forward.Listen)
 	if err != nil {
 		return err
 	}
 	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
-		return fmt.Errorf("listen udp route %s: %w", route.Name, err)
+		return fmt.Errorf("listen udp forward %s: %w", forward.Name, err)
 	}
 	s.servers = append(s.servers, conn)
-	s.log.Info("udp route listening", "route", route.Name, "listen", route.Listen)
-	go s.udpLoop(ctx, route, conn)
+	s.log.Info("forward udp listening", "forward", forward.Name, "listen", forward.Listen)
+	go s.udpLoop(ctx, forward, tunnel, conn)
 	return nil
 }
 
-func (s *Service) udpLoop(ctx context.Context, route model.Route, inbound *net.UDPConn) {
-	buf := make([]byte, 64*1024)
+func (s *Service) udpLoop(ctx context.Context, forward model.ForwardRuntime, tunnel model.TunnelRuntime, inbound *net.UDPConn) {
+	buf := make([]byte, protocol.MaxUDPPacket)
 	for {
 		_ = inbound.SetReadDeadline(time.Now().Add(time.Second))
 		n, clientAddr, err := inbound.ReadFromUDP(buf)
@@ -39,22 +42,31 @@ func (s *Service) udpLoop(ctx context.Context, route model.Route, inbound *net.U
 			}
 		}
 		payload := append([]byte(nil), buf[:n]...)
-		go s.handleUDPPacket(ctx, route, inbound, clientAddr, payload)
+		go s.handleUDPPacket(ctx, forward, tunnel, inbound, clientAddr, payload)
 	}
 }
 
-func (s *Service) handleUDPPacket(ctx context.Context, route model.Route, inbound *net.UDPConn, clientAddr *net.UDPAddr, payload []byte) {
-	counter := s.routes.Get(route.ID)
+func (s *Service) handleUDPPacket(ctx context.Context, forward model.ForwardRuntime, tunnel model.TunnelRuntime, inbound *net.UDPConn, clientAddr *net.UDPAddr, payload []byte) {
+	counter := s.forwards.Get("forward:" + forward.ID)
 	counter.AddConnection()
-	response, statID, err := s.forwardUDP(ctx, route, 0, payload)
+	var response []byte
+	var statID string
+	var err error
+	if tunnel.Type == model.TunnelDirect {
+		response, err = udpRoundTrip(ctx, forward.Target, payload)
+		statID = "target:" + forward.ID
+	} else {
+		sessionID := forward.ID + ":" + clientAddr.String()
+		response, statID, err = s.forwardUDPOverTunnel(ctx, tunnel, forward, sessionID, payload)
+	}
 	if err != nil {
-		s.log.Debug("udp forward failed", "route", route.Name, "error", err)
+		s.log.Debug("udp forward failed", "forward", forward.Name, "error", err)
 		return
 	}
 	if statID != "" {
-		linkCounter := s.links.Get(statID)
-		linkCounter.AddIn(int64(len(payload)))
-		linkCounter.AddOut(int64(len(response)))
+		tunnelCounter := s.tunnels.Get(statID)
+		tunnelCounter.AddIn(int64(len(payload)))
+		tunnelCounter.AddOut(int64(len(response)))
 	}
 	counter.AddIn(int64(len(payload)))
 	if len(response) > 0 {
@@ -63,103 +75,56 @@ func (s *Service) handleUDPPacket(ctx context.Context, route model.Route, inboun
 	}
 }
 
-func (s *Service) listenUDPLink(ctx context.Context, link model.Link) error {
-	addr, err := net.ResolveUDPAddr("udp", link.BindAddr)
+func (s *Service) forwardUDPOverTunnel(ctx context.Context, tunnel model.TunnelRuntime, forward model.ForwardRuntime, sessionID string, payload []byte) ([]byte, string, error) {
+	stream, statID, err := s.dialForwardNext(ctx, tunnel, forward, 0, "udp")
 	if err != nil {
-		return err
+		return nil, statID, err
 	}
-	conn, err := net.ListenUDP("udp", addr)
+	defer stream.Close()
+	if err := protocol.WriteUDPDatagramFrame(stream, protocol.UDPDatagramFrame{
+		ForwardID: forward.ID,
+		SessionID: sessionID,
+		Payload:   payload,
+	}); err != nil {
+		return nil, statID, err
+	}
+	frame, err := protocol.ReadUDPDatagramFrame(stream)
 	if err != nil {
-		return fmt.Errorf("listen udp link %s: %w", link.Name, err)
+		return nil, statID, err
 	}
-	s.servers = append(s.servers, conn)
-	s.log.Info("udp link listening", "link", link.Name, "listen", link.BindAddr)
-	go func() {
-		buf := make([]byte, protocol.MaxUDPPacket)
-		for {
-			_ = conn.SetReadDeadline(time.Now().Add(time.Second))
-			n, remote, err := conn.ReadFromUDP(buf)
-			if err != nil {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					continue
-				}
+	if frame.ForwardID != forward.ID || frame.SessionID != sessionID {
+		return nil, statID, errors.New("udp response frame mismatch")
+	}
+	return frame.Payload, statID, nil
+}
+
+func (s *Service) handleUDPStageExit(ctx context.Context, forward model.ForwardRuntime, inbound net.Conn, counter *metrics.Counter) {
+	for {
+		frame, err := protocol.ReadUDPDatagramFrame(inbound)
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				s.log.Debug("udp stream read failed", "forward", forward.Name, "error", err)
 			}
-			frame := append([]byte(nil), buf[:n]...)
-			go s.handleUDPLinkPacket(ctx, link, conn, remote, frame)
+			return
 		}
-	}()
-	return nil
-}
-
-func (s *Service) handleUDPLinkPacket(ctx context.Context, link model.Link, conn *net.UDPConn, remote *net.UDPAddr, frame []byte) {
-	header, payload, err := protocol.DecodeUDPFrame(frame)
-	if err != nil {
-		s.log.Debug("invalid udp frame", "link", link.Name, "error", err)
-		return
+		if frame.ForwardID != forward.ID {
+			return
+		}
+		response, err := udpRoundTrip(ctx, forward.Target, frame.Payload)
+		if err != nil {
+			s.log.Debug("udp target round trip failed", "forward", forward.Name, "error", err)
+			return
+		}
+		counter.AddIn(int64(len(frame.Payload)))
+		counter.AddOut(int64(len(response)))
+		if err := protocol.WriteUDPDatagramFrame(inbound, protocol.UDPDatagramFrame{
+			ForwardID: forward.ID,
+			SessionID: frame.SessionID,
+			Payload:   response,
+		}); err != nil {
+			return
+		}
 	}
-	if link.Settings["secret"] != "" && header.Secret != link.Settings["secret"] {
-		s.log.Warn("udp relay secret rejected", "link", link.Name, "route", header.RouteID)
-		return
-	}
-	route, ok := s.findRoute(header.RouteID)
-	if !ok || !route.Enabled {
-		return
-	}
-	response, statID, err := s.forwardUDP(ctx, route, header.HopIndex+1, payload)
-	if err != nil {
-		s.log.Debug("udp next hop failed", "link", link.Name, "error", err)
-		return
-	}
-	if statID != "" {
-		linkCounter := s.links.Get(statID)
-		linkCounter.AddIn(int64(len(payload)))
-		linkCounter.AddOut(int64(len(response)))
-	}
-	out, err := protocol.EncodeUDPFrame(protocol.UDPHeader{
-		RouteID:  route.ID,
-		HopIndex: header.HopIndex,
-		Secret:   header.Secret,
-	}, response)
-	if err != nil {
-		return
-	}
-	_, _ = conn.WriteToUDP(out, remote)
-}
-
-func (s *Service) forwardUDP(ctx context.Context, route model.Route, hopIndex int, payload []byte) ([]byte, string, error) {
-	if hopIndex >= len(route.Hops) {
-		response, err := udpRoundTrip(ctx, route.Target, payload)
-		return response, "target:" + route.ID, err
-	}
-	hop := route.Hops[hopIndex]
-	link, ok := s.findLink(hop.LinkID)
-	if !ok || !link.Enabled {
-		return nil, "", fmt.Errorf("link %s is not available", hop.LinkID)
-	}
-	if link.Type != model.LinkDirect {
-		return nil, link.ID, fmt.Errorf("udp hops currently require direct links, got %s", link.Type)
-	}
-	secret := ""
-	if link.Settings != nil {
-		secret = link.Settings["secret"]
-	}
-	frame, err := protocol.EncodeUDPFrame(protocol.UDPHeader{
-		RouteID:  route.ID,
-		HopIndex: hopIndex,
-		Secret:   secret,
-	}, payload)
-	if err != nil {
-		return nil, link.ID, err
-	}
-	responseFrame, err := udpRoundTrip(ctx, link.PublicAddr, frame)
-	if err != nil {
-		return nil, link.ID, err
-	}
-	_, response, err := protocol.DecodeUDPFrame(responseFrame)
-	return response, link.ID, err
 }
 
 func udpRoundTrip(ctx context.Context, addr string, payload []byte) ([]byte, error) {
@@ -177,8 +142,7 @@ func udpRoundTrip(ctx context.Context, addr string, payload []byte) ([]byte, err
 		deadline = d
 	}
 	_ = out.SetDeadline(deadline)
-	_, err = out.Write(payload)
-	if err != nil {
+	if _, err := out.Write(payload); err != nil {
 		return nil, err
 	}
 	buf := make([]byte, protocol.MaxUDPPacket)

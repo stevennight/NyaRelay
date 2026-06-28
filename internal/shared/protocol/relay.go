@@ -1,24 +1,34 @@
 package protocol
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
 )
 
-const Magic = "NYAR1"
+const (
+	Magic        = "NYAR1"
+	HelloVersion = 1
+)
 
 type RelayHello struct {
-	Magic    string `json:"magic"`
-	RouteID  string `json:"route_id"`
-	HopIndex int    `json:"hop_index"`
-	Network  string `json:"network"`
-	Secret   string `json:"secret"`
+	Magic          string `json:"magic"`
+	Version        int    `json:"version"`
+	TunnelID       string `json:"tunnel_id"`
+	ForwardID      string `json:"forward_id"`
+	FromStageIndex int    `json:"from_stage_index"`
+	ToStageIndex   int    `json:"to_stage_index"`
+	Network        string `json:"network"`
+	Secret         string `json:"secret,omitempty"`
 }
 
 func WriteHello(w io.Writer, hello RelayHello) error {
 	hello.Magic = Magic
+	if hello.Version == 0 {
+		hello.Version = HelloVersion
+	}
 	payload, err := json.Marshal(hello)
 	if err != nil {
 		return err
@@ -48,12 +58,17 @@ func ReadHello(r io.Reader) (RelayHello, error) {
 	if _, err := io.ReadFull(r, payload); err != nil {
 		return RelayHello{}, err
 	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
 	var hello RelayHello
-	if err := json.Unmarshal(payload, &hello); err != nil {
+	if err := decoder.Decode(&hello); err != nil {
 		return RelayHello{}, err
 	}
 	if hello.Magic != Magic {
 		return RelayHello{}, errors.New("invalid relay hello magic")
+	}
+	if hello.Version != HelloVersion {
+		return RelayHello{}, errors.New("unsupported relay hello version")
 	}
 	return hello, nil
 }

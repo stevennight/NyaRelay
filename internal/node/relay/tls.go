@@ -8,9 +8,9 @@ import (
 	"nyarelay/internal/shared/model"
 )
 
-func (s *Service) serverTLSConfig(link model.Link) (*tls.Config, error) {
-	certPEM := link.Settings["server_cert"]
-	keyPEM := link.Settings["server_key"]
+func (s *Service) serverTLSConfig(tunnel model.TunnelRuntime, node model.TunnelRuntimeNode) (*tls.Config, error) {
+	certPEM := node.Settings["server_cert"]
+	keyPEM := node.Settings["server_key"]
 	cert, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM))
 	if err != nil {
 		return nil, err
@@ -19,8 +19,8 @@ func (s *Service) serverTLSConfig(link model.Link) (*tls.Config, error) {
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS12,
 	}
-	if link.Type == model.LinkMTLS {
-		pool, err := certPool(link.Settings["ca_cert"])
+	if tunnel.Transport == model.TunnelTransportMTLS {
+		pool, err := certPool(node.Settings["ca_cert"])
 		if err != nil {
 			return nil, err
 		}
@@ -30,21 +30,21 @@ func (s *Service) serverTLSConfig(link model.Link) (*tls.Config, error) {
 	return cfg, nil
 }
 
-func (s *Service) clientTLSConfig(link model.Link, serverName string) (*tls.Config, error) {
+func (s *Service) clientTLSConfig(tunnel model.TunnelRuntime, node model.TunnelRuntimeNode, serverName string) (*tls.Config, error) {
 	cfg := &tls.Config{
 		ServerName:         serverName,
-		InsecureSkipVerify: link.Settings["skip_verify"] == "true",
+		InsecureSkipVerify: node.Settings["skip_verify"] == "true",
 		MinVersion:         tls.VersionTLS12,
 	}
-	if link.Settings["ca_cert"] != "" && !cfg.InsecureSkipVerify {
-		pool, err := certPool(link.Settings["ca_cert"])
+	if node.Settings["ca_cert"] != "" && !cfg.InsecureSkipVerify {
+		pool, err := certPool(node.Settings["ca_cert"])
 		if err != nil {
 			return nil, err
 		}
 		cfg.RootCAs = pool
 	}
-	if link.Type == model.LinkMTLS {
-		cert, err := tls.X509KeyPair([]byte(link.Settings["client_cert"]), []byte(link.Settings["client_key"]))
+	if tunnel.Transport == model.TunnelTransportMTLS {
+		cert, err := tls.X509KeyPair([]byte(node.Settings["client_cert"]), []byte(node.Settings["client_key"]))
 		if err != nil {
 			return nil, err
 		}

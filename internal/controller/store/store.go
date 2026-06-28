@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -76,32 +75,66 @@ func (s *Store) migrate(ctx context.Context) error {
 			updated_at TEXT NOT NULL,
 			system_json TEXT NOT NULL DEFAULT '{}'
 		);`,
-		`CREATE TABLE IF NOT EXISTS links (
+		`CREATE TABLE IF NOT EXISTS tunnels (
 			id TEXT PRIMARY KEY,
 			name TEXT NOT NULL,
 			type TEXT NOT NULL,
-			from_node TEXT NOT NULL,
-			to_node TEXT NOT NULL,
-			bind_addr TEXT NOT NULL,
-			public_addr TEXT NOT NULL,
-			server_name TEXT NOT NULL DEFAULT '',
+			transport TEXT NOT NULL,
 			enabled INTEGER NOT NULL,
 			settings_json TEXT NOT NULL DEFAULT '{}',
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		);`,
-		`CREATE TABLE IF NOT EXISTS routes (
+		`CREATE TABLE IF NOT EXISTS tunnel_stages (
 			id TEXT PRIMARY KEY,
-			name TEXT NOT NULL,
-			protocol TEXT NOT NULL,
-			entry_node TEXT NOT NULL,
-			listen TEXT NOT NULL,
-			target TEXT NOT NULL,
-			enabled INTEGER NOT NULL,
-			hops_json TEXT NOT NULL DEFAULT '[]',
+			tunnel_id TEXT NOT NULL,
+			stage_index INTEGER NOT NULL,
+			role TEXT NOT NULL,
+			strategy TEXT NOT NULL DEFAULT 'single',
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		);`,
+		`CREATE TABLE IF NOT EXISTS tunnel_stage_nodes (
+			id TEXT PRIMARY KEY,
+			tunnel_id TEXT NOT NULL,
+			stage_id TEXT NOT NULL,
+			node_id TEXT NOT NULL,
+			listen_addr TEXT NOT NULL DEFAULT '',
+			public_addr TEXT NOT NULL DEFAULT '',
+			connect_addr TEXT NOT NULL DEFAULT '',
+			weight INTEGER NOT NULL DEFAULT 1,
+			settings_json TEXT NOT NULL DEFAULT '{}',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);`,
+		`CREATE TABLE IF NOT EXISTS forwards (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			tunnel_id TEXT NOT NULL,
+			protocols_json TEXT NOT NULL,
+			listen TEXT NOT NULL,
+			target TEXT NOT NULL,
+			enabled INTEGER NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);`,
+		`CREATE TABLE IF NOT EXISTS port_allocations (
+			id TEXT PRIMARY KEY,
+			node_id TEXT NOT NULL,
+			owner_kind TEXT NOT NULL,
+			owner_id TEXT NOT NULL,
+			protocol TEXT NOT NULL,
+			port INTEGER NOT NULL,
+			bind_addr TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			UNIQUE(node_id, protocol, port)
+		);`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_tunnel_stage_order ON tunnel_stages(tunnel_id, stage_index);`,
+		`CREATE INDEX IF NOT EXISTS idx_tunnel_stage_nodes_tunnel ON tunnel_stage_nodes(tunnel_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_tunnel_stage_nodes_stage ON tunnel_stage_nodes(stage_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_forwards_tunnel ON forwards(tunnel_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_port_allocations_owner ON port_allocations(owner_kind, owner_id);`,
 		`CREATE TABLE IF NOT EXISTS metrics (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			node_id TEXT NOT NULL,
@@ -395,155 +428,422 @@ func (s *Store) RevokeNode(ctx context.Context, id string) error {
 	return err
 }
 
-func (s *Store) UpsertLink(ctx context.Context, link model.Link) error {
-	now := time.Now().UTC()
-	if link.CreatedAt.IsZero() {
-		link.CreatedAt = now
+func (s *Store) SaveTunnel(ctx context.Context, tunnel model.Tunnel, allocations []model.PortAllocation) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
 	}
-	link.UpdatedAt = now
-	settings, _ := json.Marshal(emptyMap(link.Settings))
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO links
-		 (id, name, type, from_node, to_node, bind_addr, public_addr, server_name, enabled, settings_json, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	defer tx.Rollback()
+	now := time.Now().UTC()
+	if tunnel.CreatedAt.IsZero() {
+		tunnel.CreatedAt = now
+	}
+	tunnel.UpdatedAt = now
+	settings, _ := json.Marshal(emptyMap(tunnel.Settings))
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO tunnels (id, name, type, transport, enabled, settings_json, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET
 		   name = excluded.name,
 		   type = excluded.type,
-		   from_node = excluded.from_node,
-		   to_node = excluded.to_node,
-		   bind_addr = excluded.bind_addr,
-		   public_addr = excluded.public_addr,
-		   server_name = excluded.server_name,
+		   transport = excluded.transport,
 		   enabled = excluded.enabled,
 		   settings_json = excluded.settings_json,
 		   updated_at = excluded.updated_at`,
-		link.ID, link.Name, string(link.Type), link.FromNode, link.ToNode, link.BindAddr, link.PublicAddr,
-		link.ServerName, boolInt(link.Enabled), string(settings),
-		link.CreatedAt.UTC().Format(time.RFC3339Nano), link.UpdatedAt.UTC().Format(time.RFC3339Nano),
+		tunnel.ID, tunnel.Name, string(tunnel.Type), string(tunnel.Transport), boolInt(tunnel.Enabled), string(settings),
+		tunnel.CreatedAt.UTC().Format(time.RFC3339Nano), tunnel.UpdatedAt.UTC().Format(time.RFC3339Nano),
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM port_allocations
+		 WHERE owner_kind = 'tunnel_stage_node'
+		   AND owner_id IN (SELECT id FROM tunnel_stage_nodes WHERE tunnel_id = ?)`,
+		tunnel.ID,
+	); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tunnel_stage_nodes WHERE tunnel_id = ?`, tunnel.ID); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tunnel_stages WHERE tunnel_id = ?`, tunnel.ID); err != nil {
+		return 0, err
+	}
+	for _, stage := range tunnel.Stages {
+		if stage.CreatedAt.IsZero() {
+			stage.CreatedAt = now
+		}
+		stage.UpdatedAt = now
+		if stage.Strategy == "" {
+			stage.Strategy = "single"
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO tunnel_stages (id, tunnel_id, stage_index, role, strategy, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			stage.ID, tunnel.ID, stage.Index, string(stage.Role), stage.Strategy,
+			stage.CreatedAt.UTC().Format(time.RFC3339Nano), stage.UpdatedAt.UTC().Format(time.RFC3339Nano),
+		); err != nil {
+			return 0, err
+		}
+		for _, node := range stage.Nodes {
+			if node.CreatedAt.IsZero() {
+				node.CreatedAt = now
+			}
+			node.UpdatedAt = now
+			if node.Weight <= 0 {
+				node.Weight = 1
+			}
+			nodeSettings, _ := json.Marshal(emptyMap(node.Settings))
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO tunnel_stage_nodes
+				 (id, tunnel_id, stage_id, node_id, listen_addr, public_addr, connect_addr, weight, settings_json, created_at, updated_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				node.ID, tunnel.ID, stage.ID, node.NodeID, node.ListenAddr, node.PublicAddr, node.ConnectAddr,
+				node.Weight, string(nodeSettings), node.CreatedAt.UTC().Format(time.RFC3339Nano), node.UpdatedAt.UTC().Format(time.RFC3339Nano),
+			); err != nil {
+				return 0, err
+			}
+		}
+	}
+	if err := insertAllocations(ctx, tx, allocations); err != nil {
+		return 0, err
+	}
+	rev, err := bumpRevisionTx(ctx, tx)
+	if err != nil {
+		return 0, err
+	}
+	return rev, tx.Commit()
 }
 
-func (s *Store) ListLinks(ctx context.Context) ([]model.Link, error) {
+func (s *Store) ListTunnels(ctx context.Context) ([]model.Tunnel, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, name, type, from_node, to_node, bind_addr, public_addr, server_name, enabled, settings_json, created_at, updated_at
-		 FROM links ORDER BY created_at DESC`,
+		`SELECT id, name, type, transport, enabled, settings_json, created_at, updated_at
+		 FROM tunnels ORDER BY created_at DESC`,
 	)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []model.Link
+	var out []model.Tunnel
 	for rows.Next() {
-		link, err := scanLink(rows)
+		tunnel, err := scanTunnel(rows)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, link)
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) GetLink(ctx context.Context, id string) (model.Link, error) {
-	row := s.db.QueryRowContext(ctx,
-		`SELECT id, name, type, from_node, to_node, bind_addr, public_addr, server_name, enabled, settings_json, created_at, updated_at
-		 FROM links WHERE id = ?`, id,
-	)
-	return scanLink(row)
-}
-
-func (s *Store) UpsertRoute(ctx context.Context, route model.Route) error {
-	now := time.Now().UTC()
-	if route.CreatedAt.IsZero() {
-		route.CreatedAt = now
-	}
-	route.UpdatedAt = now
-	hops, _ := json.Marshal(route.Hops)
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO routes
-		 (id, name, protocol, entry_node, listen, target, enabled, hops_json, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(id) DO UPDATE SET
-		   name = excluded.name,
-		   protocol = excluded.protocol,
-		   entry_node = excluded.entry_node,
-		   listen = excluded.listen,
-		   target = excluded.target,
-		   enabled = excluded.enabled,
-		   hops_json = excluded.hops_json,
-		   updated_at = excluded.updated_at`,
-		route.ID, route.Name, string(route.Protocol), route.EntryNode, route.Listen, route.Target,
-		boolInt(route.Enabled), string(hops), route.CreatedAt.UTC().Format(time.RFC3339Nano),
-		route.UpdatedAt.UTC().Format(time.RFC3339Nano),
-	)
-	return err
-}
-
-func (s *Store) ListRoutes(ctx context.Context) ([]model.Route, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, name, protocol, entry_node, listen, target, enabled, hops_json, created_at, updated_at
-		 FROM routes ORDER BY created_at DESC`,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []model.Route
-	for rows.Next() {
-		route, err := scanRoute(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, route)
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) NodePortUsage(ctx context.Context, nodeID, excludeRouteID string) (map[string]bool, error) {
-	used := make(map[string]bool)
-	rows, err := s.db.QueryContext(ctx, `SELECT id, listen FROM routes WHERE enabled = 1 AND entry_node = ?`, nodeID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var id, listen string
-		if err := rows.Scan(&id, &listen); err != nil {
-			return nil, err
-		}
-		if excludeRouteID != "" && id == excludeRouteID {
-			continue
-		}
-		if _, port, err := net.SplitHostPort(listen); err == nil {
-			used[port] = true
-		}
-	}
-	linkRows, err := s.db.QueryContext(ctx, `SELECT bind_addr FROM links WHERE enabled = 1 AND to_node = ?`, nodeID)
-	if err != nil {
-		return nil, err
-	}
-	defer linkRows.Close()
-	for linkRows.Next() {
-		var bindAddr string
-		if err := linkRows.Scan(&bindAddr); err != nil {
-			return nil, err
-		}
-		if _, port, err := net.SplitHostPort(bindAddr); err == nil {
-			used[port] = true
-		}
+		out = append(out, tunnel)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	return used, linkRows.Err()
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		if err := s.loadTunnelStages(ctx, &out[i]); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
-func (s *Store) GetRoute(ctx context.Context, id string) (model.Route, error) {
+func (s *Store) GetTunnel(ctx context.Context, id string) (model.Tunnel, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, name, protocol, entry_node, listen, target, enabled, hops_json, created_at, updated_at
-		 FROM routes WHERE id = ?`, id,
+		`SELECT id, name, type, transport, enabled, settings_json, created_at, updated_at
+		 FROM tunnels WHERE id = ?`, id,
 	)
-	return scanRoute(row)
+	tunnel, err := scanTunnel(row)
+	if err != nil {
+		return model.Tunnel{}, err
+	}
+	if err := s.loadTunnelStages(ctx, &tunnel); err != nil {
+		return model.Tunnel{}, err
+	}
+	return tunnel, nil
+}
+
+func (s *Store) DeleteTunnel(ctx context.Context, id string, force bool) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	var count int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM forwards WHERE tunnel_id = ?`, id).Scan(&count); err != nil {
+		return 0, err
+	}
+	if count > 0 && !force {
+		return 0, errors.New("tunnel still has forwards")
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM port_allocations
+		 WHERE owner_kind = 'forward'
+		   AND owner_id IN (SELECT id FROM forwards WHERE tunnel_id = ?)`,
+		id,
+	); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM port_allocations
+		 WHERE owner_kind = 'tunnel_stage_node'
+		   AND owner_id IN (SELECT id FROM tunnel_stage_nodes WHERE tunnel_id = ?)`,
+		id,
+	); err != nil {
+		return 0, err
+	}
+	if force {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM forwards WHERE tunnel_id = ?`, id); err != nil {
+			return 0, err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tunnel_stage_nodes WHERE tunnel_id = ?`, id); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tunnel_stages WHERE tunnel_id = ?`, id); err != nil {
+		return 0, err
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM tunnels WHERE id = ?`, id)
+	if err != nil {
+		return 0, err
+	}
+	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
+		return 0, errors.New("tunnel not found")
+	}
+	rev, err := bumpRevisionTx(ctx, tx)
+	if err != nil {
+		return 0, err
+	}
+	return rev, tx.Commit()
+}
+
+func (s *Store) SetTunnelEnabled(ctx context.Context, id string, enabled bool) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `UPDATE tunnels SET enabled = ?, updated_at = ? WHERE id = ?`, boolInt(enabled), time.Now().UTC().Format(time.RFC3339Nano), id)
+	if err != nil {
+		return 0, err
+	}
+	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
+		return 0, errors.New("tunnel not found")
+	}
+	rev, err := bumpRevisionTx(ctx, tx)
+	if err != nil {
+		return 0, err
+	}
+	return rev, tx.Commit()
+}
+
+func (s *Store) loadTunnelStages(ctx context.Context, tunnel *model.Tunnel) error {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, tunnel_id, stage_index, role, strategy, created_at, updated_at
+		 FROM tunnel_stages WHERE tunnel_id = ? ORDER BY stage_index ASC`,
+		tunnel.ID,
+	)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var stages []model.TunnelStage
+	for rows.Next() {
+		stage, err := scanTunnelStage(rows)
+		if err != nil {
+			return err
+		}
+		stages = append(stages, stage)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for i := range stages {
+		nodes, err := s.listStageNodes(ctx, stages[i].ID)
+		if err != nil {
+			return err
+		}
+		stages[i].Nodes = nodes
+	}
+	tunnel.Stages = stages
+	return nil
+}
+
+func (s *Store) listStageNodes(ctx context.Context, stageID string) ([]model.TunnelStageNode, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, tunnel_id, stage_id, node_id, listen_addr, public_addr, connect_addr, weight, settings_json, created_at, updated_at
+		 FROM tunnel_stage_nodes WHERE stage_id = ? ORDER BY id ASC`,
+		stageID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.TunnelStageNode
+	for rows.Next() {
+		node, err := scanTunnelStageNode(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, node)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) SaveForward(ctx context.Context, forward model.Forward, allocations []model.PortAllocation) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	now := time.Now().UTC()
+	if forward.CreatedAt.IsZero() {
+		forward.CreatedAt = now
+	}
+	forward.UpdatedAt = now
+	protocols, _ := json.Marshal(forward.Protocols)
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO forwards (id, name, tunnel_id, protocols_json, listen, target, enabled, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(id) DO UPDATE SET
+		   name = excluded.name,
+		   tunnel_id = excluded.tunnel_id,
+		   protocols_json = excluded.protocols_json,
+		   listen = excluded.listen,
+		   target = excluded.target,
+		   enabled = excluded.enabled,
+		   updated_at = excluded.updated_at`,
+		forward.ID, forward.Name, forward.TunnelID, string(protocols), forward.Listen, forward.Target, boolInt(forward.Enabled),
+		forward.CreatedAt.UTC().Format(time.RFC3339Nano), forward.UpdatedAt.UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM port_allocations WHERE owner_kind = 'forward' AND owner_id = ?`, forward.ID); err != nil {
+		return 0, err
+	}
+	if err := insertAllocations(ctx, tx, allocations); err != nil {
+		return 0, err
+	}
+	rev, err := bumpRevisionTx(ctx, tx)
+	if err != nil {
+		return 0, err
+	}
+	return rev, tx.Commit()
+}
+
+func (s *Store) ListForwards(ctx context.Context) ([]model.Forward, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, name, tunnel_id, protocols_json, listen, target, enabled, created_at, updated_at
+		 FROM forwards ORDER BY created_at DESC`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.Forward
+	for rows.Next() {
+		forward, err := scanForward(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, forward)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListForwardsByTunnel(ctx context.Context, tunnelID string) ([]model.Forward, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, name, tunnel_id, protocols_json, listen, target, enabled, created_at, updated_at
+		 FROM forwards WHERE tunnel_id = ? ORDER BY created_at DESC`,
+		tunnelID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.Forward
+	for rows.Next() {
+		forward, err := scanForward(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, forward)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) GetForward(ctx context.Context, id string) (model.Forward, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, name, tunnel_id, protocols_json, listen, target, enabled, created_at, updated_at
+		 FROM forwards WHERE id = ?`, id,
+	)
+	return scanForward(row)
+}
+
+func (s *Store) DeleteForward(ctx context.Context, id string) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM port_allocations WHERE owner_kind = 'forward' AND owner_id = ?`, id); err != nil {
+		return 0, err
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM forwards WHERE id = ?`, id)
+	if err != nil {
+		return 0, err
+	}
+	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
+		return 0, errors.New("forward not found")
+	}
+	rev, err := bumpRevisionTx(ctx, tx)
+	if err != nil {
+		return 0, err
+	}
+	return rev, tx.Commit()
+}
+
+func (s *Store) SetForwardEnabled(ctx context.Context, id string, enabled bool) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `UPDATE forwards SET enabled = ?, updated_at = ? WHERE id = ?`, boolInt(enabled), time.Now().UTC().Format(time.RFC3339Nano), id)
+	if err != nil {
+		return 0, err
+	}
+	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
+		return 0, errors.New("forward not found")
+	}
+	rev, err := bumpRevisionTx(ctx, tx)
+	if err != nil {
+		return 0, err
+	}
+	return rev, tx.Commit()
+}
+
+func (s *Store) ListPortAllocations(ctx context.Context) ([]model.PortAllocation, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, node_id, owner_kind, owner_id, protocol, port, bind_addr, created_at, updated_at
+		 FROM port_allocations ORDER BY node_id, protocol, port`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.PortAllocation
+	for rows.Next() {
+		allocation, err := scanPortAllocation(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, allocation)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) InsertMetrics(ctx context.Context, report model.MetricsReport) error {
@@ -564,13 +864,13 @@ func (s *Store) InsertMetrics(ctx context.Context, report model.MetricsReport) e
 		)
 		return err
 	}
-	for _, stat := range report.RouteStats {
-		if err := insert("route", stat); err != nil {
+	for _, stat := range report.ForwardStats {
+		if err := insert("forward", stat); err != nil {
 			return err
 		}
 	}
-	for _, stat := range report.LinkStats {
-		if err := insert("link", stat); err != nil {
+	for _, stat := range report.TunnelStats {
+		if err := insert("tunnel", stat); err != nil {
 			return err
 		}
 	}
@@ -649,19 +949,16 @@ func (s *Store) MetricSummary(ctx context.Context, limit int) ([]MetricSummary, 
 }
 
 func (s *Store) BumpRevision(ctx context.Context) (int64, error) {
-	value, ok, err := s.GetSetting(ctx, "config_revision")
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
-	var rev int64
-	if ok {
-		_, _ = fmt.Sscan(value, &rev)
-	}
-	rev++
-	if err := s.SetSetting(ctx, "config_revision", fmt.Sprintf("%d", rev)); err != nil {
+	defer tx.Rollback()
+	rev, err := bumpRevisionTx(ctx, tx)
+	if err != nil {
 		return 0, err
 	}
-	return rev, nil
+	return rev, tx.Commit()
 }
 
 func (s *Store) CurrentRevision(ctx context.Context) (int64, error) {
@@ -672,6 +969,45 @@ func (s *Store) CurrentRevision(ctx context.Context) (int64, error) {
 	var rev int64
 	_, _ = fmt.Sscan(value, &rev)
 	return rev, nil
+}
+
+func insertAllocations(ctx context.Context, tx *sql.Tx, allocations []model.PortAllocation) error {
+	now := time.Now().UTC()
+	for _, allocation := range allocations {
+		if allocation.CreatedAt.IsZero() {
+			allocation.CreatedAt = now
+		}
+		allocation.UpdatedAt = now
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO port_allocations
+			 (id, node_id, owner_kind, owner_id, protocol, port, bind_addr, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			allocation.ID, allocation.NodeID, allocation.OwnerKind, allocation.OwnerID, allocation.Protocol,
+			allocation.Port, allocation.BindAddr, allocation.CreatedAt.UTC().Format(time.RFC3339Nano), allocation.UpdatedAt.UTC().Format(time.RFC3339Nano),
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func bumpRevisionTx(ctx context.Context, tx *sql.Tx) (int64, error) {
+	var value string
+	err := tx.QueryRowContext(ctx, `SELECT value FROM settings WHERE key = ?`, "config_revision").Scan(&value)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, err
+	}
+	var rev int64
+	if err == nil {
+		_, _ = fmt.Sscan(value, &rev)
+	}
+	rev++
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO settings (key, value) VALUES (?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		"config_revision", fmt.Sprintf("%d", rev),
+	)
+	return rev, err
 }
 
 type scanner interface {
@@ -701,6 +1037,78 @@ func scanNode(row scanner) (model.Node, string, error) {
 	return node, token, nil
 }
 
+func scanTunnel(row scanner) (model.Tunnel, error) {
+	var tunnel model.Tunnel
+	var tunnelType, transport, settingsJSON, created, updated string
+	var enabled int
+	err := row.Scan(&tunnel.ID, &tunnel.Name, &tunnelType, &transport, &enabled, &settingsJSON, &created, &updated)
+	if err != nil {
+		return model.Tunnel{}, err
+	}
+	tunnel.Type = model.TunnelType(tunnelType)
+	tunnel.Transport = model.TunnelTransport(transport)
+	tunnel.Enabled = enabled == 1
+	tunnel.CreatedAt = parseTime(created)
+	tunnel.UpdatedAt = parseTime(updated)
+	_ = json.Unmarshal([]byte(settingsJSON), &tunnel.Settings)
+	return tunnel, nil
+}
+
+func scanTunnelStage(row scanner) (model.TunnelStage, error) {
+	var stage model.TunnelStage
+	var role, created, updated string
+	err := row.Scan(&stage.ID, &stage.TunnelID, &stage.Index, &role, &stage.Strategy, &created, &updated)
+	if err != nil {
+		return model.TunnelStage{}, err
+	}
+	stage.Role = model.TunnelStageRole(role)
+	stage.CreatedAt = parseTime(created)
+	stage.UpdatedAt = parseTime(updated)
+	return stage, nil
+}
+
+func scanTunnelStageNode(row scanner) (model.TunnelStageNode, error) {
+	var node model.TunnelStageNode
+	var settingsJSON, created, updated string
+	err := row.Scan(&node.ID, &node.TunnelID, &node.StageID, &node.NodeID, &node.ListenAddr, &node.PublicAddr,
+		&node.ConnectAddr, &node.Weight, &settingsJSON, &created, &updated)
+	if err != nil {
+		return model.TunnelStageNode{}, err
+	}
+	node.CreatedAt = parseTime(created)
+	node.UpdatedAt = parseTime(updated)
+	_ = json.Unmarshal([]byte(settingsJSON), &node.Settings)
+	return node, nil
+}
+
+func scanForward(row scanner) (model.Forward, error) {
+	var forward model.Forward
+	var protocolsJSON, created, updated string
+	var enabled int
+	err := row.Scan(&forward.ID, &forward.Name, &forward.TunnelID, &protocolsJSON, &forward.Listen, &forward.Target, &enabled, &created, &updated)
+	if err != nil {
+		return model.Forward{}, err
+	}
+	forward.Enabled = enabled == 1
+	forward.CreatedAt = parseTime(created)
+	forward.UpdatedAt = parseTime(updated)
+	_ = json.Unmarshal([]byte(protocolsJSON), &forward.Protocols)
+	return forward, nil
+}
+
+func scanPortAllocation(row scanner) (model.PortAllocation, error) {
+	var allocation model.PortAllocation
+	var created, updated string
+	err := row.Scan(&allocation.ID, &allocation.NodeID, &allocation.OwnerKind, &allocation.OwnerID, &allocation.Protocol,
+		&allocation.Port, &allocation.BindAddr, &created, &updated)
+	if err != nil {
+		return model.PortAllocation{}, err
+	}
+	allocation.CreatedAt = parseTime(created)
+	allocation.UpdatedAt = parseTime(updated)
+	return allocation, nil
+}
+
 func normalizeNodePorts(node *model.Node) {
 	if node.PortMin <= 0 && node.PortMax <= 0 {
 		node.PortMin = 10000
@@ -713,39 +1121,6 @@ func normalizeNodePorts(node *model.Node) {
 	if node.PortMax <= 0 {
 		node.PortMax = 65535
 	}
-}
-
-func scanLink(row scanner) (model.Link, error) {
-	var link model.Link
-	var linkType, settingsJSON, created, updated string
-	var enabled int
-	err := row.Scan(&link.ID, &link.Name, &linkType, &link.FromNode, &link.ToNode, &link.BindAddr,
-		&link.PublicAddr, &link.ServerName, &enabled, &settingsJSON, &created, &updated)
-	if err != nil {
-		return model.Link{}, err
-	}
-	link.Type = model.LinkType(linkType)
-	link.Enabled = enabled == 1
-	link.CreatedAt = parseTime(created)
-	link.UpdatedAt = parseTime(updated)
-	_ = json.Unmarshal([]byte(settingsJSON), &link.Settings)
-	return link, nil
-}
-
-func scanRoute(row scanner) (model.Route, error) {
-	var route model.Route
-	var protocol, hopsJSON, created, updated string
-	var enabled int
-	err := row.Scan(&route.ID, &route.Name, &protocol, &route.EntryNode, &route.Listen, &route.Target, &enabled, &hopsJSON, &created, &updated)
-	if err != nil {
-		return model.Route{}, err
-	}
-	route.Protocol = model.RouteProtocol(protocol)
-	route.Enabled = enabled == 1
-	route.CreatedAt = parseTime(created)
-	route.UpdatedAt = parseTime(updated)
-	_ = json.Unmarshal([]byte(hopsJSON), &route.Hops)
-	return route, nil
 }
 
 func parseTime(value string) time.Time {

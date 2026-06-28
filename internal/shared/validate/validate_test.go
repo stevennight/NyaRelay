@@ -6,34 +6,56 @@ import (
 	"nyarelay/internal/shared/model"
 )
 
-func TestRouteAllowsSingleNodeDirectOut(t *testing.T) {
-	err := Route(model.Route{
-		ID:        "route_1",
-		Name:      "premium-vless-entry",
-		Protocol:  model.ProtocolTCP,
-		EntryNode: "node_1",
-		Listen:    "127.0.0.1:8443",
-		Hops:      nil,
-		Target:    "127.0.0.1:443",
+func TestTunnelAllowsSingleNodeDirect(t *testing.T) {
+	err := Tunnel(model.Tunnel{
+		ID:        "tun_1",
+		Name:      "direct",
+		Type:      model.TunnelDirect,
+		Transport: model.TunnelTransportDirect,
 		Enabled:   true,
+		Stages: []model.TunnelStage{{
+			ID:       "stage_1",
+			TunnelID: "tun_1",
+			Index:    0,
+			Role:     model.TunnelStageEntry,
+			Strategy: "single",
+			Nodes: []model.TunnelStageNode{{
+				ID:       "stage_node_1",
+				TunnelID: "tun_1",
+				StageID:  "stage_1",
+				NodeID:   "node_1",
+			}},
+		}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestLinkRejectsUnknownType(t *testing.T) {
-	err := Link(model.Link{
-		ID:         "link_1",
-		Name:       "bad",
-		Type:       "shell",
-		FromNode:   "a",
-		ToNode:     "b",
-		BindAddr:   "127.0.0.1:9000",
-		PublicAddr: "127.0.0.1:9000",
-		Enabled:    true,
+func TestTunnelRejectsUnknownTransport(t *testing.T) {
+	err := Tunnel(model.Tunnel{
+		ID:        "tun_1",
+		Name:      "bad",
+		Type:      model.TunnelChain,
+		Transport: "shell",
+		Enabled:   true,
 	})
 	if err == nil {
-		t.Fatal("expected unknown link type to fail")
+		t.Fatal("expected unknown tunnel transport to fail")
+	}
+}
+
+func TestForwardAllowsTCPUDP(t *testing.T) {
+	err := Forward(model.Forward{
+		ID:        "fwd_1",
+		Name:      "game",
+		TunnelID:  "tun_1",
+		Protocols: []model.ForwardProtocol{model.ForwardProtocolTCP, model.ForwardProtocolUDP},
+		Listen:    "127.0.0.1:8443",
+		Target:    "127.0.0.1:443",
+		Enabled:   true,
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }

@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -117,12 +116,20 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/nodes", s.withAuth(s.handleCreateNode))
 	s.mux.HandleFunc("PATCH /api/nodes/{id}", s.withAuth(s.handleUpdateNode))
 	s.mux.HandleFunc("POST /api/nodes/revoke", s.withAuth(s.handleRevokeNode))
-	s.mux.HandleFunc("GET /api/links", s.withAuth(s.handleListLinks))
-	s.mux.HandleFunc("GET /api/links/{id}", s.withAuth(s.handleGetLink))
-	s.mux.HandleFunc("POST /api/links", s.withAuth(s.handleUpsertLink))
-	s.mux.HandleFunc("GET /api/routes", s.withAuth(s.handleListRoutes))
-	s.mux.HandleFunc("GET /api/routes/{id}", s.withAuth(s.handleGetRoute))
-	s.mux.HandleFunc("POST /api/routes", s.withAuth(s.handleUpsertRoute))
+	s.mux.HandleFunc("GET /api/tunnels", s.withAuth(s.handleListTunnels))
+	s.mux.HandleFunc("GET /api/tunnels/{id}", s.withAuth(s.handleGetTunnel))
+	s.mux.HandleFunc("POST /api/tunnels", s.withAuth(s.handleUpsertTunnel))
+	s.mux.HandleFunc("PATCH /api/tunnels/{id}", s.withAuth(s.handleUpsertTunnel))
+	s.mux.HandleFunc("DELETE /api/tunnels/{id}", s.withAuth(s.handleDeleteTunnel))
+	s.mux.HandleFunc("POST /api/tunnels/{id}/enable", s.withAuth(s.handleEnableTunnel))
+	s.mux.HandleFunc("POST /api/tunnels/{id}/disable", s.withAuth(s.handleDisableTunnel))
+	s.mux.HandleFunc("GET /api/forwards", s.withAuth(s.handleListForwards))
+	s.mux.HandleFunc("GET /api/forwards/{id}", s.withAuth(s.handleGetForward))
+	s.mux.HandleFunc("POST /api/forwards", s.withAuth(s.handleUpsertForward))
+	s.mux.HandleFunc("PATCH /api/forwards/{id}", s.withAuth(s.handleUpsertForward))
+	s.mux.HandleFunc("DELETE /api/forwards/{id}", s.withAuth(s.handleDeleteForward))
+	s.mux.HandleFunc("POST /api/forwards/{id}/pause", s.withAuth(s.handlePauseForward))
+	s.mux.HandleFunc("POST /api/forwards/{id}/resume", s.withAuth(s.handleResumeForward))
 	s.mux.HandleFunc("GET /api/traffic", s.withAuth(s.handleTraffic))
 	s.mux.HandleFunc("GET /api/audit", s.withAuth(s.handleAudit))
 
@@ -312,35 +319,35 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request, session
 		writeError(w, err, http.StatusInternalServerError)
 		return
 	}
-	links, err := s.store.ListLinks(r.Context())
+	tunnels, err := s.store.ListTunnels(r.Context())
 	if err != nil {
 		writeError(w, err, http.StatusInternalServerError)
 		return
 	}
-	routes, err := s.store.ListRoutes(r.Context())
+	forwards, err := s.store.ListForwards(r.Context())
 	if err != nil {
 		writeError(w, err, http.StatusInternalServerError)
 		return
 	}
 	nodes = activeNodes(nodes)
-	var online, activeRoutes int
+	var online, activeForwards int
 	for _, node := range nodes {
 		if node.Status == model.NodeOnline {
 			online++
 		}
 	}
-	for _, route := range routes {
-		if route.Enabled {
-			activeRoutes++
+	for _, forward := range forwards {
+		if forward.Enabled {
+			activeForwards++
 		}
 	}
 	writeJSON(w, map[string]any{
-		"nodes":         len(nodes),
-		"online_nodes":  online,
-		"links":         len(links),
-		"routes":        len(routes),
-		"active_routes": activeRoutes,
-		"revision":      s.hub.Revision(),
+		"nodes":           len(nodes),
+		"online_nodes":    online,
+		"tunnels":         len(tunnels),
+		"forwards":        len(forwards),
+		"active_forwards": activeForwards,
+		"revision":        s.hub.Revision(),
 	})
 }
 
@@ -527,159 +534,729 @@ func (s *Server) handleRevokeNode(w http.ResponseWriter, r *http.Request, sessio
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
-func (s *Server) handleListLinks(w http.ResponseWriter, r *http.Request, session auth.Session) {
-	links, err := s.store.ListLinks(r.Context())
+func (s *Server) handleListTunnels(w http.ResponseWriter, r *http.Request, session auth.Session) {
+	tunnels, err := s.store.ListTunnels(r.Context())
 	if err != nil {
 		writeError(w, err, http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, links)
+	for i := range tunnels {
+		tunnels[i] = redactTunnel(tunnels[i])
+	}
+	writeJSON(w, tunnels)
 }
 
-func (s *Server) handleGetLink(w http.ResponseWriter, r *http.Request, session auth.Session) {
-	link, err := s.store.GetLink(r.Context(), r.PathValue("id"))
+func (s *Server) handleGetTunnel(w http.ResponseWriter, r *http.Request, session auth.Session) {
+	tunnel, err := s.store.GetTunnel(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeError(w, err, http.StatusNotFound)
 		return
 	}
-	writeJSON(w, link)
+	writeJSON(w, redactTunnel(tunnel))
 }
 
-func (s *Server) handleUpsertLink(w http.ResponseWriter, r *http.Request, session auth.Session) {
-	var req struct {
-		ID         string            `json:"id"`
-		Name       string            `json:"name"`
-		Type       model.LinkType    `json:"type"`
-		FromNode   string            `json:"from_node"`
-		ToNode     string            `json:"to_node"`
-		BindAddr   string            `json:"bind_addr"`
-		PublicAddr string            `json:"public_addr"`
-		ServerName string            `json:"server_name"`
-		Enabled    *bool             `json:"enabled"`
-		Settings   map[string]string `json:"settings"`
-	}
+func (s *Server) handleUpsertTunnel(w http.ResponseWriter, r *http.Request, session auth.Session) {
+	var req tunnelRequest
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, err, http.StatusBadRequest)
 		return
 	}
-	enabled := true
-	if req.Enabled != nil {
-		enabled = *req.Enabled
+	if pathID := r.PathValue("id"); pathID != "" {
+		req.ID = pathID
 	}
-	link := model.Link{
-		ID:         req.ID,
-		Name:       req.Name,
-		Type:       req.Type,
-		FromNode:   req.FromNode,
-		ToNode:     req.ToNode,
-		BindAddr:   req.BindAddr,
-		PublicAddr: req.PublicAddr,
-		ServerName: req.ServerName,
-		Enabled:    enabled,
-		Settings:   req.Settings,
-	}
-	if link.ID == "" {
-		link.ID = ids.New("link")
-	}
-	if link.Settings == nil {
-		link.Settings = map[string]string{}
-	}
-	if link.Settings["secret"] == "" {
-		secret, err := randomToken()
-		if err != nil {
-			writeError(w, err, http.StatusInternalServerError)
-			return
-		}
-		link.Settings["secret"] = secret
-	}
-	if link.Type == model.LinkTLS || link.Type == model.LinkMTLS || link.Type == model.LinkWSTLS {
-		if link.Settings["ca_cert"] == "" || link.Settings["server_cert"] == "" || link.Settings["server_key"] == "" {
-			certName := link.ID
-			if certName == "" {
-				certName = link.Name
-			}
-			serverName := link.ServerName
-			if serverName == "" {
-				serverName = strings.Split(link.PublicAddr, ":")[0]
-			}
-			certs, err := sharedcrypto.GenerateLinkCertificates(certName, serverName)
-			if err != nil {
-				writeError(w, err, http.StatusInternalServerError)
-				return
-			}
-			link.Settings["ca_cert"] = certs.CACert
-			link.Settings["server_cert"] = certs.ServerCert
-			link.Settings["server_key"] = certs.ServerKey
-			link.Settings["client_cert"] = certs.ClientCert
-			link.Settings["client_key"] = certs.ClientKey
-		}
-	}
-	if err := validate.Link(link); err != nil {
+	tunnel, allocations, err := s.prepareTunnel(r.Context(), req)
+	if err != nil {
 		writeError(w, err, http.StatusBadRequest)
 		return
 	}
-	if err := s.store.UpsertLink(r.Context(), link); err != nil {
+	if err := validate.Tunnel(tunnel); err != nil {
 		writeError(w, err, http.StatusBadRequest)
 		return
 	}
-	rev, _ := s.store.BumpRevision(r.Context())
+	rev, err := s.store.SaveTunnel(r.Context(), tunnel, allocations)
+	if err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
 	s.hub.SetRevision(rev)
 	s.pushConfigs(r.Context())
-	_ = s.store.AddAudit(r.Context(), session.Username, "link.upsert", link.ID, link)
-	writeJSON(w, link)
-}
-
-func (s *Server) handleListRoutes(w http.ResponseWriter, r *http.Request, session auth.Session) {
-	routes, err := s.store.ListRoutes(r.Context())
+	_ = s.store.AddAudit(r.Context(), session.Username, "tunnel.upsert", tunnel.ID, redactTunnel(tunnel))
+	saved, err := s.store.GetTunnel(r.Context(), tunnel.ID)
 	if err != nil {
-		writeError(w, err, http.StatusInternalServerError)
+		writeJSON(w, redactTunnel(tunnel))
 		return
 	}
-	writeJSON(w, routes)
+	writeJSON(w, redactTunnel(saved))
 }
 
-func (s *Server) handleGetRoute(w http.ResponseWriter, r *http.Request, session auth.Session) {
-	route, err := s.store.GetRoute(r.Context(), r.PathValue("id"))
+func (s *Server) handleDeleteTunnel(w http.ResponseWriter, r *http.Request, session auth.Session) {
+	force := r.URL.Query().Get("force") == "true"
+	rev, err := s.store.DeleteTunnel(r.Context(), r.PathValue("id"), force)
+	if err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
+	s.hub.SetRevision(rev)
+	s.pushConfigs(r.Context())
+	_ = s.store.AddAudit(r.Context(), session.Username, "tunnel.delete", r.PathValue("id"), map[string]bool{"force": force})
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleEnableTunnel(w http.ResponseWriter, r *http.Request, session auth.Session) {
+	s.setTunnelEnabled(w, r, session, true)
+}
+
+func (s *Server) handleDisableTunnel(w http.ResponseWriter, r *http.Request, session auth.Session) {
+	s.setTunnelEnabled(w, r, session, false)
+}
+
+func (s *Server) setTunnelEnabled(w http.ResponseWriter, r *http.Request, session auth.Session, enabled bool) {
+	rev, err := s.store.SetTunnelEnabled(r.Context(), r.PathValue("id"), enabled)
 	if err != nil {
 		writeError(w, err, http.StatusNotFound)
 		return
 	}
-	writeJSON(w, route)
-}
-
-func (s *Server) handleUpsertRoute(w http.ResponseWriter, r *http.Request, session auth.Session) {
-	var route model.Route
-	if err := readJSON(r, &route); err != nil {
-		writeError(w, err, http.StatusBadRequest)
-		return
-	}
-	if route.ID == "" {
-		route.ID = ids.New("route")
-	}
-	if strings.TrimSpace(route.Listen) == "" {
-		listen, err := s.suggestRouteListen(r.Context(), route, route.ID)
-		if err != nil {
-			writeError(w, err, http.StatusBadRequest)
-			return
-		}
-		route.Listen = listen
-	} else if err := s.ensureRouteListenAvailable(r.Context(), route, route.ID); err != nil {
-		writeError(w, err, http.StatusBadRequest)
-		return
-	}
-	if err := validate.Route(route); err != nil {
-		writeError(w, err, http.StatusBadRequest)
-		return
-	}
-	if err := s.store.UpsertRoute(r.Context(), route); err != nil {
-		writeError(w, err, http.StatusBadRequest)
-		return
-	}
-	rev, _ := s.store.BumpRevision(r.Context())
 	s.hub.SetRevision(rev)
 	s.pushConfigs(r.Context())
-	_ = s.store.AddAudit(r.Context(), session.Username, "route.upsert", route.ID, route)
-	writeJSON(w, route)
+	action := "tunnel.disable"
+	if enabled {
+		action = "tunnel.enable"
+	}
+	_ = s.store.AddAudit(r.Context(), session.Username, action, r.PathValue("id"), map[string]bool{"enabled": enabled})
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleListForwards(w http.ResponseWriter, r *http.Request, session auth.Session) {
+	forwards, err := s.store.ListForwards(r.Context())
+	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, forwards)
+}
+
+func (s *Server) handleGetForward(w http.ResponseWriter, r *http.Request, session auth.Session) {
+	forward, err := s.store.GetForward(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeError(w, err, http.StatusNotFound)
+		return
+	}
+	writeJSON(w, forward)
+}
+
+func (s *Server) handleUpsertForward(w http.ResponseWriter, r *http.Request, session auth.Session) {
+	var req forwardRequest
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
+	if pathID := r.PathValue("id"); pathID != "" {
+		req.ID = pathID
+	}
+	prepared, allocations, err := s.prepareForward(r.Context(), req)
+	if err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
+	if err := validate.Forward(prepared); err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
+	rev, err := s.store.SaveForward(r.Context(), prepared, allocations)
+	if err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
+	s.hub.SetRevision(rev)
+	s.pushConfigs(r.Context())
+	_ = s.store.AddAudit(r.Context(), session.Username, "forward.upsert", prepared.ID, prepared)
+	writeJSON(w, prepared)
+}
+
+func (s *Server) handleDeleteForward(w http.ResponseWriter, r *http.Request, session auth.Session) {
+	rev, err := s.store.DeleteForward(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeError(w, err, http.StatusNotFound)
+		return
+	}
+	s.hub.SetRevision(rev)
+	s.pushConfigs(r.Context())
+	_ = s.store.AddAudit(r.Context(), session.Username, "forward.delete", r.PathValue("id"), map[string]string{"id": r.PathValue("id")})
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+func (s *Server) handlePauseForward(w http.ResponseWriter, r *http.Request, session auth.Session) {
+	s.setForwardEnabled(w, r, session, false)
+}
+
+func (s *Server) handleResumeForward(w http.ResponseWriter, r *http.Request, session auth.Session) {
+	s.setForwardEnabled(w, r, session, true)
+}
+
+func (s *Server) setForwardEnabled(w http.ResponseWriter, r *http.Request, session auth.Session, enabled bool) {
+	rev, err := s.store.SetForwardEnabled(r.Context(), r.PathValue("id"), enabled)
+	if err != nil {
+		writeError(w, err, http.StatusNotFound)
+		return
+	}
+	s.hub.SetRevision(rev)
+	s.pushConfigs(r.Context())
+	action := "forward.pause"
+	if enabled {
+		action = "forward.resume"
+	}
+	_ = s.store.AddAudit(r.Context(), session.Username, action, r.PathValue("id"), map[string]bool{"enabled": enabled})
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+type tunnelRequest struct {
+	ID          string                `json:"id"`
+	Name        string                `json:"name"`
+	Type        model.TunnelType      `json:"type"`
+	Transport   model.TunnelTransport `json:"transport"`
+	Enabled     *bool                 `json:"enabled"`
+	Settings    map[string]string     `json:"settings"`
+	EntryNode   string                `json:"entry_node"`
+	MiddleNodes []string              `json:"middle_nodes"`
+	ExitNode    string                `json:"exit_node"`
+	Stages      []model.TunnelStage   `json:"stages"`
+}
+
+type forwardRequest struct {
+	ID        string                  `json:"id"`
+	Name      string                  `json:"name"`
+	TunnelID  string                  `json:"tunnel_id"`
+	Protocols []model.ForwardProtocol `json:"protocols"`
+	Listen    string                  `json:"listen"`
+	Target    string                  `json:"target"`
+	Enabled   *bool                   `json:"enabled"`
+}
+
+func (s *Server) prepareTunnel(ctx context.Context, req tunnelRequest) (model.Tunnel, []model.PortAllocation, error) {
+	if strings.TrimSpace(req.ID) == "" {
+		req.ID = ids.New("tun")
+	}
+	if req.Type == "" {
+		req.Type = model.TunnelDirect
+	}
+	if req.Type == model.TunnelDirect || req.Transport == "" {
+		req.Transport = model.TunnelTransportDirect
+	}
+	enabled := true
+	var existing model.Tunnel
+	if current, err := s.store.GetTunnel(ctx, req.ID); err == nil {
+		existing = current
+		enabled = current.Enabled
+	}
+	if req.Enabled != nil {
+		enabled = *req.Enabled
+	}
+	tunnel := model.Tunnel{
+		ID:        strings.TrimSpace(req.ID),
+		Name:      strings.TrimSpace(req.Name),
+		Type:      req.Type,
+		Transport: req.Transport,
+		Enabled:   enabled,
+		Settings:  emptyStringMap(req.Settings),
+		Stages:    req.Stages,
+	}
+	if tunnel.Settings == nil {
+		tunnel.Settings = emptyStringMap(existing.Settings)
+	}
+	if len(tunnel.Stages) == 0 {
+		tunnel.Stages = buildRequestStages(tunnel.ID, req)
+	}
+	nodes, err := s.store.ListNodes(ctx)
+	if err != nil {
+		return model.Tunnel{}, nil, err
+	}
+	nodeByID := make(map[string]model.Node, len(nodes))
+	for _, node := range nodes {
+		nodeByID[node.ID] = node
+	}
+	excludedOwners := map[string]bool{}
+	for _, stage := range existing.Stages {
+		for _, node := range stage.Nodes {
+			excludedOwners[node.ID] = true
+		}
+	}
+	allocations, err := s.store.ListPortAllocations(ctx)
+	if err != nil {
+		return model.Tunnel{}, nil, err
+	}
+	used := usedPortSet(allocations, excludedOwners)
+	var outAllocations []model.PortAllocation
+	seenNodes := map[string]bool{}
+	for i := range tunnel.Stages {
+		stage := &tunnel.Stages[i]
+		stage.TunnelID = tunnel.ID
+		stage.Index = i
+		stage.Role = roleForStage(tunnel.Type, i, len(tunnel.Stages))
+		if stage.ID == "" {
+			if existingStage := findExistingStage(existing, i); existingStage.ID != "" {
+				stage.ID = existingStage.ID
+			} else {
+				stage.ID = ids.New("stage")
+			}
+		}
+		if stage.Strategy == "" {
+			stage.Strategy = "single"
+		}
+		if len(stage.Nodes) != 1 {
+			return model.Tunnel{}, nil, fmt.Errorf("stage %d must have exactly one node", i)
+		}
+		node := &stage.Nodes[0]
+		node.TunnelID = tunnel.ID
+		node.StageID = stage.ID
+		node.NodeID = strings.TrimSpace(node.NodeID)
+		if node.NodeID == "" {
+			return model.Tunnel{}, nil, fmt.Errorf("stage %d node id is required", i)
+		}
+		if seenNodes[node.NodeID] {
+			return model.Tunnel{}, nil, fmt.Errorf("node %s appears more than once in tunnel", node.NodeID)
+		}
+		seenNodes[node.NodeID] = true
+		realNode, ok := nodeByID[node.NodeID]
+		if !ok || realNode.Revoked {
+			return model.Tunnel{}, nil, fmt.Errorf("node %s not found", node.NodeID)
+		}
+		existingNode := findExistingStageNode(existing, i, node.NodeID)
+		if node.ID == "" {
+			if existingNode.ID != "" {
+				node.ID = existingNode.ID
+			} else {
+				node.ID = ids.New("stage_node")
+			}
+		}
+		if node.Weight <= 0 {
+			node.Weight = 1
+		}
+		node.Settings = mergeSettings(existingNode.Settings, node.Settings)
+		if tunnel.Type == model.TunnelDirect || stage.Role == model.TunnelStageEntry {
+			node.ListenAddr = ""
+			node.PublicAddr = ""
+			node.ConnectAddr = strings.TrimSpace(node.ConnectAddr)
+			node.Settings = map[string]string{}
+			continue
+		}
+		if node.ListenAddr == "" {
+			node.ListenAddr = existingNode.ListenAddr
+		}
+		if node.PublicAddr == "" {
+			node.PublicAddr = existingNode.PublicAddr
+		}
+		if node.ConnectAddr == "" {
+			node.ConnectAddr = existingNode.ConnectAddr
+		}
+		port := 0
+		if node.ListenAddr == "" {
+			port, err = allocatePort(realNode, "tcp", used)
+			if err != nil {
+				return model.Tunnel{}, nil, err
+			}
+			node.ListenAddr = net.JoinHostPort("", strconv.Itoa(port))
+		} else {
+			port, err = portFromAddr(node.ListenAddr)
+			if err != nil {
+				return model.Tunnel{}, nil, err
+			}
+			if err := ensurePortInRange(realNode, port); err != nil {
+				return model.Tunnel{}, nil, err
+			}
+			markPortUsed(used, realNode.ID, "tcp", port)
+		}
+		if node.PublicAddr == "" && realNode.PublicHost != "" {
+			node.PublicAddr = net.JoinHostPort(realNode.PublicHost, strconv.Itoa(port))
+		}
+		if node.PublicAddr == "" && node.ConnectAddr == "" {
+			return model.Tunnel{}, nil, fmt.Errorf("node %s requires public_host or connect_addr for chain stage", realNode.ID)
+		}
+		if node.Settings == nil {
+			node.Settings = map[string]string{}
+		}
+		if node.Settings["secret"] == "" {
+			secret, err := randomToken()
+			if err != nil {
+				return model.Tunnel{}, nil, err
+			}
+			node.Settings["secret"] = secret
+		}
+		if err := ensureTunnelCertificates(tunnel, node); err != nil {
+			return model.Tunnel{}, nil, err
+		}
+		outAllocations = append(outAllocations, model.PortAllocation{
+			ID:        ids.New("alloc"),
+			NodeID:    realNode.ID,
+			OwnerKind: "tunnel_stage_node",
+			OwnerID:   node.ID,
+			Protocol:  "tcp",
+			Port:      port,
+			BindAddr:  node.ListenAddr,
+		})
+	}
+	return tunnel, outAllocations, nil
+}
+
+func (s *Server) prepareForward(ctx context.Context, req forwardRequest) (model.Forward, []model.PortAllocation, error) {
+	if strings.TrimSpace(req.ID) == "" {
+		req.ID = ids.New("fwd")
+	}
+	enabled := true
+	if existing, err := s.store.GetForward(ctx, req.ID); err == nil {
+		enabled = existing.Enabled
+		if req.Name == "" {
+			req.Name = existing.Name
+		}
+		if req.TunnelID == "" {
+			req.TunnelID = existing.TunnelID
+		}
+		if len(req.Protocols) == 0 {
+			req.Protocols = existing.Protocols
+		}
+		if req.Listen == "" {
+			req.Listen = existing.Listen
+		}
+		if req.Target == "" {
+			req.Target = existing.Target
+		}
+	}
+	if req.Enabled != nil {
+		enabled = *req.Enabled
+	}
+	protocols, err := normalizeForwardProtocols(req.Protocols)
+	if err != nil {
+		return model.Forward{}, nil, err
+	}
+	tunnel, err := s.store.GetTunnel(ctx, req.TunnelID)
+	if err != nil {
+		return model.Forward{}, nil, errors.New("tunnel not found")
+	}
+	if !tunnel.Enabled {
+		return model.Forward{}, nil, errors.New("tunnel is disabled")
+	}
+	entryNodeID, err := tunnelEntryNodeID(tunnel)
+	if err != nil {
+		return model.Forward{}, nil, err
+	}
+	entryNode, err := s.store.GetNode(ctx, entryNodeID)
+	if err != nil || entryNode.Revoked {
+		return model.Forward{}, nil, errors.New("entry node not found")
+	}
+	forward := model.Forward{
+		ID:        strings.TrimSpace(req.ID),
+		Name:      strings.TrimSpace(req.Name),
+		TunnelID:  strings.TrimSpace(req.TunnelID),
+		Protocols: protocols,
+		Listen:    strings.TrimSpace(req.Listen),
+		Target:    strings.TrimSpace(req.Target),
+		Enabled:   enabled,
+	}
+	excludedOwners := map[string]bool{forward.ID: true}
+	allocations, err := s.store.ListPortAllocations(ctx)
+	if err != nil {
+		return model.Forward{}, nil, err
+	}
+	used := usedPortSet(allocations, excludedOwners)
+	port := 0
+	if forward.Listen == "" {
+		port, err = allocateSharedProtocolPort(entryNode, protocols, used)
+		if err != nil {
+			return model.Forward{}, nil, err
+		}
+		forward.Listen = net.JoinHostPort("", strconv.Itoa(port))
+	} else {
+		port, err = portFromAddr(forward.Listen)
+		if err != nil {
+			return model.Forward{}, nil, err
+		}
+		if err := ensurePortInRange(entryNode, port); err != nil {
+			return model.Forward{}, nil, err
+		}
+		for _, protocol := range protocols {
+			if isPortUsed(used, entryNode.ID, string(protocol), port) {
+				return model.Forward{}, nil, fmt.Errorf("listen port %d/%s is already in use on node %s", port, protocol, entryNode.ID)
+			}
+			markPortUsed(used, entryNode.ID, string(protocol), port)
+		}
+	}
+	var outAllocations []model.PortAllocation
+	for _, protocol := range protocols {
+		outAllocations = append(outAllocations, model.PortAllocation{
+			ID:        ids.New("alloc"),
+			NodeID:    entryNode.ID,
+			OwnerKind: "forward",
+			OwnerID:   forward.ID,
+			Protocol:  string(protocol),
+			Port:      port,
+			BindAddr:  forward.Listen,
+		})
+	}
+	return forward, outAllocations, nil
+}
+
+func buildRequestStages(tunnelID string, req tunnelRequest) []model.TunnelStage {
+	nodeIDs := []string{strings.TrimSpace(req.EntryNode)}
+	if req.Type == model.TunnelChain {
+		nodeIDs = append(nodeIDs, req.MiddleNodes...)
+		nodeIDs = append(nodeIDs, strings.TrimSpace(req.ExitNode))
+	}
+	stages := make([]model.TunnelStage, 0, len(nodeIDs))
+	for i, nodeID := range nodeIDs {
+		if strings.TrimSpace(nodeID) == "" {
+			continue
+		}
+		stageID := ids.New("stage")
+		stages = append(stages, model.TunnelStage{
+			ID:       stageID,
+			TunnelID: tunnelID,
+			Index:    i,
+			Role:     roleForStage(req.Type, i, len(nodeIDs)),
+			Strategy: "single",
+			Nodes: []model.TunnelStageNode{{
+				ID:       ids.New("stage_node"),
+				TunnelID: tunnelID,
+				StageID:  stageID,
+				NodeID:   strings.TrimSpace(nodeID),
+				Weight:   1,
+			}},
+		})
+	}
+	return stages
+}
+
+func roleForStage(tunnelType model.TunnelType, index, count int) model.TunnelStageRole {
+	if tunnelType == model.TunnelDirect || index == 0 {
+		return model.TunnelStageEntry
+	}
+	if index == count-1 {
+		return model.TunnelStageExit
+	}
+	return model.TunnelStageMiddle
+}
+
+func findExistingStage(tunnel model.Tunnel, index int) model.TunnelStage {
+	for _, stage := range tunnel.Stages {
+		if stage.Index == index {
+			return stage
+		}
+	}
+	return model.TunnelStage{}
+}
+
+func findExistingStageNode(tunnel model.Tunnel, index int, nodeID string) model.TunnelStageNode {
+	stage := findExistingStage(tunnel, index)
+	for _, node := range stage.Nodes {
+		if node.NodeID == nodeID {
+			return node
+		}
+	}
+	return model.TunnelStageNode{}
+}
+
+func ensureTunnelCertificates(tunnel model.Tunnel, node *model.TunnelStageNode) error {
+	if tunnel.Transport != model.TunnelTransportTLS && tunnel.Transport != model.TunnelTransportMTLS && tunnel.Transport != model.TunnelTransportWSTLS {
+		return nil
+	}
+	if node.Settings["ca_cert"] != "" && node.Settings["server_cert"] != "" && node.Settings["server_key"] != "" {
+		return nil
+	}
+	serverName := node.Settings["server_name"]
+	if serverName == "" {
+		serverName = firstHost(node.PublicAddr, node.ConnectAddr)
+	}
+	certs, err := sharedcrypto.GenerateTunnelCertificates(node.ID, serverName)
+	if err != nil {
+		return err
+	}
+	node.Settings["ca_cert"] = certs.CACert
+	node.Settings["server_cert"] = certs.ServerCert
+	node.Settings["server_key"] = certs.ServerKey
+	node.Settings["client_cert"] = certs.ClientCert
+	node.Settings["client_key"] = certs.ClientKey
+	return nil
+}
+
+func firstHost(addrs ...string) string {
+	for _, addr := range addrs {
+		if addr == "" {
+			continue
+		}
+		host, _, err := net.SplitHostPort(addr)
+		if err == nil {
+			return host
+		}
+		return strings.Split(addr, ":")[0]
+	}
+	return ""
+}
+
+func normalizeForwardProtocols(protocols []model.ForwardProtocol) ([]model.ForwardProtocol, error) {
+	seen := map[model.ForwardProtocol]bool{}
+	for _, protocol := range protocols {
+		switch protocol {
+		case model.ForwardProtocolTCP, model.ForwardProtocolUDP:
+			seen[protocol] = true
+		default:
+			return nil, fmt.Errorf("unsupported forward protocol %q", protocol)
+		}
+	}
+	var out []model.ForwardProtocol
+	if seen[model.ForwardProtocolTCP] {
+		out = append(out, model.ForwardProtocolTCP)
+	}
+	if seen[model.ForwardProtocolUDP] {
+		out = append(out, model.ForwardProtocolUDP)
+	}
+	if len(out) == 0 {
+		return nil, errors.New("forward protocol is required")
+	}
+	return out, nil
+}
+
+func tunnelEntryNodeID(tunnel model.Tunnel) (string, error) {
+	if len(tunnel.Stages) == 0 || len(tunnel.Stages[0].Nodes) == 0 {
+		return "", errors.New("tunnel has no entry node")
+	}
+	return tunnel.Stages[0].Nodes[0].NodeID, nil
+}
+
+type usedPorts map[string]map[string]map[int]bool
+
+func usedPortSet(allocations []model.PortAllocation, excludedOwners map[string]bool) usedPorts {
+	used := usedPorts{}
+	for _, allocation := range allocations {
+		if excludedOwners[allocation.OwnerID] {
+			continue
+		}
+		markPortUsed(used, allocation.NodeID, allocation.Protocol, allocation.Port)
+	}
+	return used
+}
+
+func allocateSharedProtocolPort(node model.Node, protocols []model.ForwardProtocol, used usedPorts) (int, error) {
+	min, max := normalizedPortRange(node)
+	for port := min; port <= max; port++ {
+		free := true
+		for _, protocol := range protocols {
+			if isPortUsed(used, node.ID, string(protocol), port) {
+				free = false
+				break
+			}
+		}
+		if !free {
+			continue
+		}
+		for _, protocol := range protocols {
+			markPortUsed(used, node.ID, string(protocol), port)
+		}
+		return port, nil
+	}
+	return 0, fmt.Errorf("no free forward port available on node %s", node.ID)
+}
+
+func allocatePort(node model.Node, protocol string, used usedPorts) (int, error) {
+	min, max := normalizedPortRange(node)
+	for port := min; port <= max; port++ {
+		if isPortUsed(used, node.ID, protocol, port) {
+			continue
+		}
+		markPortUsed(used, node.ID, protocol, port)
+		return port, nil
+	}
+	return 0, fmt.Errorf("no free %s port available on node %s", protocol, node.ID)
+}
+
+func normalizedPortRange(node model.Node) (int, int) {
+	min, max := node.PortMin, node.PortMax
+	if min <= 0 {
+		min = 10000
+	}
+	if max <= 0 {
+		max = 65535
+	}
+	return min, max
+}
+
+func ensurePortInRange(node model.Node, port int) error {
+	min, max := normalizedPortRange(node)
+	if port < min || port > max {
+		return fmt.Errorf("port %d is outside node %s range %d-%d", port, node.ID, min, max)
+	}
+	return nil
+}
+
+func portFromAddr(addr string) (int, error) {
+	_, portText, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 0, fmt.Errorf("invalid address %q: %w", addr, err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port <= 0 || port > 65535 {
+		return 0, fmt.Errorf("invalid port %q", portText)
+	}
+	return port, nil
+}
+
+func isPortUsed(used usedPorts, nodeID, protocol string, port int) bool {
+	if used[nodeID] == nil || used[nodeID][protocol] == nil {
+		return false
+	}
+	return used[nodeID][protocol][port]
+}
+
+func markPortUsed(used usedPorts, nodeID, protocol string, port int) {
+	if used[nodeID] == nil {
+		used[nodeID] = map[string]map[int]bool{}
+	}
+	if used[nodeID][protocol] == nil {
+		used[nodeID][protocol] = map[int]bool{}
+	}
+	used[nodeID][protocol][port] = true
+}
+
+func mergeSettings(base map[string]string, override map[string]string) map[string]string {
+	out := emptyStringMap(base)
+	for key, value := range override {
+		out[key] = value
+	}
+	return out
+}
+
+func emptyStringMap(in map[string]string) map[string]string {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
+}
+
+func redactTunnel(tunnel model.Tunnel) model.Tunnel {
+	tunnel.Settings = redactSettings(tunnel.Settings)
+	for i := range tunnel.Stages {
+		for j := range tunnel.Stages[i].Nodes {
+			tunnel.Stages[i].Nodes[j].Settings = redactSettings(tunnel.Stages[i].Nodes[j].Settings)
+		}
+	}
+	return tunnel
+}
+
+func redactSettings(settings map[string]string) map[string]string {
+	if len(settings) == 0 {
+		return settings
+	}
+	out := make(map[string]string, len(settings))
+	for key, value := range settings {
+		switch key {
+		case "secret", "server_key", "client_key", "server_cert", "client_cert", "ca_cert":
+			out[key] = ""
+		default:
+			out[key] = value
+		}
+	}
+	return out
 }
 
 func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, session auth.Session) {
@@ -820,11 +1397,11 @@ func (s *Server) compileConfig(ctx context.Context, nodeID string) (model.Signed
 	if err != nil {
 		return model.SignedConfig{}, err
 	}
-	links, err := s.store.ListLinks(ctx)
+	tunnels, err := s.store.ListTunnels(ctx)
 	if err != nil {
 		return model.SignedConfig{}, err
 	}
-	routes, err := s.store.ListRoutes(ctx)
+	forwards, err := s.store.ListForwards(ctx)
 	if err != nil {
 		return model.SignedConfig{}, err
 	}
@@ -833,14 +1410,14 @@ func (s *Server) compileConfig(ctx context.Context, nodeID string) (model.Signed
 		return model.SignedConfig{}, err
 	}
 	nodes = activeNodes(nodes)
-	routes, links = scopeConfigForNode(nodeID, routes, links)
+	scopedTunnels, scopedForwards := scopeConfigForNode(nodeID, tunnels, forwards)
 	cfg := model.RelayConfig{
 		Revision:  rev,
 		IssuedAt:  time.Now().UTC(),
 		NodeID:    nodeID,
 		Nodes:     nodes,
-		Links:     links,
-		Routes:    routes,
+		Tunnels:   scopedTunnels,
+		Forwards:  scopedForwards,
 		ExpiresAt: time.Now().UTC().Add(7 * 24 * time.Hour),
 	}
 	priv, _, err := s.store.GetSetting(ctx, signingKeySetting)
@@ -869,68 +1446,154 @@ func activeNodes(nodes []model.Node) []model.Node {
 	return out
 }
 
-func scopeConfigForNode(nodeID string, routes []model.Route, links []model.Link) ([]model.Route, []model.Link) {
-	linkByID := make(map[string]model.Link, len(links))
-	for _, link := range links {
-		linkByID[link.ID] = link
+func scopeConfigForNode(nodeID string, tunnels []model.Tunnel, forwards []model.Forward) ([]model.TunnelRuntime, []model.ForwardRuntime) {
+	forwardsByTunnel := make(map[string][]model.Forward)
+	for _, forward := range forwards {
+		forwardsByTunnel[forward.TunnelID] = append(forwardsByTunnel[forward.TunnelID], forward)
 	}
-	relevantLinks := make(map[string]bool)
-	scopedRoutes := make([]model.Route, 0, len(routes))
-	for _, route := range routes {
-		relevant := route.EntryNode == nodeID
-		for _, hop := range route.Hops {
-			link, ok := linkByID[hop.LinkID]
-			if !ok {
-				continue
-			}
-			if link.FromNode == nodeID || link.ToNode == nodeID {
-				relevant = true
-				relevantLinks[link.ID] = true
-			}
-		}
-		if relevant {
-			scopedRoutes = append(scopedRoutes, route)
-			for _, hop := range route.Hops {
-				link, ok := linkByID[hop.LinkID]
-				if !ok {
-					continue
-				}
-				if link.FromNode == nodeID || link.ToNode == nodeID {
-					relevantLinks[link.ID] = true
-				}
-			}
-		}
-	}
-	scopedLinks := make([]model.Link, 0, len(relevantLinks))
-	for _, link := range links {
-		if !relevantLinks[link.ID] {
+	var scopedTunnels []model.TunnelRuntime
+	var scopedForwards []model.ForwardRuntime
+	for _, tunnel := range tunnels {
+		if !tunnel.Enabled || !nodeParticipatesInTunnel(nodeID, tunnel) {
 			continue
 		}
-		link.Settings = scopeLinkSettings(nodeID, link)
-		scopedLinks = append(scopedLinks, link)
-	}
-	return scopedRoutes, scopedLinks
-}
-
-func scopeLinkSettings(nodeID string, link model.Link) map[string]string {
-	settings := map[string]string{}
-	copyKey := func(key string) {
-		if link.Settings != nil && link.Settings[key] != "" {
-			settings[key] = link.Settings[key]
+		scopedTunnels = append(scopedTunnels, scopeTunnelRuntime(nodeID, tunnel))
+		role, ok := nodeTunnelRole(nodeID, tunnel)
+		if !ok {
+			continue
+		}
+		for _, forward := range forwardsByTunnel[tunnel.ID] {
+			scopedForwards = append(scopedForwards, scopeForwardRuntime(forward, tunnel, role))
 		}
 	}
-	copyKey("secret")
-	copyKey("skip_verify")
-	copyKey("ca_cert")
-	if nodeID == link.ToNode {
-		copyKey("server_cert")
-		copyKey("server_key")
+	return scopedTunnels, scopedForwards
+}
+
+func scopeTunnelRuntime(nodeID string, tunnel model.Tunnel) model.TunnelRuntime {
+	runtime := model.TunnelRuntime{
+		ID:        tunnel.ID,
+		Name:      tunnel.Name,
+		Type:      tunnel.Type,
+		Transport: tunnel.Transport,
+		Settings:  copyStringMap(tunnel.Settings),
 	}
-	if nodeID == link.FromNode && link.Type == model.LinkMTLS {
-		copyKey("client_cert")
-		copyKey("client_key")
+	for stageIndex, stage := range tunnel.Stages {
+		runtimeStage := model.TunnelRuntimeStage{
+			Index:    stage.Index,
+			Role:     stage.Role,
+			Strategy: stage.Strategy,
+		}
+		for _, node := range stage.Nodes {
+			runtimeNode := model.TunnelRuntimeNode{
+				NodeID:      node.NodeID,
+				ListenAddr:  node.ListenAddr,
+				PublicAddr:  node.PublicAddr,
+				ConnectAddr: node.ConnectAddr,
+				Weight:      node.Weight,
+			}
+			switch {
+			case node.NodeID == nodeID:
+				runtimeNode.Settings = listenerSettings(tunnel.Transport, node.Settings)
+			case stageIndex > 0 && previousStageNodeID(tunnel, stageIndex) == nodeID:
+				runtimeNode.Settings = dialerSettings(tunnel.Transport, node.Settings)
+			}
+			runtimeStage.Nodes = append(runtimeStage.Nodes, runtimeNode)
+		}
+		runtime.Stages = append(runtime.Stages, runtimeStage)
 	}
-	return settings
+	return runtime
+}
+
+func scopeForwardRuntime(forward model.Forward, tunnel model.Tunnel, role model.TunnelStageRole) model.ForwardRuntime {
+	runtime := model.ForwardRuntime{
+		ID:        forward.ID,
+		Name:      forward.Name,
+		TunnelID:  forward.TunnelID,
+		Protocols: append([]model.ForwardProtocol(nil), forward.Protocols...),
+		Enabled:   forward.Enabled,
+	}
+	if role == model.TunnelStageEntry {
+		runtime.Listen = forward.Listen
+		if tunnel.Type == model.TunnelDirect {
+			runtime.Target = forward.Target
+		}
+	}
+	if role == model.TunnelStageExit {
+		runtime.Target = forward.Target
+	}
+	return runtime
+}
+
+func nodeParticipatesInTunnel(nodeID string, tunnel model.Tunnel) bool {
+	_, ok := nodeTunnelRole(nodeID, tunnel)
+	return ok
+}
+
+func nodeTunnelRole(nodeID string, tunnel model.Tunnel) (model.TunnelStageRole, bool) {
+	for _, stage := range tunnel.Stages {
+		for _, node := range stage.Nodes {
+			if node.NodeID == nodeID {
+				return stage.Role, true
+			}
+		}
+	}
+	return "", false
+}
+
+func previousStageNodeID(tunnel model.Tunnel, stageIndex int) string {
+	if stageIndex <= 0 || stageIndex > len(tunnel.Stages)-1 {
+		return ""
+	}
+	prev := tunnel.Stages[stageIndex-1]
+	if len(prev.Nodes) == 0 {
+		return ""
+	}
+	return prev.Nodes[0].NodeID
+}
+
+func listenerSettings(transport model.TunnelTransport, settings map[string]string) map[string]string {
+	out := map[string]string{}
+	copySetting(out, settings, "secret")
+	if transport == model.TunnelTransportTLS || transport == model.TunnelTransportMTLS || transport == model.TunnelTransportWSTLS {
+		copySetting(out, settings, "server_cert")
+		copySetting(out, settings, "server_key")
+	}
+	if transport == model.TunnelTransportMTLS {
+		copySetting(out, settings, "ca_cert")
+	}
+	return out
+}
+
+func dialerSettings(transport model.TunnelTransport, settings map[string]string) map[string]string {
+	out := map[string]string{}
+	copySetting(out, settings, "secret")
+	copySetting(out, settings, "server_name")
+	copySetting(out, settings, "skip_verify")
+	if transport == model.TunnelTransportTLS || transport == model.TunnelTransportMTLS || transport == model.TunnelTransportWSTLS {
+		copySetting(out, settings, "ca_cert")
+	}
+	if transport == model.TunnelTransportMTLS {
+		copySetting(out, settings, "client_cert")
+		copySetting(out, settings, "client_key")
+	}
+	return out
+}
+
+func copySetting(dst map[string]string, src map[string]string, key string) {
+	if src != nil && src[key] != "" {
+		dst[key] = src[key]
+	}
+}
+
+func copyStringMap(src map[string]string) map[string]string {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]string, len(src))
+	for key, value := range src {
+		dst[key] = value
+	}
+	return dst
 }
 
 func (s *Server) withAuth(next func(http.ResponseWriter, *http.Request, auth.Session)) http.HandlerFunc {
@@ -1102,67 +1765,6 @@ func validateNodePortRange(portMin, portMax int) error {
 	}
 	if portMin > portMax {
 		return fmt.Errorf("port_min must be less than or equal to port_max")
-	}
-	return nil
-}
-
-func (s *Server) suggestRouteListen(ctx context.Context, route model.Route, routeID string) (string, error) {
-	if port := strings.TrimSpace(route.Listen); port != "" {
-		return port, nil
-	}
-	used, err := s.store.NodePortUsage(ctx, route.EntryNode, routeID)
-	if err != nil {
-		return "", err
-	}
-	nodes, err := s.store.ListNodes(ctx)
-	if err != nil {
-		return "", err
-	}
-	for _, node := range nodes {
-		if node.ID != route.EntryNode {
-			continue
-		}
-		min, max := node.PortMin, node.PortMax
-		if min <= 0 {
-			min = 10000
-		}
-		if max <= 0 {
-			max = 65535
-		}
-		if min > max {
-			continue
-		}
-		freePorts := make([]string, 0, max-min+1)
-		for port := min; port <= max; port++ {
-			portStr := strconv.Itoa(port)
-			if used[portStr] {
-				continue
-			}
-			freePorts = append(freePorts, portStr)
-		}
-		if len(freePorts) == 0 {
-			continue
-		}
-		index, err := rand.Int(rand.Reader, big.NewInt(int64(len(freePorts))))
-		if err != nil {
-			return "", err
-		}
-		return net.JoinHostPort("", freePorts[index.Int64()]), nil
-	}
-	return "", errors.New("no free route port available")
-}
-
-func (s *Server) ensureRouteListenAvailable(ctx context.Context, route model.Route, routeID string) error {
-	_, port, err := net.SplitHostPort(route.Listen)
-	if err != nil {
-		return fmt.Errorf("invalid listen address: %w", err)
-	}
-	used, err := s.store.NodePortUsage(ctx, route.EntryNode, routeID)
-	if err != nil {
-		return err
-	}
-	if used[port] {
-		return fmt.Errorf("listen port %s is already in use", port)
 	}
 	return nil
 }

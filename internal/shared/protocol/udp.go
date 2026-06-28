@@ -4,50 +4,53 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"io"
 )
 
 const MaxUDPPacket = 64 * 1024
 
-type UDPHeader struct {
-	Magic    string `json:"magic"`
-	RouteID  string `json:"route_id"`
-	HopIndex int    `json:"hop_index"`
-	Secret   string `json:"secret"`
+type UDPDatagramFrame struct {
+	ForwardID string `json:"forward_id"`
+	SessionID string `json:"session_id"`
+	Payload   []byte `json:"payload"`
 }
 
-func EncodeUDPFrame(header UDPHeader, payload []byte) ([]byte, error) {
-	header.Magic = Magic
-	headerBytes, err := json.Marshal(header)
+func WriteUDPDatagramFrame(w io.Writer, frame UDPDatagramFrame) error {
+	payload, err := json.Marshal(frame)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if len(headerBytes) > 4096 {
-		return nil, errors.New("udp header is too large")
+	if len(payload) == 0 || len(payload) > MaxUDPPacket+4096 {
+		return errors.New("udp frame is too large")
 	}
-	if len(payload)+len(headerBytes)+2 > MaxUDPPacket {
-		return nil, errors.New("udp frame is too large")
+	var size [4]byte
+	binary.BigEndian.PutUint32(size[:], uint32(len(payload)))
+	if _, err := w.Write(size[:]); err != nil {
+		return err
 	}
-	out := make([]byte, 2+len(headerBytes)+len(payload))
-	binary.BigEndian.PutUint16(out[:2], uint16(len(headerBytes)))
-	copy(out[2:], headerBytes)
-	copy(out[2+len(headerBytes):], payload)
-	return out, nil
+	_, err = w.Write(payload)
+	return err
 }
 
-func DecodeUDPFrame(frame []byte) (UDPHeader, []byte, error) {
-	if len(frame) < 2 {
-		return UDPHeader{}, nil, errors.New("udp frame is too small")
+func ReadUDPDatagramFrame(r io.Reader) (UDPDatagramFrame, error) {
+	var size [4]byte
+	if _, err := io.ReadFull(r, size[:]); err != nil {
+		return UDPDatagramFrame{}, err
 	}
-	headerLen := int(binary.BigEndian.Uint16(frame[:2]))
-	if headerLen == 0 || headerLen > 4096 || 2+headerLen > len(frame) {
-		return UDPHeader{}, nil, errors.New("invalid udp header size")
+	n := binary.BigEndian.Uint32(size[:])
+	if n == 0 || n > MaxUDPPacket+4096 {
+		return UDPDatagramFrame{}, errors.New("invalid udp frame size")
 	}
-	var header UDPHeader
-	if err := json.Unmarshal(frame[2:2+headerLen], &header); err != nil {
-		return UDPHeader{}, nil, err
+	payload := make([]byte, n)
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return UDPDatagramFrame{}, err
 	}
-	if header.Magic != Magic {
-		return UDPHeader{}, nil, errors.New("invalid udp header magic")
+	var frame UDPDatagramFrame
+	if err := json.Unmarshal(payload, &frame); err != nil {
+		return UDPDatagramFrame{}, err
 	}
-	return header, frame[2+headerLen:], nil
+	if len(frame.Payload) > MaxUDPPacket {
+		return UDPDatagramFrame{}, errors.New("udp payload is too large")
+	}
+	return frame, nil
 }

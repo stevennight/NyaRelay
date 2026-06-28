@@ -21,15 +21,16 @@ func TestSingleNodeTCPDirectOut(t *testing.T) {
 	defer closeTarget()
 
 	listenAddr := freeTCPAddr(t)
-	service := New(slog.New(slog.NewTextHandler(io.Discard, nil)), "node_entry")
+	service := New(testLogger(), "node_entry")
 	err := service.Apply(ctx, model.RelayConfig{
 		NodeID:   "node_entry",
 		Revision: 1,
-		Routes: []model.Route{{
-			ID:        "route_1",
+		Tunnels:  []model.TunnelRuntime{directTunnel()},
+		Forwards: []model.ForwardRuntime{{
+			ID:        "fwd_1",
 			Name:      "single",
-			Protocol:  model.ProtocolTCP,
-			EntryNode: "node_entry",
+			TunnelID:  "tun_direct",
+			Protocols: []model.ForwardProtocol{model.ForwardProtocolTCP},
 			Listen:    listenAddr,
 			Target:    targetAddr,
 			Enabled:   true,
@@ -42,7 +43,7 @@ func TestSingleNodeTCPDirectOut(t *testing.T) {
 	assertTCPRoundTrip(t, listenAddr, "nya-single")
 }
 
-func TestTwoNodeTCPDirectLink(t *testing.T) {
+func TestTwoNodeTCPChain(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -50,42 +51,22 @@ func TestTwoNodeTCPDirectLink(t *testing.T) {
 	defer closeTarget()
 
 	entryListen := freeTCPAddr(t)
-	linkListen := freeTCPAddr(t)
-	link := model.Link{
-		ID:         "link_1",
-		Name:       "entry-to-exit",
-		Type:       model.LinkDirect,
-		FromNode:   "node_entry",
-		ToNode:     "node_exit",
-		BindAddr:   linkListen,
-		PublicAddr: linkListen,
-		Enabled:    true,
-		Settings:   map[string]string{"secret": "test-secret"},
-	}
-	route := model.Route{
-		ID:        "route_1",
-		Name:      "multi",
-		Protocol:  model.ProtocolTCP,
-		EntryNode: "node_entry",
-		Listen:    entryListen,
-		Hops:      []model.RouteHop{{LinkID: "link_1"}},
-		Target:    targetAddr,
-		Enabled:   true,
-	}
+	stageListen := freeTCPAddr(t)
+	tunnel := twoNodeTunnel(model.TunnelTransportDirect, stageListen, map[string]string{"secret": "test-secret"})
 
-	exitService := New(slog.New(slog.NewTextHandler(io.Discard, nil)), "node_exit")
-	if err := exitService.Apply(ctx, model.RelayConfig{NodeID: "node_exit", Revision: 1, Links: []model.Link{link}, Routes: []model.Route{route}}); err != nil {
+	exitService := New(testLogger(), "node_exit")
+	if err := exitService.Apply(ctx, model.RelayConfig{NodeID: "node_exit", Revision: 1, Tunnels: []model.TunnelRuntime{tunnel}, Forwards: []model.ForwardRuntime{chainForward(entryListen, targetAddr, model.ForwardProtocolTCP)}}); err != nil {
 		t.Fatal(err)
 	}
-	entryService := New(slog.New(slog.NewTextHandler(io.Discard, nil)), "node_entry")
-	if err := entryService.Apply(ctx, model.RelayConfig{NodeID: "node_entry", Revision: 1, Links: []model.Link{link}, Routes: []model.Route{route}}); err != nil {
+	entryService := New(testLogger(), "node_entry")
+	if err := entryService.Apply(ctx, model.RelayConfig{NodeID: "node_entry", Revision: 1, Tunnels: []model.TunnelRuntime{tunnel}, Forwards: []model.ForwardRuntime{chainForward(entryListen, "", model.ForwardProtocolTCP)}}); err != nil {
 		t.Fatal(err)
 	}
 
 	assertTCPRoundTrip(t, entryListen, "nya-hop")
 }
 
-func TestTwoNodeTCPMTLSLink(t *testing.T) {
+func TestTwoNodeTCPMTLSChain(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -93,69 +74,35 @@ func TestTwoNodeTCPMTLSLink(t *testing.T) {
 	defer closeTarget()
 
 	entryListen := freeTCPAddr(t)
-	linkListen := freeTCPAddr(t)
-	certs, err := sharedcrypto.GenerateLinkCertificates("test-link", "127.0.0.1")
+	stageListen := freeTCPAddr(t)
+	certs, err := sharedcrypto.GenerateTunnelCertificates("test-tunnel", "127.0.0.1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	link := model.Link{
-		ID:         "link_mtls",
-		Name:       "entry-to-exit-mtls",
-		Type:       model.LinkMTLS,
-		FromNode:   "node_entry",
-		ToNode:     "node_exit",
-		BindAddr:   linkListen,
-		PublicAddr: linkListen,
-		ServerName: "127.0.0.1",
-		Enabled:    true,
-		Settings: map[string]string{
-			"secret":      "test-secret",
-			"ca_cert":     certs.CACert,
-			"server_cert": certs.ServerCert,
-			"server_key":  certs.ServerKey,
-			"client_cert": certs.ClientCert,
-			"client_key":  certs.ClientKey,
-		},
-	}
-	route := model.Route{
-		ID:        "route_1",
-		Name:      "mtls",
-		Protocol:  model.ProtocolTCP,
-		EntryNode: "node_entry",
-		Listen:    entryListen,
-		Hops:      []model.RouteHop{{LinkID: "link_mtls"}},
-		Target:    targetAddr,
-		Enabled:   true,
-	}
-
-	exitLink := link
-	exitLink.Settings = map[string]string{
+	settings := map[string]string{
 		"secret":      "test-secret",
+		"server_name": "127.0.0.1",
 		"ca_cert":     certs.CACert,
 		"server_cert": certs.ServerCert,
 		"server_key":  certs.ServerKey,
-	}
-	entryLink := link
-	entryLink.Settings = map[string]string{
-		"secret":      "test-secret",
-		"ca_cert":     certs.CACert,
 		"client_cert": certs.ClientCert,
 		"client_key":  certs.ClientKey,
 	}
+	tunnel := twoNodeTunnel(model.TunnelTransportMTLS, stageListen, settings)
 
-	exitService := New(slog.New(slog.NewTextHandler(io.Discard, nil)), "node_exit")
-	if err := exitService.Apply(ctx, model.RelayConfig{NodeID: "node_exit", Revision: 1, Links: []model.Link{exitLink}, Routes: []model.Route{route}}); err != nil {
+	exitService := New(testLogger(), "node_exit")
+	if err := exitService.Apply(ctx, model.RelayConfig{NodeID: "node_exit", Revision: 1, Tunnels: []model.TunnelRuntime{tunnel}, Forwards: []model.ForwardRuntime{chainForward(entryListen, targetAddr, model.ForwardProtocolTCP)}}); err != nil {
 		t.Fatal(err)
 	}
-	entryService := New(slog.New(slog.NewTextHandler(io.Discard, nil)), "node_entry")
-	if err := entryService.Apply(ctx, model.RelayConfig{NodeID: "node_entry", Revision: 1, Links: []model.Link{entryLink}, Routes: []model.Route{route}}); err != nil {
+	entryService := New(testLogger(), "node_entry")
+	if err := entryService.Apply(ctx, model.RelayConfig{NodeID: "node_entry", Revision: 1, Tunnels: []model.TunnelRuntime{tunnel}, Forwards: []model.ForwardRuntime{chainForward(entryListen, "", model.ForwardProtocolTCP)}}); err != nil {
 		t.Fatal(err)
 	}
 
 	assertTCPRoundTrip(t, entryListen, "nya-mtls")
 }
 
-func TestThreeNodeTCPDirectMultiHop(t *testing.T) {
+func TestThreeNodeTCPDirectChain(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -163,59 +110,43 @@ func TestThreeNodeTCPDirectMultiHop(t *testing.T) {
 	defer closeTarget()
 
 	entryListen := freeTCPAddr(t)
-	linkABListen := freeTCPAddr(t)
-	linkBCListen := freeTCPAddr(t)
-
-	linkAB := model.Link{
-		ID:         "link_ab",
-		Name:       "entry-to-mid",
-		Type:       model.LinkDirect,
-		FromNode:   "node_entry",
-		ToNode:     "node_mid",
-		BindAddr:   linkABListen,
-		PublicAddr: linkABListen,
-		Enabled:    true,
-		Settings:   map[string]string{"secret": "test-secret"},
-	}
-	linkBC := model.Link{
-		ID:         "link_bc",
-		Name:       "mid-to-exit",
-		Type:       model.LinkDirect,
-		FromNode:   "node_mid",
-		ToNode:     "node_exit",
-		BindAddr:   linkBCListen,
-		PublicAddr: linkBCListen,
-		Enabled:    true,
-		Settings:   map[string]string{"secret": "test-secret"},
-	}
-	route := model.Route{
-		ID:        "route_3",
-		Name:      "three-hop",
-		Protocol:  model.ProtocolTCP,
-		EntryNode: "node_entry",
-		Listen:    entryListen,
-		Hops:      []model.RouteHop{{LinkID: "link_ab"}, {LinkID: "link_bc"}},
-		Target:    targetAddr,
-		Enabled:   true,
+	midListen := freeTCPAddr(t)
+	exitListen := freeTCPAddr(t)
+	tunnel := model.TunnelRuntime{
+		ID:        "tun_three",
+		Name:      "three",
+		Type:      model.TunnelChain,
+		Transport: model.TunnelTransportDirect,
+		Stages: []model.TunnelRuntimeStage{
+			runtimeStage(0, model.TunnelStageEntry, runtimeNode("node_entry", "", "", nil)),
+			runtimeStage(1, model.TunnelStageMiddle, runtimeNode("node_mid", midListen, midListen, map[string]string{"secret": "secret-ab"})),
+			runtimeStage(2, model.TunnelStageExit, runtimeNode("node_exit", exitListen, exitListen, map[string]string{"secret": "secret-bc"})),
+		},
 	}
 
-	exitService := New(slog.New(slog.NewTextHandler(io.Discard, nil)), "node_exit")
-	if err := exitService.Apply(ctx, model.RelayConfig{NodeID: "node_exit", Revision: 1, Links: []model.Link{linkBC}, Routes: []model.Route{route}}); err != nil {
+	exitService := New(testLogger(), "node_exit")
+	exitForward := chainForward(entryListen, targetAddr, model.ForwardProtocolTCP)
+	exitForward.TunnelID = tunnel.ID
+	if err := exitService.Apply(ctx, model.RelayConfig{NodeID: "node_exit", Revision: 1, Tunnels: []model.TunnelRuntime{tunnel}, Forwards: []model.ForwardRuntime{exitForward}}); err != nil {
 		t.Fatal(err)
 	}
-	midService := New(slog.New(slog.NewTextHandler(io.Discard, nil)), "node_mid")
-	if err := midService.Apply(ctx, model.RelayConfig{NodeID: "node_mid", Revision: 1, Links: []model.Link{linkAB, linkBC}, Routes: []model.Route{route}}); err != nil {
+	midService := New(testLogger(), "node_mid")
+	midForward := chainForward(entryListen, "", model.ForwardProtocolTCP)
+	midForward.TunnelID = tunnel.ID
+	if err := midService.Apply(ctx, model.RelayConfig{NodeID: "node_mid", Revision: 1, Tunnels: []model.TunnelRuntime{tunnel}, Forwards: []model.ForwardRuntime{midForward}}); err != nil {
 		t.Fatal(err)
 	}
-	entryService := New(slog.New(slog.NewTextHandler(io.Discard, nil)), "node_entry")
-	if err := entryService.Apply(ctx, model.RelayConfig{NodeID: "node_entry", Revision: 1, Links: []model.Link{linkAB}, Routes: []model.Route{route}}); err != nil {
+	entryService := New(testLogger(), "node_entry")
+	entryForward := chainForward(entryListen, "", model.ForwardProtocolTCP)
+	entryForward.TunnelID = tunnel.ID
+	if err := entryService.Apply(ctx, model.RelayConfig{NodeID: "node_entry", Revision: 1, Tunnels: []model.TunnelRuntime{tunnel}, Forwards: []model.ForwardRuntime{entryForward}}); err != nil {
 		t.Fatal(err)
 	}
 
 	assertTCPRoundTrip(t, entryListen, "nya-three-hop")
 }
 
-func TestWSTLSLink(t *testing.T) {
+func TestWSTLSChain(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -223,50 +154,26 @@ func TestWSTLSLink(t *testing.T) {
 	defer closeTarget()
 
 	entryListen := freeTCPAddr(t)
-	linkListen := freeTCPAddr(t)
-	certs, err := sharedcrypto.GenerateLinkCertificates("ws-link", "127.0.0.1")
+	stageListen := freeTCPAddr(t)
+	certs, err := sharedcrypto.GenerateTunnelCertificates("ws-tunnel", "127.0.0.1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	link := model.Link{
-		ID:         "link_ws",
-		Name:       "entry-to-exit-ws",
-		Type:       model.LinkWSTLS,
-		FromNode:   "node_entry",
-		ToNode:     "node_exit",
-		BindAddr:   linkListen,
-		PublicAddr: linkListen,
-		ServerName: "127.0.0.1",
-		Enabled:    true,
-		Settings: map[string]string{
-			"secret":      "test-secret",
-			"ca_cert":     certs.CACert,
-			"server_cert": certs.ServerCert,
-			"server_key":  certs.ServerKey,
-		},
+	settings := map[string]string{
+		"secret":      "test-secret",
+		"server_name": "127.0.0.1",
+		"ca_cert":     certs.CACert,
+		"server_cert": certs.ServerCert,
+		"server_key":  certs.ServerKey,
 	}
-	route := model.Route{
-		ID:        "route_ws",
-		Name:      "ws-hop",
-		Protocol:  model.ProtocolTCP,
-		EntryNode: "node_entry",
-		Listen:    entryListen,
-		Hops:      []model.RouteHop{{LinkID: "link_ws"}},
-		Target:    targetAddr,
-		Enabled:   true,
-	}
+	tunnel := twoNodeTunnel(model.TunnelTransportWSTLS, stageListen, settings)
 
-	exitService := New(slog.New(slog.NewTextHandler(io.Discard, nil)), "node_exit")
-	if err := exitService.Apply(ctx, model.RelayConfig{NodeID: "node_exit", Revision: 1, Links: []model.Link{link}, Routes: []model.Route{route}}); err != nil {
+	exitService := New(testLogger(), "node_exit")
+	if err := exitService.Apply(ctx, model.RelayConfig{NodeID: "node_exit", Revision: 1, Tunnels: []model.TunnelRuntime{tunnel}, Forwards: []model.ForwardRuntime{chainForward(entryListen, targetAddr, model.ForwardProtocolTCP)}}); err != nil {
 		t.Fatal(err)
 	}
-	entryLink := link
-	entryLink.Settings = map[string]string{
-		"secret":  "test-secret",
-		"ca_cert": certs.CACert,
-	}
-	entryService := New(slog.New(slog.NewTextHandler(io.Discard, nil)), "node_entry")
-	if err := entryService.Apply(ctx, model.RelayConfig{NodeID: "node_entry", Revision: 1, Links: []model.Link{entryLink}, Routes: []model.Route{route}}); err != nil {
+	entryService := New(testLogger(), "node_entry")
+	if err := entryService.Apply(ctx, model.RelayConfig{NodeID: "node_entry", Revision: 1, Tunnels: []model.TunnelRuntime{tunnel}, Forwards: []model.ForwardRuntime{chainForward(entryListen, "", model.ForwardProtocolTCP)}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -281,15 +188,16 @@ func TestSingleNodeUDPDirectOut(t *testing.T) {
 	defer closeTarget()
 
 	listenAddr := freeUDPAddr(t)
-	service := New(slog.New(slog.NewTextHandler(io.Discard, nil)), "node_entry")
+	service := New(testLogger(), "node_entry")
 	if err := service.Apply(ctx, model.RelayConfig{
 		NodeID:   "node_entry",
 		Revision: 1,
-		Routes: []model.Route{{
-			ID:        "route_udp",
+		Tunnels:  []model.TunnelRuntime{directTunnel()},
+		Forwards: []model.ForwardRuntime{{
+			ID:        "fwd_udp",
 			Name:      "single-udp",
-			Protocol:  model.ProtocolUDP,
-			EntryNode: "node_entry",
+			TunnelID:  "tun_direct",
+			Protocols: []model.ForwardProtocol{model.ForwardProtocolUDP},
 			Listen:    listenAddr,
 			Target:    targetAddr,
 			Enabled:   true,
@@ -301,7 +209,7 @@ func TestSingleNodeUDPDirectOut(t *testing.T) {
 	assertUDPRoundTrip(t, listenAddr, "nya-udp-single")
 }
 
-func TestTwoNodeUDPDirectLink(t *testing.T) {
+func TestTwoNodeUDPChain(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -309,39 +217,82 @@ func TestTwoNodeUDPDirectLink(t *testing.T) {
 	defer closeTarget()
 
 	entryListen := freeUDPAddr(t)
-	linkListen := freeUDPAddr(t)
-	link := model.Link{
-		ID:         "link_udp",
-		Name:       "entry-to-exit-udp",
-		Type:       model.LinkDirect,
-		FromNode:   "node_entry",
-		ToNode:     "node_exit",
-		BindAddr:   linkListen,
-		PublicAddr: linkListen,
-		Enabled:    true,
-		Settings:   map[string]string{"secret": "test-secret"},
-	}
-	route := model.Route{
-		ID:        "route_udp",
-		Name:      "udp-hop",
-		Protocol:  model.ProtocolUDP,
-		EntryNode: "node_entry",
-		Listen:    entryListen,
-		Hops:      []model.RouteHop{{LinkID: "link_udp"}},
-		Target:    targetAddr,
-		Enabled:   true,
-	}
+	stageListen := freeTCPAddr(t)
+	tunnel := twoNodeTunnel(model.TunnelTransportDirect, stageListen, map[string]string{"secret": "test-secret"})
 
-	exitService := New(slog.New(slog.NewTextHandler(io.Discard, nil)), "node_exit")
-	if err := exitService.Apply(ctx, model.RelayConfig{NodeID: "node_exit", Revision: 1, Links: []model.Link{link}, Routes: []model.Route{route}}); err != nil {
+	exitService := New(testLogger(), "node_exit")
+	if err := exitService.Apply(ctx, model.RelayConfig{NodeID: "node_exit", Revision: 1, Tunnels: []model.TunnelRuntime{tunnel}, Forwards: []model.ForwardRuntime{chainForward(entryListen, targetAddr, model.ForwardProtocolUDP)}}); err != nil {
 		t.Fatal(err)
 	}
-	entryService := New(slog.New(slog.NewTextHandler(io.Discard, nil)), "node_entry")
-	if err := entryService.Apply(ctx, model.RelayConfig{NodeID: "node_entry", Revision: 1, Links: []model.Link{link}, Routes: []model.Route{route}}); err != nil {
+	entryService := New(testLogger(), "node_entry")
+	if err := entryService.Apply(ctx, model.RelayConfig{NodeID: "node_entry", Revision: 1, Tunnels: []model.TunnelRuntime{tunnel}, Forwards: []model.ForwardRuntime{chainForward(entryListen, "", model.ForwardProtocolUDP)}}); err != nil {
 		t.Fatal(err)
 	}
 
 	assertUDPRoundTrip(t, entryListen, "nya-udp-hop")
+}
+
+func directTunnel() model.TunnelRuntime {
+	return model.TunnelRuntime{
+		ID:        "tun_direct",
+		Name:      "direct",
+		Type:      model.TunnelDirect,
+		Transport: model.TunnelTransportDirect,
+		Stages: []model.TunnelRuntimeStage{
+			runtimeStage(0, model.TunnelStageEntry, runtimeNode("node_entry", "", "", nil)),
+		},
+	}
+}
+
+func twoNodeTunnel(transport model.TunnelTransport, stageListen string, settings map[string]string) model.TunnelRuntime {
+	return model.TunnelRuntime{
+		ID:        "tun_chain",
+		Name:      "chain",
+		Type:      model.TunnelChain,
+		Transport: transport,
+		Stages: []model.TunnelRuntimeStage{
+			runtimeStage(0, model.TunnelStageEntry, runtimeNode("node_entry", "", "", nil)),
+			runtimeStage(1, model.TunnelStageExit, runtimeNode("node_exit", stageListen, stageListen, settings)),
+		},
+	}
+}
+
+func runtimeStage(index int, role model.TunnelStageRole, node model.TunnelRuntimeNode) model.TunnelRuntimeStage {
+	return model.TunnelRuntimeStage{
+		Index:    index,
+		Role:     role,
+		Strategy: "single",
+		Nodes:    []model.TunnelRuntimeNode{node},
+	}
+}
+
+func runtimeNode(nodeID, listen, public string, settings map[string]string) model.TunnelRuntimeNode {
+	if settings == nil {
+		settings = map[string]string{}
+	}
+	return model.TunnelRuntimeNode{
+		NodeID:     nodeID,
+		ListenAddr: listen,
+		PublicAddr: public,
+		Weight:     1,
+		Settings:   settings,
+	}
+}
+
+func chainForward(listen, target string, protocol model.ForwardProtocol) model.ForwardRuntime {
+	return model.ForwardRuntime{
+		ID:        "fwd_chain",
+		Name:      "chain-forward",
+		TunnelID:  "tun_chain",
+		Protocols: []model.ForwardProtocol{protocol},
+		Listen:    listen,
+		Target:    target,
+		Enabled:   true,
+	}
+}
+
+func testLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
 func tcpEchoServer(t *testing.T) (string, func()) {

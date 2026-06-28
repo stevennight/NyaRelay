@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -32,21 +33,25 @@ type controllerHarness struct {
 	closeOnce  sync.Once
 }
 
+var (
+	nextTCPTestPort  = 10000
+	nextUDPTestPort  = 10000
+	nextDualTestPort = 10000
+	portCursorMu     sync.Mutex
+)
+
 func newControllerHarness(t *testing.T, listenAddr string) *controllerHarness {
 	t.Helper()
-
 	return newControllerHarnessInDir(t, t.TempDir(), listenAddr)
 }
 
 func newControllerHarnessInDir(t *testing.T, dir, listenAddr string) *controllerHarness {
 	t.Helper()
-
 	dbPath := filepath.Join(dir, "nyarelay.db")
 	st, err := store.Open(context.Background(), dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	srv := &Server{
 		cfg: Config{
 			ListenAddr: listenAddr,
@@ -106,27 +111,25 @@ func TestControllerNodeSingleNodeTCPIntegration(t *testing.T) {
 	h := newControllerHarness(t, "127.0.0.1:0")
 	pub := mustSigningKey(t, h.store)
 
-	nodeNode, token := createNode(t, h.server, "entry-1")
-	nodeDir := t.TempDir()
-	nodeCancel := startNode(t, h.url, nodeNode.ID, token, pub, nodeDir)
+	entry, token := createNode(t, h.server, "entry-1")
+	nodeCancel := startNode(t, h.url, entry.ID, token, pub, t.TempDir())
 	defer nodeCancel()
-
-	waitForNodeOnline(t, h.store, nodeNode.ID)
+	waitForNodeOnline(t, h.store, entry.ID)
 
 	targetAddr, closeTarget := tcpEchoServer(t)
 	defer closeTarget()
 
 	listenAddr := freeTCPAddr(t)
-	route := model.Route{
-		ID:        "route_tcp_1",
+	tunnel := upsertTunnel(t, h.server, directTunnelRequest("tun_tcp_1", entry.ID))
+	upsertForward(t, h.server, forwardRequest{
+		ID:        "fwd_tcp_1",
 		Name:      "single-tcp",
-		Protocol:  model.ProtocolTCP,
-		EntryNode: nodeNode.ID,
+		TunnelID:  tunnel.ID,
+		Protocols: []model.ForwardProtocol{model.ForwardProtocolTCP},
 		Listen:    listenAddr,
 		Target:    targetAddr,
-		Enabled:   true,
-	}
-	upsertRoute(t, h.server, route)
+		Enabled:   boolPtr(true),
+	})
 
 	assertTCPRoundTrip(t, listenAddr, "nya-single")
 	h.close()
@@ -137,92 +140,209 @@ func TestControllerNodeSingleNodeUDPIntegration(t *testing.T) {
 	h := newControllerHarness(t, "127.0.0.1:0")
 	pub := mustSigningKey(t, h.store)
 
-	nodeNode, token := createNode(t, h.server, "entry-udp")
-	nodeCancel := startNode(t, h.url, nodeNode.ID, token, pub, t.TempDir())
+	entry, token := createNode(t, h.server, "entry-udp")
+	nodeCancel := startNode(t, h.url, entry.ID, token, pub, t.TempDir())
 	defer nodeCancel()
-
-	waitForNodeOnline(t, h.store, nodeNode.ID)
+	waitForNodeOnline(t, h.store, entry.ID)
 
 	targetAddr, closeTarget := udpEchoServer(t)
 	defer closeTarget()
 
 	listenAddr := freeUDPAddr(t)
-	route := model.Route{
-		ID:        "route_udp_1",
+	tunnel := upsertTunnel(t, h.server, directTunnelRequest("tun_udp_1", entry.ID))
+	upsertForward(t, h.server, forwardRequest{
+		ID:        "fwd_udp_1",
 		Name:      "single-udp",
-		Protocol:  model.ProtocolUDP,
-		EntryNode: nodeNode.ID,
+		TunnelID:  tunnel.ID,
+		Protocols: []model.ForwardProtocol{model.ForwardProtocolUDP},
 		Listen:    listenAddr,
 		Target:    targetAddr,
-		Enabled:   true,
-	}
-	upsertRoute(t, h.server, route)
+		Enabled:   boolPtr(true),
+	})
 
 	assertUDPRoundTrip(t, listenAddr, "nya-udp")
+}
+
+func TestControllerNodeTCPAndUDPSamePortIntegration(t *testing.T) {
+	h := newControllerHarness(t, "127.0.0.1:0")
+	pub := mustSigningKey(t, h.store)
+
+	entry, token := createNode(t, h.server, "entry-dual")
+	nodeCancel := startNode(t, h.url, entry.ID, token, pub, t.TempDir())
+	defer nodeCancel()
+	waitForNodeOnline(t, h.store, entry.ID)
+
+	targetAddr, closeTarget := dualProtoEchoServer(t)
+	defer closeTarget()
+
+	listenAddr := freeDualProtoAddr(t)
+	tunnel := upsertTunnel(t, h.server, directTunnelRequest("tun_dual", entry.ID))
+	upsertForward(t, h.server, forwardRequest{
+		ID:        "fwd_dual",
+		Name:      "dual",
+		TunnelID:  tunnel.ID,
+		Protocols: []model.ForwardProtocol{model.ForwardProtocolTCP, model.ForwardProtocolUDP},
+		Listen:    listenAddr,
+		Target:    targetAddr,
+		Enabled:   boolPtr(true),
+	})
+
+	assertTCPRoundTrip(t, listenAddr, "nya-dual-tcp")
+	assertUDPRoundTrip(t, listenAddr, "nya-dual-udp")
 }
 
 func TestControllerNodeThreeNodeTCPIntegration(t *testing.T) {
 	h := newControllerHarness(t, "127.0.0.1:0")
 	pub := mustSigningKey(t, h.store)
 
-	entryNode, entryToken := createNode(t, h.server, "entry")
-	midNode, midToken := createNode(t, h.server, "mid")
-	exitNode, exitToken := createNode(t, h.server, "exit")
+	entry, entryToken := createNode(t, h.server, "entry")
+	mid, midToken := createNode(t, h.server, "mid")
+	exit, exitToken := createNode(t, h.server, "exit")
 
-	entryCancel := startNode(t, h.url, entryNode.ID, entryToken, pub, t.TempDir())
-	midCancel := startNode(t, h.url, midNode.ID, midToken, pub, t.TempDir())
-	exitCancel := startNode(t, h.url, exitNode.ID, exitToken, pub, t.TempDir())
+	entryCancel := startNode(t, h.url, entry.ID, entryToken, pub, t.TempDir())
+	midCancel := startNode(t, h.url, mid.ID, midToken, pub, t.TempDir())
+	exitCancel := startNode(t, h.url, exit.ID, exitToken, pub, t.TempDir())
 	defer entryCancel()
 	defer midCancel()
 	defer exitCancel()
 
-	waitForNodeOnline(t, h.store, entryNode.ID)
-	waitForNodeOnline(t, h.store, midNode.ID)
-	waitForNodeOnline(t, h.store, exitNode.ID)
+	waitForNodeOnline(t, h.store, entry.ID)
+	waitForNodeOnline(t, h.store, mid.ID)
+	waitForNodeOnline(t, h.store, exit.ID)
 
 	targetAddr, closeTarget := tcpEchoServer(t)
 	defer closeTarget()
 
-	linkABListen := freeTCPAddr(t)
-	linkBCListen := freeTCPAddr(t)
+	entryListen := freeTCPAddr(t)
+	midListen := freeTCPAddr(t)
+	exitListen := freeTCPAddr(t)
+	tunnel := upsertTunnel(t, h.server, chainTunnelRequest("tun_three", entry.ID, []string{mid.ID}, exit.ID, []string{midListen, exitListen}))
+	upsertForward(t, h.server, forwardRequest{
+		ID:        "fwd_three",
+		Name:      "three-hop",
+		TunnelID:  tunnel.ID,
+		Protocols: []model.ForwardProtocol{model.ForwardProtocolTCP},
+		Listen:    entryListen,
+		Target:    targetAddr,
+		Enabled:   boolPtr(true),
+	})
 
-	linkAB := model.Link{
-		ID:         "link_ab",
-		Name:       "entry-to-mid",
-		Type:       model.LinkDirect,
-		FromNode:   entryNode.ID,
-		ToNode:     midNode.ID,
-		BindAddr:   linkABListen,
-		PublicAddr: linkABListen,
-		Enabled:    true,
-	}
-	linkBC := model.Link{
-		ID:         "link_bc",
-		Name:       "mid-to-exit",
-		Type:       model.LinkDirect,
-		FromNode:   midNode.ID,
-		ToNode:     exitNode.ID,
-		BindAddr:   linkBCListen,
-		PublicAddr: linkBCListen,
-		Enabled:    true,
-	}
-	upsertLink(t, h.server, linkAB)
-	upsertLink(t, h.server, linkBC)
+	assertTCPRoundTrip(t, entryListen, "nya-three-hop")
+}
+
+func TestControllerForwardTargetUpdateAppliesWithoutRestart(t *testing.T) {
+	h := newControllerHarness(t, "127.0.0.1:0")
+	pub := mustSigningKey(t, h.store)
+
+	entry, token := createNode(t, h.server, "entry-update")
+	nodeCancel := startNode(t, h.url, entry.ID, token, pub, t.TempDir())
+	defer nodeCancel()
+	waitForNodeOnline(t, h.store, entry.ID)
+
+	targetOne, closeOne := tcpReplyServer(t, "one")
+	defer closeOne()
+	targetTwo, closeTwo := tcpReplyServer(t, "two")
+	defer closeTwo()
 
 	listenAddr := freeTCPAddr(t)
-	route := model.Route{
-		ID:        "route_multi_1",
-		Name:      "three-hop",
-		Protocol:  model.ProtocolTCP,
-		EntryNode: entryNode.ID,
+	tunnel := upsertTunnel(t, h.server, directTunnelRequest("tun_update", entry.ID))
+	forward := upsertForward(t, h.server, forwardRequest{
+		ID:        "fwd_update",
+		Name:      "update",
+		TunnelID:  tunnel.ID,
+		Protocols: []model.ForwardProtocol{model.ForwardProtocolTCP},
 		Listen:    listenAddr,
-		Hops:      []model.RouteHop{{LinkID: linkAB.ID}, {LinkID: linkBC.ID}},
-		Target:    targetAddr,
-		Enabled:   true,
-	}
-	upsertRoute(t, h.server, route)
+		Target:    targetOne,
+		Enabled:   boolPtr(true),
+	})
 
-	assertTCPRoundTrip(t, listenAddr, "nya-three-hop")
+	assertTCPResponse(t, listenAddr, "ping", "one")
+
+	upsertForward(t, h.server, forwardRequest{
+		ID:        forward.ID,
+		Name:      forward.Name,
+		TunnelID:  tunnel.ID,
+		Protocols: []model.ForwardProtocol{model.ForwardProtocolTCP},
+		Listen:    listenAddr,
+		Target:    targetTwo,
+		Enabled:   boolPtr(true),
+	})
+
+	assertTCPResponse(t, listenAddr, "ping", "two")
+}
+
+func TestControllerForwardDeleteStopsListener(t *testing.T) {
+	h := newControllerHarness(t, "127.0.0.1:0")
+	pub := mustSigningKey(t, h.store)
+
+	entry, token := createNode(t, h.server, "entry-delete")
+	nodeCancel := startNode(t, h.url, entry.ID, token, pub, t.TempDir())
+	defer nodeCancel()
+	waitForNodeOnline(t, h.store, entry.ID)
+
+	targetAddr, closeTarget := tcpEchoServer(t)
+	defer closeTarget()
+
+	listenAddr := freeTCPAddr(t)
+	tunnel := upsertTunnel(t, h.server, directTunnelRequest("tun_delete", entry.ID))
+	forward := upsertForward(t, h.server, forwardRequest{
+		ID:        "fwd_delete",
+		Name:      "delete",
+		TunnelID:  tunnel.ID,
+		Protocols: []model.ForwardProtocol{model.ForwardProtocolTCP},
+		Listen:    listenAddr,
+		Target:    targetAddr,
+		Enabled:   boolPtr(true),
+	})
+
+	assertTCPRoundTrip(t, listenAddr, "before-delete")
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/forwards/"+forward.ID, nil)
+	req.SetPathValue("id", forward.ID)
+	rec := httptest.NewRecorder()
+	h.server.handleDeleteForward(rec, req, auth.Session{UserID: 1, Username: "admin"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete forward failed: %d %s", rec.Code, rec.Body.String())
+	}
+
+	assertTCPDialEventuallyFails(t, listenAddr)
+}
+
+func TestControllerTunnelDisableStopsForward(t *testing.T) {
+	h := newControllerHarness(t, "127.0.0.1:0")
+	pub := mustSigningKey(t, h.store)
+
+	entry, token := createNode(t, h.server, "entry-disable")
+	nodeCancel := startNode(t, h.url, entry.ID, token, pub, t.TempDir())
+	defer nodeCancel()
+	waitForNodeOnline(t, h.store, entry.ID)
+
+	targetAddr, closeTarget := tcpEchoServer(t)
+	defer closeTarget()
+
+	listenAddr := freeTCPAddr(t)
+	tunnel := upsertTunnel(t, h.server, directTunnelRequest("tun_disable", entry.ID))
+	upsertForward(t, h.server, forwardRequest{
+		ID:        "fwd_disable",
+		Name:      "disable",
+		TunnelID:  tunnel.ID,
+		Protocols: []model.ForwardProtocol{model.ForwardProtocolTCP},
+		Listen:    listenAddr,
+		Target:    targetAddr,
+		Enabled:   boolPtr(true),
+	})
+
+	assertTCPRoundTrip(t, listenAddr, "before-disable")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/tunnels/"+tunnel.ID+"/disable", nil)
+	req.SetPathValue("id", tunnel.ID)
+	rec := httptest.NewRecorder()
+	h.server.handleDisableTunnel(rec, req, auth.Session{UserID: 1, Username: "admin"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("disable tunnel failed: %d %s", rec.Code, rec.Body.String())
+	}
+
+	assertTCPDialEventuallyFails(t, listenAddr)
 }
 
 func TestControllerRestartAndNodeReconnectIntegration(t *testing.T) {
@@ -232,50 +352,44 @@ func TestControllerRestartAndNodeReconnectIntegration(t *testing.T) {
 	h1 := newControllerHarnessInDir(t, dir, controllerAddr)
 	pub := mustSigningKey(t, h1.store)
 
-	nodeNode, token := createNode(t, h1.server, "entry-restart")
-	nodeDir := t.TempDir()
-	nodeCancel := startNode(t, h1.url, nodeNode.ID, token, pub, nodeDir)
+	entry, token := createNode(t, h1.server, "entry-restart")
+	nodeCancel := startNode(t, h1.url, entry.ID, token, pub, t.TempDir())
 	defer nodeCancel()
-
-	waitForNodeOnline(t, h1.store, nodeNode.ID)
+	waitForNodeOnline(t, h1.store, entry.ID)
 
 	targetAddr, closeTarget := tcpEchoServer(t)
 	defer closeTarget()
-	routeListen := freeTCPAddr(t)
+	listenAddr := freeTCPAddr(t)
 
-	route := model.Route{
-		ID:        "route_restart_1",
+	tunnel := upsertTunnel(t, h1.server, directTunnelRequest("tun_restart", entry.ID))
+	upsertForward(t, h1.server, forwardRequest{
+		ID:        "fwd_restart",
 		Name:      "restart",
-		Protocol:  model.ProtocolTCP,
-		EntryNode: nodeNode.ID,
-		Listen:    routeListen,
+		TunnelID:  tunnel.ID,
+		Protocols: []model.ForwardProtocol{model.ForwardProtocolTCP},
+		Listen:    listenAddr,
 		Target:    targetAddr,
-		Enabled:   true,
-	}
-	upsertRoute(t, h1.server, route)
+		Enabled:   boolPtr(true),
+	})
 
-	assertTCPRoundTrip(t, routeListen, "nya-before-restart")
-
+	assertTCPRoundTrip(t, listenAddr, "nya-before-restart")
 	h1.close()
-
-	assertTCPRoundTrip(t, routeListen, "nya-during-controller-down")
+	assertTCPRoundTrip(t, listenAddr, "nya-during-controller-down")
 
 	h2 := newControllerHarnessInDir(t, dir, controllerAddr)
 	defer h2.close()
 
-	waitForNodeOnline(t, h2.store, nodeNode.ID)
-	assertTCPRoundTrip(t, routeListen, "nya-after-restart")
+	waitForNodeOnline(t, h2.store, entry.ID)
+	assertTCPRoundTrip(t, listenAddr, "nya-after-restart")
 }
 
 func TestNodeInstallEndpointReturnsCommand(t *testing.T) {
 	h := newControllerHarness(t, "127.0.0.1:0")
 	_, _ = mustSigningKey(t, h.store), h
 
-	nodeNode, token := createNode(t, h.server, "installer")
-	req := httptest.NewRequest(http.MethodGet, "/api/nodes/"+nodeNode.ID+"/install", nil)
-	req.SetPathValue("id", nodeNode.ID)
-	req.Header.Set("X-NyaRelay-Node-ID", "admin")
-	req.Header.Set("X-NyaRelay-Node-Token", "admin-token")
+	entry, token := createNode(t, h.server, "installer")
+	req := httptest.NewRequest(http.MethodGet, "/api/nodes/"+entry.ID+"/install", nil)
+	req.SetPathValue("id", entry.ID)
 	rec := httptest.NewRecorder()
 	h.server.handleGetNodeInstall(rec, req, auth.Session{UserID: 1, Username: "admin"})
 	if rec.Code != http.StatusOK {
@@ -285,7 +399,7 @@ func TestNodeInstallEndpointReturnsCommand(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
-	if resp.Node.ID != nodeNode.ID || resp.Token != token {
+	if resp.Node.ID != entry.ID || resp.Token != token {
 		t.Fatalf("unexpected install info: %#v", resp)
 	}
 	if resp.Command == "" || resp.ScriptURL == "" || resp.BinaryURL == "" {
@@ -293,30 +407,31 @@ func TestNodeInstallEndpointReturnsCommand(t *testing.T) {
 	}
 }
 
-func TestRouteAutoAssignsPortWithinNodeRange(t *testing.T) {
+func TestForwardAutoAssignsPortWithinNodeRange(t *testing.T) {
 	h := newControllerHarness(t, "127.0.0.1:0")
-	nodeNode, _ := createNode(t, h.server, "entry-auto")
-	nodeNode.PortMin = 12000
-	nodeNode.PortMax = 12001
-	if err := h.store.UpdateNode(context.Background(), nodeNode); err != nil {
+	entry, _ := createNode(t, h.server, "entry-auto")
+	entry.PortMin = 12000
+	entry.PortMax = 12001
+	if err := h.store.UpdateNode(context.Background(), entry); err != nil {
 		t.Fatal(err)
 	}
+	tunnel := upsertTunnel(t, h.server, directTunnelRequest("tun_auto", entry.ID))
 
-	first := upsertRoute(t, h.server, model.Route{
-		ID:        "route_auto_1",
+	first := upsertForward(t, h.server, forwardRequest{
+		ID:        "fwd_auto_1",
 		Name:      "auto-1",
-		Protocol:  model.ProtocolTCP,
-		EntryNode: nodeNode.ID,
+		TunnelID:  tunnel.ID,
+		Protocols: []model.ForwardProtocol{model.ForwardProtocolTCP},
 		Target:    "127.0.0.1:443",
-		Enabled:   true,
+		Enabled:   boolPtr(true),
 	})
-	second := upsertRoute(t, h.server, model.Route{
-		ID:        "route_auto_2",
+	second := upsertForward(t, h.server, forwardRequest{
+		ID:        "fwd_auto_2",
 		Name:      "auto-2",
-		Protocol:  model.ProtocolTCP,
-		EntryNode: nodeNode.ID,
+		TunnelID:  tunnel.ID,
+		Protocols: []model.ForwardProtocol{model.ForwardProtocolTCP},
 		Target:    "127.0.0.1:443",
-		Enabled:   true,
+		Enabled:   boolPtr(true),
 	})
 	got := map[string]bool{first.Listen: true, second.Listen: true}
 	if len(got) != 2 || !got[":12000"] || !got[":12001"] {
@@ -324,36 +439,37 @@ func TestRouteAutoAssignsPortWithinNodeRange(t *testing.T) {
 	}
 }
 
-func TestRouteRejectsDuplicatePortOnSameEntryNode(t *testing.T) {
+func TestForwardRejectsDuplicatePortOnSameEntryNode(t *testing.T) {
 	h := newControllerHarness(t, "127.0.0.1:0")
-	nodeNode, _ := createNode(t, h.server, "entry-dup")
-	upsertRoute(t, h.server, model.Route{
-		ID:        "route_dup_1",
+	entry, _ := createNode(t, h.server, "entry-dup")
+	tunnel := upsertTunnel(t, h.server, directTunnelRequest("tun_dup", entry.ID))
+	upsertForward(t, h.server, forwardRequest{
+		ID:        "fwd_dup_1",
 		Name:      "dup-1",
-		Protocol:  model.ProtocolTCP,
-		EntryNode: nodeNode.ID,
+		TunnelID:  tunnel.ID,
+		Protocols: []model.ForwardProtocol{model.ForwardProtocolTCP},
 		Listen:    ":13000",
 		Target:    "127.0.0.1:443",
-		Enabled:   true,
+		Enabled:   boolPtr(true),
 	})
 
-	payload, err := json.Marshal(model.Route{
-		ID:        "route_dup_2",
+	payload, err := json.Marshal(forwardRequest{
+		ID:        "fwd_dup_2",
 		Name:      "dup-2",
-		Protocol:  model.ProtocolTCP,
-		EntryNode: nodeNode.ID,
+		TunnelID:  tunnel.ID,
+		Protocols: []model.ForwardProtocol{model.ForwardProtocolTCP},
 		Listen:    "0.0.0.0:13000",
 		Target:    "127.0.0.1:443",
-		Enabled:   true,
+		Enabled:   boolPtr(true),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := httptest.NewRequest(http.MethodPost, "/api/routes", bytes.NewReader(payload))
+	req := httptest.NewRequest(http.MethodPost, "/api/forwards", bytes.NewReader(payload))
 	rec := httptest.NewRecorder()
-	h.server.handleUpsertRoute(rec, req, auth.Session{UserID: 1, Username: "admin"})
+	h.server.handleUpsertForward(rec, req, auth.Session{UserID: 1, Username: "admin"})
 	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected duplicate route port to fail, got %d %s", rec.Code, rec.Body.String())
+		t.Fatalf("expected duplicate forward port to fail, got %d %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -392,82 +508,95 @@ func createNode(t *testing.T, s *Server, name string) (model.Node, string) {
 	return resp.Node, resp.Token
 }
 
-func upsertLink(t *testing.T, s *Server, link model.Link) model.Link {
+func upsertTunnel(t *testing.T, s *Server, reqBody tunnelRequest) model.Tunnel {
 	t.Helper()
-	payload, err := json.Marshal(struct {
-		ID         string            `json:"id"`
-		Name       string            `json:"name"`
-		Type       model.LinkType    `json:"type"`
-		FromNode   string            `json:"from_node"`
-		ToNode     string            `json:"to_node"`
-		BindAddr   string            `json:"bind_addr"`
-		PublicAddr string            `json:"public_addr"`
-		ServerName string            `json:"server_name"`
-		Enabled    bool              `json:"enabled"`
-		Settings   map[string]string `json:"settings"`
-	}{
-		ID:         link.ID,
-		Name:       link.Name,
-		Type:       link.Type,
-		FromNode:   link.FromNode,
-		ToNode:     link.ToNode,
-		BindAddr:   link.BindAddr,
-		PublicAddr: link.PublicAddr,
-		ServerName: link.ServerName,
-		Enabled:    link.Enabled,
-		Settings:   link.Settings,
-	})
+	payload, err := json.Marshal(reqBody)
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := httptest.NewRequest(http.MethodPost, "/api/links", bytes.NewReader(payload))
+	req := httptest.NewRequest(http.MethodPost, "/api/tunnels", bytes.NewReader(payload))
 	rec := httptest.NewRecorder()
-	s.handleUpsertLink(rec, req, auth.Session{UserID: 1, Username: "admin"})
+	s.handleUpsertTunnel(rec, req, auth.Session{UserID: 1, Username: "admin"})
 	if rec.Code != http.StatusOK {
-		t.Fatalf("upsert link failed: %d %s", rec.Code, rec.Body.String())
+		t.Fatalf("upsert tunnel failed: %d %s", rec.Code, rec.Body.String())
 	}
-	var resp model.Link
+	var resp model.Tunnel
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
 	return resp
 }
 
-func upsertRoute(t *testing.T, s *Server, route model.Route) model.Route {
+func upsertForward(t *testing.T, s *Server, reqBody forwardRequest) model.Forward {
 	t.Helper()
-	payload, err := json.Marshal(struct {
-		ID        string              `json:"id"`
-		Name      string              `json:"name"`
-		Protocol  model.RouteProtocol `json:"protocol"`
-		EntryNode string              `json:"entry_node"`
-		Listen    string              `json:"listen"`
-		Hops      []model.RouteHop    `json:"hops"`
-		Target    string              `json:"target"`
-		Enabled   bool                `json:"enabled"`
-	}{
-		ID:        route.ID,
-		Name:      route.Name,
-		Protocol:  route.Protocol,
-		EntryNode: route.EntryNode,
-		Listen:    route.Listen,
-		Hops:      route.Hops,
-		Target:    route.Target,
-		Enabled:   route.Enabled,
-	})
+	payload, err := json.Marshal(reqBody)
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := httptest.NewRequest(http.MethodPost, "/api/routes", bytes.NewReader(payload))
+	req := httptest.NewRequest(http.MethodPost, "/api/forwards", bytes.NewReader(payload))
 	rec := httptest.NewRecorder()
-	s.handleUpsertRoute(rec, req, auth.Session{UserID: 1, Username: "admin"})
+	s.handleUpsertForward(rec, req, auth.Session{UserID: 1, Username: "admin"})
 	if rec.Code != http.StatusOK {
-		t.Fatalf("upsert route failed: %d %s", rec.Code, rec.Body.String())
+		t.Fatalf("upsert forward failed: %d %s", rec.Code, rec.Body.String())
 	}
-	var resp model.Route
+	var resp model.Forward
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
 	return resp
+}
+
+func directTunnelRequest(id, entryNode string) tunnelRequest {
+	return tunnelRequest{
+		ID:        id,
+		Name:      id,
+		Type:      model.TunnelDirect,
+		Transport: model.TunnelTransportDirect,
+		EntryNode: entryNode,
+		Enabled:   boolPtr(true),
+	}
+}
+
+func chainTunnelRequest(id, entryNode string, middleNodes []string, exitNode string, listens []string) tunnelRequest {
+	nodeIDs := append([]string{entryNode}, middleNodes...)
+	nodeIDs = append(nodeIDs, exitNode)
+	stages := make([]model.TunnelStage, 0, len(nodeIDs))
+	listenIndex := 0
+	for i, nodeID := range nodeIDs {
+		stageID := "stage_" + id + "_" + nodeID
+		stage := model.TunnelStage{
+			ID:       stageID,
+			TunnelID: id,
+			Index:    i,
+			Role:     roleForStage(model.TunnelChain, i, len(nodeIDs)),
+			Strategy: "single",
+			Nodes: []model.TunnelStageNode{{
+				ID:       "stage_node_" + id + "_" + nodeID,
+				TunnelID: id,
+				StageID:  stageID,
+				NodeID:   nodeID,
+				Weight:   1,
+			}},
+		}
+		if i > 0 {
+			stage.Nodes[0].ListenAddr = listens[listenIndex]
+			stage.Nodes[0].PublicAddr = listens[listenIndex]
+			listenIndex++
+		}
+		stages = append(stages, stage)
+	}
+	return tunnelRequest{
+		ID:        id,
+		Name:      id,
+		Type:      model.TunnelChain,
+		Transport: model.TunnelTransportDirect,
+		Enabled:   boolPtr(true),
+		Stages:    stages,
+	}
+}
+
+func boolPtr(v bool) *bool {
+	return &v
 }
 
 func startNode(t *testing.T, controllerURL, nodeID, token, signingKey, dataDir string) context.CancelFunc {
@@ -537,6 +666,77 @@ func tcpEchoServer(t *testing.T) (string, func()) {
 	}
 }
 
+func tcpReplyServer(t *testing.T, reply string) (string, func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 32)
+				_, _ = c.Read(buf)
+				_, _ = c.Write([]byte(reply))
+			}(conn)
+		}
+	}()
+	return ln.Addr().String(), func() {
+		_ = ln.Close()
+		<-done
+	}
+}
+
+func dualProtoEchoServer(t *testing.T) (string, func()) {
+	t.Helper()
+	tcpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := tcpLn.Addr().(*net.TCPAddr).Port
+	udpConn, err := net.ListenPacket("udp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	if err != nil {
+		_ = tcpLn.Close()
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := tcpLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = io.Copy(c, c)
+			}(conn)
+		}
+	}()
+	go func() {
+		buf := make([]byte, 64*1024)
+		for {
+			n, remote, err := udpConn.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			_, _ = udpConn.WriteTo(buf[:n], remote)
+		}
+	}()
+	return net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), func() {
+		_ = tcpLn.Close()
+		_ = udpConn.Close()
+		<-done
+	}
+}
+
 func udpEchoServer(t *testing.T) (string, func()) {
 	t.Helper()
 	addr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
@@ -567,28 +767,109 @@ func udpEchoServer(t *testing.T) (string, func()) {
 
 func freeTCPAddr(t *testing.T) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	portCursorMu.Lock()
+	defer portCursorMu.Unlock()
+	addr := freeTCPAddrFromCursor(&nextTCPTestPort)
+	if addr != "" {
+		return addr
 	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-	return addr
+	t.Fatal("no free TCP port available in node range")
+	return ""
 }
 
 func freeUDPAddr(t *testing.T) string {
 	t.Helper()
-	addr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	portCursorMu.Lock()
+	defer portCursorMu.Unlock()
+	addr := freeUDPAddrFromCursor(&nextUDPTestPort)
+	if addr != "" {
+		return addr
 	}
-	conn, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		t.Fatal(err)
+	t.Fatal("no free UDP port available in node range")
+	return ""
+}
+
+func freeDualProtoAddr(t *testing.T) string {
+	t.Helper()
+	portCursorMu.Lock()
+	defer portCursorMu.Unlock()
+	addr := freeDualProtoAddrFromCursor(&nextDualTestPort)
+	if addr != "" {
+		return addr
 	}
-	out := conn.LocalAddr().String()
-	_ = conn.Close()
-	return out
+	t.Fatal("no free TCP/UDP shared port available in node range")
+	return ""
+}
+
+func freeTCPAddrFromCursor(cursor *int) string {
+	start := *cursor
+	for _, port := range append(rangePorts(start, 65535), rangePorts(10000, start-1)...) {
+		addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			continue
+		}
+		_ = ln.Close()
+		*cursor = port + 1
+		if *cursor > 65535 {
+			*cursor = 10000
+		}
+		return addr
+	}
+	return ""
+}
+
+func freeDualProtoAddrFromCursor(cursor *int) string {
+	start := *cursor
+	for _, port := range append(rangePorts(start, 65535), rangePorts(10000, start-1)...) {
+		addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			continue
+		}
+		udpConn, err := net.ListenPacket("udp", addr)
+		if err != nil {
+			_ = ln.Close()
+			continue
+		}
+		_ = ln.Close()
+		_ = udpConn.Close()
+		*cursor = port + 1
+		if *cursor > 65535 {
+			*cursor = 10000
+		}
+		return addr
+	}
+	return ""
+}
+
+func freeUDPAddrFromCursor(cursor *int) string {
+	start := *cursor
+	for _, port := range append(rangePorts(start, 65535), rangePorts(10000, start-1)...) {
+		addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+		conn, err := net.ListenPacket("udp", addr)
+		if err != nil {
+			continue
+		}
+		_ = conn.Close()
+		*cursor = port + 1
+		if *cursor > 65535 {
+			*cursor = 10000
+		}
+		return addr
+	}
+	return ""
+}
+
+func rangePorts(start, end int) []int {
+	if end < start {
+		return nil
+	}
+	ports := make([]int, 0, end-start+1)
+	for port := start; port <= end; port++ {
+		ports = append(ports, port)
+	}
+	return ports
 }
 
 func assertTCPRoundTrip(t *testing.T, addr, payload string) {
@@ -616,6 +897,34 @@ func assertTCPRoundTrip(t *testing.T, addr, payload string) {
 	}
 	if string(buf) != payload {
 		t.Fatalf("got %q, want %q", string(buf), payload)
+	}
+}
+
+func assertTCPResponse(t *testing.T, addr, payload, want string) {
+	t.Helper()
+	var conn net.Conn
+	var err error
+	for i := 0; i < 50; i++ {
+		conn, err = net.Dial("tcp", addr)
+		if err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Write([]byte(payload)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, len(want))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatal(err)
+	}
+	if string(buf) != want {
+		t.Fatalf("got %q, want %q", string(buf), want)
 	}
 }
 
@@ -649,4 +958,18 @@ func assertUDPRoundTrip(t *testing.T, addr, payload string) {
 	if string(buf[:n]) != payload {
 		t.Fatalf("got %q, want %q", string(buf[:n]), payload)
 	}
+}
+
+func assertTCPDialEventuallyFails(t *testing.T, addr string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if err != nil {
+			return
+		}
+		_ = conn.Close()
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("expected dial to %s to fail", addr)
 }

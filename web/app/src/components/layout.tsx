@@ -2,7 +2,6 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { Link, Navigate, Outlet, useLocation, useNavigate } from '@tanstack/react-router'
 import {
   Activity,
-  Cable,
   History,
   LayoutDashboard,
   LogOut,
@@ -10,19 +9,20 @@ import {
   Route,
   Server,
   Settings,
+  Waypoints,
 } from 'lucide-react'
 import type { ReactNode } from 'react'
 import { post } from '../api'
 import { useBootstrap } from '../bootstrap'
 
 const navItems = [
-  { to: '/dashboard', label: '概览', icon: LayoutDashboard },
-  { to: '/nodes', label: '节点', icon: Server },
-  { to: '/links', label: '链路', icon: Cable },
-  { to: '/routes', label: '路由', icon: Route },
-  { to: '/traffic', label: '流量', icon: Activity },
-  { to: '/audit', label: '审计', icon: History },
-  { to: '/settings/security', label: '设置', icon: Settings },
+  { to: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
+  { to: '/nodes', label: 'Nodes', icon: Server },
+  { to: '/tunnels', label: 'Tunnels', icon: Waypoints },
+  { to: '/forwards', label: 'Forwards', icon: Route },
+  { to: '/traffic', label: 'Traffic', icon: Activity },
+  { to: '/audit', label: 'Audit', icon: History },
+  { to: '/settings/security', label: 'Settings', icon: Settings },
 ] as const
 
 export function AppFrame() {

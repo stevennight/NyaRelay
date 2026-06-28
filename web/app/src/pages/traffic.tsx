@@ -12,7 +12,7 @@ export function TrafficPage() {
   return (
     <PageFrame
       title="流量"
-      subtitle="节点会主动上报 route 和 link 的流量统计。"
+      subtitle="节点会主动上报 forward 和 tunnel 维度的流量统计。"
     >
       {query.error && <Banner text={query.error instanceof Error ? query.error.message : '加载失败'} />}
       {(query.data ?? []).length === 0 ? (

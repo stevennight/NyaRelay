@@ -1,9 +1,7 @@
 package controller
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -97,38 +95,34 @@ func TestNodeWebSocketReceivesConfigPush(t *testing.T) {
 		t.Fatalf("config node mismatch: got %s", first.Config.Config.NodeID)
 	}
 
-	route := model.Route{
-		ID:        "route_1",
+	tunnel := upsertTunnel(t, s, directTunnelRequest("tun_ws_push", node.ID))
+	upsertForward(t, s, forwardRequest{
+		ID:        "fwd_ws_push",
 		Name:      "ws-push",
-		Protocol:  model.ProtocolTCP,
-		EntryNode: node.ID,
-		Listen:    "127.0.0.1:8443",
+		TunnelID:  tunnel.ID,
+		Protocols: []model.ForwardProtocol{model.ForwardProtocolTCP},
+		Listen:    "127.0.0.1:18443",
 		Target:    "127.0.0.1:443",
-		Enabled:   true,
-	}
-	body, err := json.Marshal(route)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req := httptest.NewRequest(http.MethodPost, "/api/routes", bytes.NewReader(body))
-	rec := httptest.NewRecorder()
-	s.handleUpsertRoute(rec, req, auth.Session{UserID: 1, Username: "admin"})
-	if rec.Code != http.StatusOK {
-		t.Fatalf("unexpected status: %d body=%s", rec.Code, rec.Body.String())
-	}
+		Enabled:   boolPtr(true),
+	})
 
 	var second sharedprotocol.ControlMessage
-	if err := wsjson.Read(ctx, conn, &second); err != nil {
-		t.Fatal(err)
-	}
-	if second.Type != "config" || second.Config == nil {
-		t.Fatalf("unexpected second message: %#v", second)
+	for i := 0; i < 3; i++ {
+		if err := wsjson.Read(ctx, conn, &second); err != nil {
+			t.Fatal(err)
+		}
+		if second.Type != "config" || second.Config == nil {
+			t.Fatalf("unexpected second message: %#v", second)
+		}
+		if len(second.Config.Config.Forwards) == 1 {
+			break
+		}
 	}
 	if second.Config.Config.Revision <= first.Config.Config.Revision {
 		t.Fatalf("revision did not advance: %d -> %d", first.Config.Config.Revision, second.Config.Config.Revision)
 	}
-	if len(second.Config.Config.Routes) != 1 {
-		t.Fatalf("expected one route in pushed config, got %d", len(second.Config.Config.Routes))
+	if len(second.Config.Config.Forwards) != 1 {
+		t.Fatalf("expected one forward in pushed config, got %d", len(second.Config.Config.Forwards))
 	}
 }
 

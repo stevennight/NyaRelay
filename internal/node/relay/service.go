@@ -19,28 +19,32 @@ import (
 )
 
 type Service struct {
-	log     *slog.Logger
-	nodeID  string
-	routes  *metrics.Counters
-	links   *metrics.Counters
-	mu      sync.Mutex
-	cancel  context.CancelFunc
-	config  model.RelayConfig
-	servers []io.Closer
+	log      *slog.Logger
+	nodeID   string
+	forwards *metrics.Counters
+	tunnels  *metrics.Counters
+	mu       sync.Mutex
+	cancel   context.CancelFunc
+	revision int64
+	config   model.RelayConfig
+	servers  []io.Closer
 }
 
 func New(log *slog.Logger, nodeID string) *Service {
 	return &Service{
-		log:    log,
-		nodeID: nodeID,
-		routes: metrics.New(),
-		links:  metrics.New(),
+		log:      log,
+		nodeID:   nodeID,
+		forwards: metrics.New(),
+		tunnels:  metrics.New(),
 	}
 }
 
 func (s *Service) Apply(ctx context.Context, cfg model.RelayConfig) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if cfg.Revision != 0 && cfg.Revision == s.revision {
+		return nil
+	}
 	if s.cancel != nil {
 		s.cancel()
 	}
@@ -51,96 +55,108 @@ func (s *Service) Apply(ctx context.Context, cfg model.RelayConfig) error {
 	s.cancel = cancel
 	s.servers = nil
 	s.config = cfg
+	s.revision = cfg.Revision
 
-	for _, link := range cfg.Links {
-		if !link.Enabled || link.ToNode != s.nodeID {
-			continue
-		}
-		if err := s.listenLink(runCtx, link); err != nil {
-			return err
+	for _, tunnel := range cfg.Tunnels {
+		for _, stage := range tunnel.Stages {
+			if stage.Role == model.TunnelStageEntry {
+				continue
+			}
+			node, ok := stageNodeFor(stage, s.nodeID)
+			if !ok {
+				continue
+			}
+			if err := s.listenStage(runCtx, tunnel, stage, node); err != nil {
+				return err
+			}
 		}
 	}
-	for _, route := range cfg.Routes {
-		if !route.Enabled || route.EntryNode != s.nodeID {
+	for _, forward := range cfg.Forwards {
+		if !forward.Enabled {
 			continue
 		}
-		if err := s.listenRoute(runCtx, route); err != nil {
-			return err
+		tunnel, ok := s.findTunnel(forward.TunnelID)
+		if !ok || !s.isEntryNode(tunnel) {
+			continue
+		}
+		for _, forwardProtocol := range forward.Protocols {
+			switch forwardProtocol {
+			case model.ForwardProtocolTCP:
+				if err := s.listenTCPForward(runCtx, forward, tunnel); err != nil {
+					return err
+				}
+			case model.ForwardProtocolUDP:
+				if err := s.listenUDPForward(runCtx, forward, tunnel); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	return nil
 }
 
-func (s *Service) RouteStats() []model.TrafficStat {
-	return s.routes.SnapshotAndReset()
+func (s *Service) ForwardStats() []model.TrafficStat {
+	return s.forwards.SnapshotAndReset()
 }
 
-func (s *Service) LinkStats() []model.TrafficStat {
-	return s.links.SnapshotAndReset()
+func (s *Service) TunnelStats() []model.TrafficStat {
+	return s.tunnels.SnapshotAndReset()
 }
 
-func (s *Service) listenRoute(ctx context.Context, route model.Route) error {
-	if route.Protocol == model.ProtocolUDP {
-		return s.listenUDPRoute(ctx, route)
-	}
-	ln, err := net.Listen("tcp", route.Listen)
+func (s *Service) listenTCPForward(ctx context.Context, forward model.ForwardRuntime, tunnel model.TunnelRuntime) error {
+	ln, err := net.Listen("tcp", forward.Listen)
 	if err != nil {
-		return fmt.Errorf("listen route %s: %w", route.Name, err)
+		return fmt.Errorf("listen forward %s: %w", forward.Name, err)
 	}
 	s.servers = append(s.servers, ln)
-	s.log.Info("route listening", "route", route.Name, "listen", route.Listen, "protocol", route.Protocol)
+	s.log.Info("forward tcp listening", "forward", forward.Name, "listen", forward.Listen)
 	go s.acceptLoop(ctx, ln, func(conn net.Conn) {
-		s.handleTCPRoute(ctx, route, conn)
+		s.handleTCPForward(ctx, forward, tunnel, conn)
 	})
 	return nil
 }
 
-func (s *Service) listenLink(ctx context.Context, link model.Link) error {
-	switch link.Type {
-	case model.LinkWSTLS:
-		tlsConfig, err := s.serverTLSConfig(link)
+func (s *Service) listenStage(ctx context.Context, tunnel model.TunnelRuntime, stage model.TunnelRuntimeStage, node model.TunnelRuntimeNode) error {
+	switch tunnel.Transport {
+	case model.TunnelTransportWSTLS:
+		tlsConfig, err := s.serverTLSConfig(tunnel, node)
 		if err != nil {
 			return err
 		}
-		return s.listenWSLink(ctx, link, tlsConfig)
-	case model.LinkTLS, model.LinkMTLS:
-		tlsConfig, err := s.serverTLSConfig(link)
+		return s.listenWSStage(ctx, tunnel, stage, node, tlsConfig)
+	case model.TunnelTransportTLS, model.TunnelTransportMTLS:
+		tlsConfig, err := s.serverTLSConfig(tunnel, node)
 		if err != nil {
 			return err
 		}
-		ln, err := tls.Listen("tcp", link.BindAddr, tlsConfig)
+		ln, err := tls.Listen("tcp", node.ListenAddr, tlsConfig)
 		if err != nil {
-			return fmt.Errorf("listen link %s: %w", link.Name, err)
+			return fmt.Errorf("listen tunnel %s stage %d: %w", tunnel.Name, stage.Index, err)
 		}
 		s.servers = append(s.servers, ln)
-		s.log.Info("link listening", "link", link.Name, "listen", link.BindAddr, "type", link.Type)
+		s.log.Info("tunnel stage listening", "tunnel", tunnel.Name, "stage", stage.Index, "listen", node.ListenAddr, "transport", tunnel.Transport)
 		go s.acceptLoop(ctx, ln, func(conn net.Conn) {
-			s.handleLinkConn(ctx, link, conn)
+			s.handleStageConn(ctx, tunnel, stage, node, conn)
 		})
 		return nil
 	default:
-		ln, err := net.Listen("tcp", link.BindAddr)
+		ln, err := net.Listen("tcp", node.ListenAddr)
 		if err != nil {
-			return fmt.Errorf("listen link %s: %w", link.Name, err)
+			return fmt.Errorf("listen tunnel %s stage %d: %w", tunnel.Name, stage.Index, err)
 		}
 		s.servers = append(s.servers, ln)
-		s.log.Info("link listening", "link", link.Name, "listen", link.BindAddr, "type", link.Type)
+		s.log.Info("tunnel stage listening", "tunnel", tunnel.Name, "stage", stage.Index, "listen", node.ListenAddr, "transport", tunnel.Transport)
 		go s.acceptLoop(ctx, ln, func(conn net.Conn) {
-			s.handleLinkConn(ctx, link, conn)
+			s.handleStageConn(ctx, tunnel, stage, node, conn)
 		})
-		if link.Type == model.LinkDirect {
-			if err := s.listenUDPLink(ctx, link); err != nil {
-				return err
-			}
-		}
 		return nil
 	}
 }
 
-func (s *Service) listenWSLink(ctx context.Context, link model.Link, tlsConfig *tls.Config) error {
+func (s *Service) listenWSStage(ctx context.Context, tunnel model.TunnelRuntime, stage model.TunnelRuntimeStage, node model.TunnelRuntimeNode, tlsConfig *tls.Config) error {
 	mux := http.NewServeMux()
 	server := &http.Server{
-		Addr:              link.BindAddr,
+		Addr:              node.ListenAddr,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
@@ -160,20 +176,20 @@ func (s *Service) listenWSLink(ctx context.Context, link model.Link, tlsConfig *
 		}
 		_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: nyarelay\r\nConnection: Upgrade\r\n\r\n")
 		_ = rw.Flush()
-		s.handleLinkConn(ctx, link, conn)
+		s.handleStageConn(ctx, tunnel, stage, node, conn)
 	})
-	ln, err := tls.Listen("tcp", link.BindAddr, tlsConfig)
+	ln, err := tls.Listen("tcp", node.ListenAddr, tlsConfig)
 	if err != nil {
-		return fmt.Errorf("listen ws link %s: %w", link.Name, err)
+		return fmt.Errorf("listen ws tunnel %s stage %d: %w", tunnel.Name, stage.Index, err)
 	}
 	s.servers = append(s.servers, closerFunc(func() error {
 		_ = ln.Close()
 		return server.Close()
 	}))
-	s.log.Info("ws link listening", "link", link.Name, "listen", link.BindAddr)
+	s.log.Info("ws tunnel stage listening", "tunnel", tunnel.Name, "stage", stage.Index, "listen", node.ListenAddr)
 	go func() {
 		if err := server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			s.log.Error("ws link server failed", "link", link.Name, "error", err)
+			s.log.Error("ws tunnel stage server failed", "tunnel", tunnel.Name, "stage", stage.Index, "error", err)
 		}
 	}()
 	return nil
@@ -195,89 +211,143 @@ func (s *Service) acceptLoop(ctx context.Context, ln net.Listener, handle func(n
 	}
 }
 
-func (s *Service) handleTCPRoute(ctx context.Context, route model.Route, inbound net.Conn) {
+func (s *Service) handleTCPForward(ctx context.Context, forward model.ForwardRuntime, tunnel model.TunnelRuntime, inbound net.Conn) {
 	defer inbound.Close()
-	counter := s.routes.Get(route.ID)
+	counter := s.forwards.Get("forward:" + forward.ID)
 	counter.AddConnection()
-	outbound, statID, err := s.dialRouteNext(ctx, route, 0)
+	outbound, statID, err := s.dialForwardNext(ctx, tunnel, forward, 0, "tcp")
 	if err != nil {
-		s.log.Warn("route dial failed", "route", route.Name, "error", err)
+		s.log.Warn("forward dial failed", "forward", forward.Name, "error", err)
 		return
 	}
 	defer outbound.Close()
-	s.pipe(inbound, outbound, counter, s.links.Get(statID))
+	s.pipe(inbound, outbound, counter, s.tunnels.Get(statID))
 }
 
-func (s *Service) handleLinkConn(ctx context.Context, link model.Link, inbound net.Conn) {
+func (s *Service) handleStageConn(ctx context.Context, tunnel model.TunnelRuntime, stage model.TunnelRuntimeStage, node model.TunnelRuntimeNode, inbound net.Conn) {
 	defer inbound.Close()
 	hello, err := protocol.ReadHello(inbound)
 	if err != nil {
-		s.log.Warn("invalid relay hello", "link", link.Name, "error", err)
+		s.log.Warn("invalid relay hello", "tunnel", tunnel.Name, "stage", stage.Index, "error", err)
 		return
 	}
-	if link.Settings["secret"] != "" && hello.Secret != link.Settings["secret"] {
-		s.log.Warn("relay secret rejected", "link", link.Name, "route", hello.RouteID)
+	if err := s.validateHello(tunnel, stage, node, hello); err != nil {
+		s.log.Warn("relay hello rejected", "tunnel", tunnel.Name, "stage", stage.Index, "error", err)
 		return
 	}
-	route, ok := s.findRoute(hello.RouteID)
-	if !ok || !route.Enabled {
-		s.log.Warn("route not found for link", "route", hello.RouteID)
+	forward, ok := s.findForward(hello.ForwardID)
+	if !ok || !forward.Enabled {
+		s.log.Warn("forward not found for tunnel", "forward", hello.ForwardID)
 		return
 	}
-	counter := s.routes.Get(route.ID)
+	counter := s.forwards.Get("forward:" + forward.ID)
 	counter.AddConnection()
-	next, statID, err := s.dialRouteNext(ctx, route, hello.HopIndex+1)
+	if stage.Role == model.TunnelStageExit {
+		if hello.Network == "udp" {
+			s.handleUDPStageExit(ctx, forward, inbound, counter)
+			return
+		}
+		outbound, err := (&net.Dialer{}).DialContext(ctx, "tcp", forward.Target)
+		if err != nil {
+			s.log.Warn("target dial failed", "forward", forward.Name, "error", err)
+			return
+		}
+		defer outbound.Close()
+		s.pipe(inbound, outbound, counter, s.tunnels.Get("target:"+forward.ID))
+		return
+	}
+	next, statID, err := s.dialForwardNext(ctx, tunnel, forward, stage.Index, hello.Network)
 	if err != nil {
-		s.log.Warn("next hop dial failed", "route", route.Name, "error", err)
+		s.log.Warn("next stage dial failed", "forward", forward.Name, "error", err)
 		return
 	}
 	defer next.Close()
-	s.pipe(inbound, next, counter, s.links.Get(statID))
+	s.pipe(inbound, next, counter, s.tunnels.Get(statID))
 }
 
-func (s *Service) dialRouteNext(ctx context.Context, route model.Route, hopIndex int) (net.Conn, string, error) {
-	if hopIndex >= len(route.Hops) {
-		conn, err := (&net.Dialer{}).DialContext(ctx, string(route.Protocol), route.Target)
-		return conn, "target:" + route.ID, err
+func (s *Service) validateHello(tunnel model.TunnelRuntime, stage model.TunnelRuntimeStage, node model.TunnelRuntimeNode, hello protocol.RelayHello) error {
+	if hello.TunnelID != tunnel.ID {
+		return errors.New("tunnel id mismatch")
 	}
-	hop := route.Hops[hopIndex]
-	link, ok := s.findLink(hop.LinkID)
-	if !ok || !link.Enabled {
-		return nil, "", fmt.Errorf("link %s is not available", hop.LinkID)
+	if hello.ToStageIndex != stage.Index {
+		return errors.New("to stage index mismatch")
 	}
-	conn, err := s.dialLink(ctx, link)
+	if hello.FromStageIndex != stage.Index-1 {
+		return errors.New("from stage index mismatch")
+	}
+	if hello.Network != "tcp" && hello.Network != "udp" {
+		return fmt.Errorf("unsupported network %q", hello.Network)
+	}
+	if node.Settings["secret"] != "" && hello.Secret != node.Settings["secret"] {
+		return errors.New("secret mismatch")
+	}
+	forward, ok := s.findForward(hello.ForwardID)
+	if !ok {
+		return errors.New("forward not found")
+	}
+	if !forwardSupports(forward, model.ForwardProtocol(hello.Network)) {
+		return errors.New("forward protocol mismatch")
+	}
+	return nil
+}
+
+func (s *Service) dialForwardNext(ctx context.Context, tunnel model.TunnelRuntime, forward model.ForwardRuntime, fromStageIndex int, network string) (net.Conn, string, error) {
+	if tunnel.Type == model.TunnelDirect {
+		targetNetwork := network
+		if targetNetwork == "udp" {
+			targetNetwork = "udp"
+		}
+		conn, err := (&net.Dialer{}).DialContext(ctx, targetNetwork, forward.Target)
+		return conn, "target:" + forward.ID, err
+	}
+	nextIndex := fromStageIndex + 1
+	if nextIndex >= len(tunnel.Stages) {
+		conn, err := (&net.Dialer{}).DialContext(ctx, network, forward.Target)
+		return conn, "target:" + forward.ID, err
+	}
+	nextStage := tunnel.Stages[nextIndex]
+	if len(nextStage.Nodes) == 0 {
+		return nil, "", fmt.Errorf("tunnel stage %d has no node", nextIndex)
+	}
+	nextNode := nextStage.Nodes[0]
+	conn, err := s.dialStage(ctx, tunnel, nextNode)
 	if err != nil {
-		return nil, link.ID, err
-	}
-	secret := ""
-	if link.Settings != nil {
-		secret = link.Settings["secret"]
+		return nil, stageStatID(tunnel.ID, nextIndex), err
 	}
 	if err := protocol.WriteHello(conn, protocol.RelayHello{
-		RouteID:  route.ID,
-		HopIndex: hopIndex,
-		Network:  string(route.Protocol),
-		Secret:   secret,
+		TunnelID:       tunnel.ID,
+		ForwardID:      forward.ID,
+		FromStageIndex: fromStageIndex,
+		ToStageIndex:   nextIndex,
+		Network:        network,
+		Secret:         nextNode.Settings["secret"],
 	}); err != nil {
 		_ = conn.Close()
-		return nil, link.ID, err
+		return nil, stageStatID(tunnel.ID, nextIndex), err
 	}
-	return conn, link.ID, nil
+	return conn, stageStatID(tunnel.ID, nextIndex), nil
 }
 
-func (s *Service) dialLink(ctx context.Context, link model.Link) (net.Conn, error) {
+func (s *Service) dialStage(ctx context.Context, tunnel model.TunnelRuntime, node model.TunnelRuntimeNode) (net.Conn, error) {
+	addr := node.ConnectAddr
+	if addr == "" {
+		addr = node.PublicAddr
+	}
+	if addr == "" {
+		return nil, errors.New("stage has no connect address")
+	}
 	dialer := &net.Dialer{}
-	switch link.Type {
-	case model.LinkTLS, model.LinkMTLS:
-		raw, err := dialer.DialContext(ctx, "tcp", link.PublicAddr)
+	switch tunnel.Transport {
+	case model.TunnelTransportTLS, model.TunnelTransportMTLS:
+		raw, err := dialer.DialContext(ctx, "tcp", addr)
 		if err != nil {
 			return nil, err
 		}
-		serverName := link.ServerName
+		serverName := node.Settings["server_name"]
 		if serverName == "" {
-			serverName = strings.Split(link.PublicAddr, ":")[0]
+			serverName = strings.Split(addr, ":")[0]
 		}
-		clientTLS, err := s.clientTLSConfig(link, serverName)
+		clientTLS, err := s.clientTLSConfig(tunnel, node, serverName)
 		if err != nil {
 			_ = raw.Close()
 			return nil, err
@@ -288,16 +358,16 @@ func (s *Service) dialLink(ctx context.Context, link model.Link) (net.Conn, erro
 			return nil, err
 		}
 		return tlsConn, nil
-	case model.LinkWSTLS:
-		raw, err := dialer.DialContext(ctx, "tcp", link.PublicAddr)
+	case model.TunnelTransportWSTLS:
+		raw, err := dialer.DialContext(ctx, "tcp", addr)
 		if err != nil {
 			return nil, err
 		}
-		host := link.ServerName
+		host := node.Settings["server_name"]
 		if host == "" {
-			host = strings.Split(link.PublicAddr, ":")[0]
+			host = strings.Split(addr, ":")[0]
 		}
-		clientTLS, err := s.clientTLSConfig(link, host)
+		clientTLS, err := s.clientTLSConfig(tunnel, node, host)
 		if err != nil {
 			_ = raw.Close()
 			return nil, err
@@ -324,22 +394,22 @@ func (s *Service) dialLink(ctx context.Context, link model.Link) (net.Conn, erro
 		}
 		return tlsConn, nil
 	default:
-		return dialer.DialContext(ctx, "tcp", link.PublicAddr)
+		return dialer.DialContext(ctx, "tcp", addr)
 	}
 }
 
-func (s *Service) pipe(a, b net.Conn, routeCounter *metrics.Counter, linkCounter *metrics.Counter) {
+func (s *Service) pipe(a, b net.Conn, forwardCounter *metrics.Counter, tunnelCounter *metrics.Counter) {
 	done := make(chan struct{}, 2)
-	copySide := func(dst, src net.Conn, addRoute func(int64), addLink func(int64)) {
+	copySide := func(dst, src net.Conn, addForward func(int64), addTunnel func(int64)) {
 		buf := make([]byte, 32*1024)
 		for {
 			n, err := src.Read(buf)
 			if n > 0 {
 				written, werr := dst.Write(buf[:n])
 				if written > 0 {
-					addRoute(int64(written))
-					if linkCounter != nil {
-						addLink(int64(written))
+					addForward(int64(written))
+					if addTunnel != nil {
+						addTunnel(int64(written))
 					}
 				}
 				if werr != nil {
@@ -354,27 +424,61 @@ func (s *Service) pipe(a, b net.Conn, routeCounter *metrics.Counter, linkCounter
 		_ = src.Close()
 		done <- struct{}{}
 	}
-	go copySide(b, a, routeCounter.AddIn, linkCounter.AddIn)
-	go copySide(a, b, routeCounter.AddOut, linkCounter.AddOut)
+	var tunnelIn, tunnelOut func(int64)
+	if tunnelCounter != nil {
+		tunnelIn = tunnelCounter.AddIn
+		tunnelOut = tunnelCounter.AddOut
+	}
+	go copySide(b, a, forwardCounter.AddIn, tunnelIn)
+	go copySide(a, b, forwardCounter.AddOut, tunnelOut)
 	<-done
 }
 
-func (s *Service) findRoute(id string) (model.Route, bool) {
-	for _, route := range s.config.Routes {
-		if route.ID == id {
-			return route, true
+func (s *Service) findTunnel(id string) (model.TunnelRuntime, bool) {
+	for _, tunnel := range s.config.Tunnels {
+		if tunnel.ID == id {
+			return tunnel, true
 		}
 	}
-	return model.Route{}, false
+	return model.TunnelRuntime{}, false
 }
 
-func (s *Service) findLink(id string) (model.Link, bool) {
-	for _, link := range s.config.Links {
-		if link.ID == id {
-			return link, true
+func (s *Service) findForward(id string) (model.ForwardRuntime, bool) {
+	for _, forward := range s.config.Forwards {
+		if forward.ID == id {
+			return forward, true
 		}
 	}
-	return model.Link{}, false
+	return model.ForwardRuntime{}, false
+}
+
+func (s *Service) isEntryNode(tunnel model.TunnelRuntime) bool {
+	if len(tunnel.Stages) == 0 || len(tunnel.Stages[0].Nodes) == 0 {
+		return false
+	}
+	return tunnel.Stages[0].Nodes[0].NodeID == s.nodeID
+}
+
+func stageNodeFor(stage model.TunnelRuntimeStage, nodeID string) (model.TunnelRuntimeNode, bool) {
+	for _, node := range stage.Nodes {
+		if node.NodeID == nodeID {
+			return node, true
+		}
+	}
+	return model.TunnelRuntimeNode{}, false
+}
+
+func forwardSupports(forward model.ForwardRuntime, protocolValue model.ForwardProtocol) bool {
+	for _, protocol := range forward.Protocols {
+		if protocol == protocolValue {
+			return true
+		}
+	}
+	return false
+}
+
+func stageStatID(tunnelID string, stageIndex int) string {
+	return fmt.Sprintf("tunnel:%s:stage:%d", tunnelID, stageIndex)
 }
 
 type closerFunc func() error
