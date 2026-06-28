@@ -417,6 +417,18 @@ td small {
   text-decoration: underline;
 }
 
+.list-filters {
+  width: min(960px, 100%);
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) minmax(180px, 1fr) minmax(200px, 1fr) auto;
+  gap: 12px;
+  align-items: end;
+}
+
+.list-filters button {
+  min-width: 96px;
+}
+
 .status {
   display: inline-flex;
   min-width: 70px;
@@ -864,7 +876,7 @@ td small {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
-  .stats, .field-grid {
+  .stats, .field-grid, .list-filters {
     grid-template-columns: 1fr;
   }
 
@@ -898,7 +910,8 @@ td small {
   }
 
   .form-actions,
-  .form-actions button {
+  .form-actions button,
+  .list-filters button {
     width: 100%;
   }
 

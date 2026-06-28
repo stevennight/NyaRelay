@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate } from '@tanstack/react-router'
-import { Pause, Play, Plus, Settings, Trash2 } from 'lucide-react'
+import { Pause, Play, Plus, RotateCcw, Settings, Trash2 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { api, post } from '../api'
 import type { Dashboard, ForwardInfo, ForwardProtocol, NodeInfo, TunnelInfo } from '../types'
@@ -32,14 +32,26 @@ type ForwardForm = {
   enabled: boolean
 }
 
+type ForwardFilters = {
+  name: string
+  tunnelID: string
+  entryAddress: string
+}
+
 const emptyForwardForm = (): ForwardForm => ({
   id: '',
   name: '',
   tunnel_id: '',
-  protocol_mode: 'tcp',
+  protocol_mode: 'tcp_udp',
   listen: '',
   target: '',
   enabled: true,
+})
+
+const emptyForwardFilters = (): ForwardFilters => ({
+  name: '',
+  tunnelID: '',
+  entryAddress: '',
 })
 
 export function ForwardsPage() {
@@ -91,11 +103,52 @@ function ForwardsListView({
   })
   const tunnelMap = useMemo(() => indexByID(tunnelsQuery.data ?? []), [tunnelsQuery.data])
   const nodeMap = useMemo(() => indexByID(nodesQuery.data ?? []), [nodesQuery.data])
+  const [filters, setFilters] = useState<ForwardFilters>(emptyForwardFilters)
+  const forwards = forwardsQuery.data ?? []
+  const tunnelOptions = useMemo(() => {
+    const options = (tunnelsQuery.data ?? []).map((tunnel) => ({
+      id: tunnel.id,
+      name: tunnel.name,
+    }))
+    const knownTunnelIDs = new Set(options.map((tunnel) => tunnel.id))
+    forwards.forEach((forward) => {
+      if (!knownTunnelIDs.has(forward.tunnel_id)) {
+        options.push({ id: forward.tunnel_id, name: forward.tunnel_id })
+        knownTunnelIDs.add(forward.tunnel_id)
+      }
+    })
+    return options
+  }, [forwards, tunnelsQuery.data])
+  const filteredForwards = useMemo(() => {
+    const nameNeedle = filters.name.trim().toLowerCase()
+    const entryNeedle = filters.entryAddress.trim().toLowerCase()
+
+    return forwards.filter((forward) => {
+      const tunnel = tunnelMap.get(forward.tunnel_id)
+      if (nameNeedle && !`${forward.name} ${forward.id}`.toLowerCase().includes(nameNeedle)) {
+        return false
+      }
+      if (filters.tunnelID && forward.tunnel_id !== filters.tunnelID) {
+        return false
+      }
+      if (entryNeedle) {
+        const entryText = [
+          formatForwardEndpoint(forward, tunnel, nodeMap),
+          ...entryHostsForTunnel(tunnel, nodeMap),
+        ].join(' ').toLowerCase()
+        if (!entryText.includes(entryNeedle)) {
+          return false
+        }
+      }
+      return true
+    })
+  }, [filters, forwards, nodeMap, tunnelMap])
+  const hasActiveFilters = Boolean(filters.name.trim() || filters.tunnelID || filters.entryAddress.trim())
 
   return (
     <PageFrame
       title="转发"
-      subtitle="转发选择一个隧道，设置入口监听和最终目标。"
+      subtitle="转发选择一个隧道，设置入口端口和最终目标。"
       action={
         <Link to="/forwards/new" className="button-link">
           <Plus size={16} />
@@ -104,7 +157,7 @@ function ForwardsListView({
       }
     >
       {forwardsQuery.error && <Banner text={forwardsQuery.error instanceof Error ? forwardsQuery.error.message : '加载失败'} />}
-      {(forwardsQuery.data ?? []).length === 0 ? (
+      {forwards.length === 0 ? (
         <EmptyState
           title="还没有转发"
           text="先创建隧道，再为入口节点分配监听端口。"
@@ -116,31 +169,73 @@ function ForwardsListView({
           }
         />
       ) : (
-        <Table headers={['名称', '协议', '隧道', '入口地址', '目标', '状态']}>
-          {(forwardsQuery.data ?? []).map((forward) => {
-            const tunnel = tunnelMap.get(forward.tunnel_id)
-            return (
-              <tr key={forward.id}>
-                <td>
-                  <strong>
-                    <Link to="/forwards/$forwardId" params={{ forwardId: forward.id }}>
-                      {forward.name}
-                    </Link>
-                  </strong>
-                  <small>{forward.id}</small>
-                </td>
-                <td>{formatProtocols(forward.protocols)}</td>
-                <td>{tunnel?.name ?? forward.tunnel_id}</td>
-                <td>
-                  {formatForwardEndpoint(forward, tunnel, nodeMap)}
-                  <small>{forward.listen || '自动分配'}</small>
-                </td>
-                <td>{forward.target}</td>
-                <td><StatusPill value={forward.enabled ? 'enabled' : 'disabled'} /></td>
-              </tr>
-            )
-          })}
-        </Table>
+        <>
+          <div className="list-filters" role="search" aria-label="转发筛选">
+            <Field label="名称">
+              <input
+                value={filters.name}
+                onChange={(event) => setFilters((current) => ({ ...current, name: event.target.value }))}
+                placeholder="转发名称或 ID"
+              />
+            </Field>
+            <Field label="隧道">
+              <select
+                value={filters.tunnelID}
+                onChange={(event) => setFilters((current) => ({ ...current, tunnelID: event.target.value }))}
+              >
+                <option value="">全部隧道</option>
+                {tunnelOptions.map((tunnel) => (
+                  <option key={tunnel.id} value={tunnel.id}>{tunnel.name}</option>
+                ))}
+              </select>
+            </Field>
+            <Field label="入口地址">
+              <input
+                value={filters.entryAddress}
+                onChange={(event) => setFilters((current) => ({ ...current, entryAddress: event.target.value }))}
+                placeholder="入口节点域名或 IP"
+              />
+            </Field>
+            <button
+              className="ghost"
+              type="button"
+              onClick={() => setFilters(emptyForwardFilters())}
+              disabled={!hasActiveFilters}
+            >
+              <RotateCcw size={16} />
+              重置
+            </button>
+          </div>
+          {filteredForwards.length === 0 ? (
+            <EmptyState title="没有匹配的转发" text="调整名称、隧道或入口地址筛选后再查看。" />
+          ) : (
+            <Table headers={['名称', '协议', '隧道', '入口地址', '目标', '状态']}>
+              {filteredForwards.map((forward) => {
+                const tunnel = tunnelMap.get(forward.tunnel_id)
+                return (
+                  <tr key={forward.id}>
+                    <td>
+                      <strong>
+                        <Link to="/forwards/$forwardId" params={{ forwardId: forward.id }}>
+                          {forward.name}
+                        </Link>
+                      </strong>
+                      <small>{forward.id}</small>
+                    </td>
+                    <td>{formatProtocols(forward.protocols)}</td>
+                    <td>{tunnel?.name ?? forward.tunnel_id}</td>
+                    <td>
+                      {formatForwardEndpoint(forward, tunnel, nodeMap)}
+                      <small>{listenPortSummary(forward.listen)}</small>
+                    </td>
+                    <td>{forward.target}</td>
+                    <td><StatusPill value={forward.enabled ? 'enabled' : 'disabled'} /></td>
+                  </tr>
+                )
+              })}
+            </Table>
+          )}
+        </>
       )}
       {modal === 'new' && <ForwardCreateModal onClose={onCloseModal} />}
       {modal === 'detail' && forwardId && <ForwardDetailModal forwardId={forwardId} onClose={onCloseModal} />}
@@ -304,8 +399,7 @@ function ForwardDetailsContent({
           { label: '协议', value: formatProtocols(forward.protocols) },
           { label: '隧道', value: tunnel?.name ?? forward.tunnel_id },
           { label: '入口地址', value: formatForwardEndpoint(forward, tunnel, nodes) },
-          { label: '监听地址', value: forward.listen || '自动分配' },
-          { label: '监听端口', value: portFromListen(forward.listen) || '-' },
+          { label: '监听端口', value: listenPortLabel(forward.listen) },
           { label: '目标地址', value: forward.target },
           { label: '配置版本', value: String(revision ?? '-') },
           { label: '创建时间', value: formatTime(forward.created_at) },
@@ -349,7 +443,7 @@ function ForwardEditor({
       name: initialForward.name,
       tunnel_id: initialForward.tunnel_id,
       protocol_mode: modeFromProtocols(initialForward.protocols),
-      listen: initialForward.listen,
+      listen: listenInputValue(initialForward.listen),
       target: initialForward.target,
       enabled: initialForward.enabled,
     })
@@ -362,7 +456,7 @@ function ForwardEditor({
         name: form.name,
         tunnel_id: form.tunnel_id,
         protocols: protocolsFromMode(form.protocol_mode),
-        listen: form.listen,
+        listen: normalizeListenInput(form.listen),
         target: form.target,
         enabled: form.enabled,
       }
@@ -406,11 +500,11 @@ function ForwardEditor({
             {tunnels.map((tunnel) => <option key={tunnel.id} value={tunnel.id}>{tunnel.name}</option>)}
           </select>
         </Field>
-        <Field label="监听地址" hint="留空自动分配，也可以填写 :8443。">
+        <Field label="监听端口" hint="留空自动分配；填写 8443 即监听该端口。">
           <input
             value={form.listen}
             onChange={(event) => setForm((current) => ({ ...current, listen: event.target.value }))}
-            placeholder="留空自动分配，例如 :8443"
+            placeholder="8443"
           />
         </Field>
         <Field label="目标地址" hint="最终目标地址，例如 10.0.0.8:443。">
@@ -457,20 +551,50 @@ function formatProtocols(protocols: ForwardProtocol[]) {
 
 function formatForwardEndpoint(forward: ForwardInfo, tunnel?: TunnelInfo, nodes?: Map<string, NodeInfo>) {
   const port = portFromListen(forward.listen)
-  const entryNodes = tunnel?.stages.find((stage) => stage.role === 'entry')?.nodes ?? []
-  const endpoints = entryNodes
-    .map((entryNode) => nodes?.get(entryNode.node_id))
-    .filter((node): node is NodeInfo => Boolean(node))
-    .map((entryNode) => entryNode.public_host || entryNode.system?.ip)
-    .filter((host): host is string => Boolean(host))
-  if (endpoints.length > 0 && port) {
-    return endpoints.map((host) => `${hostForEndpoint(host)}:${port}`).join(' / ')
+  const endpoints = entryHostsForTunnel(tunnel, nodes)
+  if (endpoints.length > 0) {
+    const hosts = endpoints.map((host) => hostForEndpoint(host))
+    if (port) {
+      return hosts.map((host) => `${host}:${port}`).join(' / ')
+    }
+    return hosts.join(' / ')
   }
   return forward.listen || '自动分配'
 }
 
+function entryHostsForTunnel(tunnel?: TunnelInfo, nodes?: Map<string, NodeInfo>) {
+  const entryNodes = tunnel?.stages.find((stage) => stage.role === 'entry')?.nodes ?? []
+  return entryNodes
+    .map((entryNode) => nodes?.get(entryNode.node_id))
+    .filter((node): node is NodeInfo => Boolean(node))
+    .map((entryNode) => entryNode.public_host || entryNode.system?.ip)
+    .filter((host): host is string => Boolean(host))
+}
+
+function listenInputValue(listen: string) {
+  return portFromListen(listen) || listen
+}
+
+function normalizeListenInput(listen: string) {
+  const trimmed = listen.trim()
+  if (!trimmed) return ''
+  if (/^\d+$/.test(trimmed)) return `:${trimmed}`
+  return trimmed
+}
+
+function listenPortSummary(listen: string) {
+  const label = listenPortLabel(listen)
+  return label === '自动分配' ? label : `监听端口：${label}`
+}
+
+function listenPortLabel(listen: string) {
+  return portFromListen(listen) || listen || '自动分配'
+}
+
 function portFromListen(listen: string) {
-  const match = listen.match(/:(\d+)$/)
+  const trimmed = listen.trim()
+  if (/^\d+$/.test(trimmed)) return trimmed
+  const match = trimmed.match(/:(\d+)$/)
   return match?.[1] ?? ''
 }
 

@@ -89,6 +89,12 @@ function TunnelsListView({
     queryKey: ['tunnels'],
     queryFn: () => api<TunnelInfo[]>('/api/tunnels'),
   })
+  const nodesQuery = useQuery({
+    queryKey: ['nodes'],
+    queryFn: () => api<NodeInfo[]>('/api/nodes'),
+    enabled: (query.data ?? []).length > 0,
+  })
+  const nodeMap = useMemo(() => indexByID(nodesQuery.data ?? []), [nodesQuery.data])
 
   return (
     <PageFrame
@@ -127,7 +133,7 @@ function TunnelsListView({
               </td>
               <td>{tunnel.type}</td>
               <td>{tunnel.transport}</td>
-              <td>{formatTunnelPath(tunnel)}</td>
+              <td>{formatTunnelPath(tunnel, nodeMap)}</td>
               <td><StatusPill value={tunnel.enabled ? 'online' : 'offline'} /></td>
             </tr>
           ))}
@@ -173,6 +179,12 @@ function TunnelDetailModal({ tunnelId, onClose }: { tunnelId: string; onClose: (
     queryKey: ['tunnel', tunnelId],
     queryFn: () => api<TunnelInfo>(`/api/tunnels/${tunnelId}`),
   })
+  const nodesQuery = useQuery({
+    queryKey: ['nodes'],
+    queryFn: () => api<NodeInfo[]>('/api/nodes'),
+    enabled: Boolean(query.data),
+  })
+  const nodeMap = useMemo(() => indexByID(nodesQuery.data ?? []), [nodesQuery.data])
   const enable = useMutation({
     mutationFn: () => post(`/api/tunnels/${tunnelId}/enable`, {}),
     onSuccess: async () => {
@@ -250,7 +262,7 @@ function TunnelDetailModal({ tunnelId, onClose }: { tunnelId: string; onClose: (
               }}
             />
           ) : (
-            <TunnelDetailsContent tunnel={tunnel} revision={dashboardQuery.data?.revision} />
+            <TunnelDetailsContent tunnel={tunnel} nodes={nodeMap} revision={dashboardQuery.data?.revision} />
           )}
           {message && <p className="modal-message">{message}</p>}
         </>
@@ -259,7 +271,15 @@ function TunnelDetailModal({ tunnelId, onClose }: { tunnelId: string; onClose: (
   )
 }
 
-function TunnelDetailsContent({ tunnel, revision }: { tunnel: TunnelInfo; revision?: number }) {
+function TunnelDetailsContent({
+  tunnel,
+  nodes,
+  revision,
+}: {
+  tunnel: TunnelInfo
+  nodes: Map<string, NodeInfo>
+  revision?: number
+}) {
   return (
     <>
       <section className="modal-section">
@@ -269,7 +289,7 @@ function TunnelDetailsContent({ tunnel, revision }: { tunnel: TunnelInfo; revisi
             { label: 'ID', value: tunnel.id },
             { label: '类型', value: tunnel.type },
             { label: '传输', value: tunnel.transport },
-            { label: '路径', value: formatTunnelPath(tunnel) },
+            { label: '路径', value: formatTunnelPath(tunnel, nodes) },
             { label: '配置版本', value: String(revision ?? '-') },
             { label: '创建时间', value: formatTime(tunnel.created_at) },
             { label: '更新时间', value: formatTime(tunnel.updated_at) },
@@ -285,7 +305,7 @@ function TunnelDetailsContent({ tunnel, revision }: { tunnel: TunnelInfo; revisi
               <span>{stage.index + 1}</span>
               <strong>{stage.role}</strong>
               <small>{stage.strategy}</small>
-              <small>{stage.nodes.map((node) => node.node_id).join(' / ')}</small>
+              <small>{stage.nodes.map((node) => nodeDisplayName(node.node_id, nodes)).join(' / ')}</small>
             </div>
           ))}
         </div>
@@ -672,10 +692,18 @@ function insertMiddleStage(stages: TunnelStageForm[]): TunnelStageForm[] {
   return [...stages.slice(0, stages.length - 1), emptyStageForm(), stages[stages.length - 1]]
 }
 
-function formatTunnelPath(tunnel: TunnelInfo) {
+function indexByID<T extends { id: string }>(items: T[]) {
+  return new Map(items.map((item) => [item.id, item]))
+}
+
+function formatTunnelPath(tunnel: TunnelInfo, nodes?: Map<string, NodeInfo>) {
   return tunnel.stages
     .slice()
     .sort((a, b) => a.index - b.index)
-    .map((stage) => stage.nodes.map((node) => node.node_id).join('/'))
+    .map((stage) => stage.nodes.map((node) => nodeDisplayName(node.node_id, nodes)).join('/'))
     .join(' -> ')
+}
+
+function nodeDisplayName(nodeID: string, nodes?: Map<string, NodeInfo>) {
+  return nodes?.get(nodeID)?.name || nodeID
 }
