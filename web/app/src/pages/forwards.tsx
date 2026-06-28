@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate } from '@tanstack/react-router'
-import { Pause, Play, Plus, Trash2 } from 'lucide-react'
+import { Pause, Play, Plus, Settings, Trash2 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { api, post } from '../api'
 import type { Dashboard, ForwardInfo, ForwardProtocol, NodeInfo, TunnelInfo } from '../types'
@@ -12,8 +12,8 @@ import {
   FieldGrid,
   FormActions,
   InlineActions,
+  Modal,
   PageFrame,
-  Panel,
   StatusPill,
   Table,
   ToggleField,
@@ -43,6 +43,40 @@ const emptyForwardForm = (): ForwardForm => ({
 })
 
 export function ForwardsPage() {
+  const navigate = useNavigate()
+  return <ForwardsListView onCloseModal={() => navigate({ to: '/forwards', replace: true })} />
+}
+
+export function ForwardNewPage() {
+  const navigate = useNavigate()
+  return (
+    <ForwardsListView
+      modal="new"
+      onCloseModal={() => navigate({ to: '/forwards', replace: true })}
+    />
+  )
+}
+
+export function ForwardDetailPage({ forwardId }: { forwardId: string }) {
+  const navigate = useNavigate()
+  return (
+    <ForwardsListView
+      modal="detail"
+      forwardId={forwardId}
+      onCloseModal={() => navigate({ to: '/forwards', replace: true })}
+    />
+  )
+}
+
+function ForwardsListView({
+  modal,
+  forwardId,
+  onCloseModal,
+}: {
+  modal?: 'new' | 'detail'
+  forwardId?: string
+  onCloseModal: () => void
+}) {
   const forwardsQuery = useQuery({
     queryKey: ['forwards'],
     queryFn: () => api<ForwardInfo[]>('/api/forwards'),
@@ -108,28 +142,37 @@ export function ForwardsPage() {
           })}
         </Table>
       )}
+      {modal === 'new' && <ForwardCreateModal onClose={onCloseModal} />}
+      {modal === 'detail' && forwardId && <ForwardDetailModal forwardId={forwardId} onClose={onCloseModal} />}
     </PageFrame>
   )
 }
 
-export function ForwardNewPage() {
+function ForwardCreateModal({ onClose }: { onClose: () => void }) {
   const queryClient = useQueryClient()
   const navigate = useNavigate()
+
   return (
-    <PageFrame title="新建转发" subtitle="选择隧道后，入口节点会按协议启动 TCP、UDP 或同端口双协议监听。">
+    <Modal
+      title="新建转发"
+      subtitle="选择隧道后，入口节点会按协议启动 TCP、UDP 或同端口双协议监听。"
+      onClose={onClose}
+      size="lg"
+    >
       <ForwardEditor
         onSaved={async (saved) => {
           await queryClient.invalidateQueries({ queryKey: ['forwards'] })
           navigate({ to: '/forwards/$forwardId', params: { forwardId: saved.id }, replace: true })
         }}
       />
-    </PageFrame>
+    </Modal>
   )
 }
 
-export function ForwardDetailPage({ forwardId }: { forwardId: string }) {
+function ForwardDetailModal({ forwardId, onClose }: { forwardId: string; onClose: () => void }) {
   const queryClient = useQueryClient()
   const navigate = useNavigate()
+  const [mode, setMode] = useState<'details' | 'edit'>('details')
   const [message, setMessage] = useState('')
   const forwardQuery = useQuery({
     queryKey: ['forward', forwardId],
@@ -180,11 +223,17 @@ export function ForwardDetailPage({ forwardId }: { forwardId: string }) {
   })
 
   return (
-    <PageFrame
+    <Modal
       title={forward?.name || '转发详情'}
       subtitle="保存后控制器会重新签名并推送相关节点配置。"
+      onClose={onClose}
+      size="lg"
       action={forward ? (
         <InlineActions>
+          <button className="ghost" type="button" onClick={() => setMode(mode === 'edit' ? 'details' : 'edit')}>
+            <Settings size={16} />
+            {mode === 'edit' ? '查看详情' : '编辑'}
+          </button>
           {forward.enabled ? (
             <button className="ghost" type="button" onClick={() => pause.mutate()} disabled={pause.isPending}>
               <Pause size={16} />
@@ -209,36 +258,62 @@ export function ForwardDetailPage({ forwardId }: { forwardId: string }) {
       {resume.error && <Banner text={resume.error instanceof Error ? resume.error.message : '恢复失败'} />}
       {forward ? (
         <>
-          <Panel>
-            <DetailGrid
-              items={[
-                { label: 'ID', value: forward.id },
-                { label: '协议', value: formatProtocols(forward.protocols) },
-                { label: '隧道', value: tunnel?.name ?? forward.tunnel_id },
-                { label: '入口地址', value: formatForwardEndpoint(forward, tunnel, nodeMap) },
-                { label: '监听地址', value: forward.listen || '自动分配' },
-                { label: '监听端口', value: portFromListen(forward.listen) || '-' },
-                { label: '目标地址', value: forward.target },
-                { label: '配置版本', value: String(dashboardQuery.data?.revision ?? '-') },
-                { label: '创建时间', value: formatTime(forward.created_at) },
-                { label: '更新时间', value: formatTime(forward.updated_at) },
-                { label: '状态', value: <StatusPill value={forward.enabled ? 'enabled' : 'disabled'} /> },
-              ]}
+          {mode === 'edit' ? (
+            <ForwardEditor
+              initialForward={forward}
+              onSaved={async () => {
+                setMessage('已保存')
+                setMode('details')
+                await queryClient.invalidateQueries({ queryKey: ['forwards'] })
+                await queryClient.invalidateQueries({ queryKey: ['forward', forwardId] })
+                await queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+              }}
             />
-          </Panel>
-          <ForwardEditor
-            initialForward={forward}
-            onSaved={async () => {
-              setMessage('已保存')
-              await queryClient.invalidateQueries({ queryKey: ['forwards'] })
-              await queryClient.invalidateQueries({ queryKey: ['forward', forwardId] })
-              await queryClient.invalidateQueries({ queryKey: ['dashboard'] })
-            }}
-          />
-          {message && <Panel><p>{message}</p></Panel>}
+          ) : (
+            <ForwardDetailsContent
+              forward={forward}
+              tunnel={tunnel}
+              nodes={nodeMap}
+              revision={dashboardQuery.data?.revision}
+            />
+          )}
+          {message && <p className="modal-message">{message}</p>}
         </>
       ) : null}
-    </PageFrame>
+    </Modal>
+  )
+}
+
+function ForwardDetailsContent({
+  forward,
+  tunnel,
+  nodes,
+  revision,
+}: {
+  forward: ForwardInfo
+  tunnel?: TunnelInfo
+  nodes: Map<string, NodeInfo>
+  revision?: number
+}) {
+  return (
+    <section className="modal-section">
+      <h3>基础信息</h3>
+      <DetailGrid
+        items={[
+          { label: 'ID', value: forward.id },
+          { label: '协议', value: formatProtocols(forward.protocols) },
+          { label: '隧道', value: tunnel?.name ?? forward.tunnel_id },
+          { label: '入口地址', value: formatForwardEndpoint(forward, tunnel, nodes) },
+          { label: '监听地址', value: forward.listen || '自动分配' },
+          { label: '监听端口', value: portFromListen(forward.listen) || '-' },
+          { label: '目标地址', value: forward.target },
+          { label: '配置版本', value: String(revision ?? '-') },
+          { label: '创建时间', value: formatTime(forward.created_at) },
+          { label: '更新时间', value: formatTime(forward.updated_at) },
+          { label: '状态', value: <StatusPill value={forward.enabled ? 'enabled' : 'disabled'} /> },
+        ]}
+      />
+    </section>
   )
 }
 

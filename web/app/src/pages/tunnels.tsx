@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate } from '@tanstack/react-router'
-import { Pause, Play, Plus, Trash2 } from 'lucide-react'
+import { Pause, Play, Plus, Settings, Trash2 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { api, post } from '../api'
 import type { NodeInfo, TunnelInfo, TunnelStageRole, TunnelTransport, TunnelType } from '../types'
@@ -12,8 +12,8 @@ import {
   FieldGrid,
   FormActions,
   InlineActions,
+  Modal,
   PageFrame,
-  Panel,
   StatusPill,
   Table,
   ToggleField,
@@ -51,6 +51,40 @@ const emptyTunnelForm = (): TunnelForm => ({
 })
 
 export function TunnelsPage() {
+  const navigate = useNavigate()
+  return <TunnelsListView onCloseModal={() => navigate({ to: '/tunnels', replace: true })} />
+}
+
+export function TunnelNewPage() {
+  const navigate = useNavigate()
+  return (
+    <TunnelsListView
+      modal="new"
+      onCloseModal={() => navigate({ to: '/tunnels', replace: true })}
+    />
+  )
+}
+
+export function TunnelDetailPage({ tunnelId }: { tunnelId: string }) {
+  const navigate = useNavigate()
+  return (
+    <TunnelsListView
+      modal="detail"
+      tunnelId={tunnelId}
+      onCloseModal={() => navigate({ to: '/tunnels', replace: true })}
+    />
+  )
+}
+
+function TunnelsListView({
+  modal,
+  tunnelId,
+  onCloseModal,
+}: {
+  modal?: 'new' | 'detail'
+  tunnelId?: string
+  onCloseModal: () => void
+}) {
   const query = useQuery({
     queryKey: ['tunnels'],
     queryFn: () => api<TunnelInfo[]>('/api/tunnels'),
@@ -99,28 +133,37 @@ export function TunnelsPage() {
           ))}
         </Table>
       )}
+      {modal === 'new' && <TunnelCreateModal onClose={onCloseModal} />}
+      {modal === 'detail' && tunnelId && <TunnelDetailModal tunnelId={tunnelId} onClose={onCloseModal} />}
     </PageFrame>
   )
 }
 
-export function TunnelNewPage() {
+function TunnelCreateModal({ onClose }: { onClose: () => void }) {
   const queryClient = useQueryClient()
   const navigate = useNavigate()
+
   return (
-    <PageFrame title="新建隧道" subtitle="隧道由一层或多层 stage 组成，每层可放多个候选节点。">
+    <Modal
+      title="新建隧道"
+      subtitle="隧道由一层或多层 stage 组成，每层可放多个候选节点。"
+      onClose={onClose}
+      size="lg"
+    >
       <TunnelEditor
         onSaved={async (saved) => {
           await queryClient.invalidateQueries({ queryKey: ['tunnels'] })
           navigate({ to: '/tunnels/$tunnelId', params: { tunnelId: saved.id }, replace: true })
         }}
       />
-    </PageFrame>
+    </Modal>
   )
 }
 
-export function TunnelDetailPage({ tunnelId }: { tunnelId: string }) {
+function TunnelDetailModal({ tunnelId, onClose }: { tunnelId: string; onClose: () => void }) {
   const queryClient = useQueryClient()
   const navigate = useNavigate()
+  const [mode, setMode] = useState<'details' | 'edit'>('details')
   const [message, setMessage] = useState('')
   const dashboardQuery = useQuery({
     queryKey: ['dashboard'],
@@ -157,13 +200,21 @@ export function TunnelDetailPage({ tunnelId }: { tunnelId: string }) {
     },
   })
 
+  const tunnel = query.data
+
   return (
-    <PageFrame
-      title={query.data?.name || '隧道详情'}
+    <Modal
+      title={tunnel?.name || '隧道详情'}
       subtitle="保存后控制器会重新签名并推送相关节点配置。"
-      action={query.data ? (
+      onClose={onClose}
+      size="lg"
+      action={tunnel ? (
         <InlineActions>
-          {query.data.enabled ? (
+          <button className="ghost" type="button" onClick={() => setMode(mode === 'edit' ? 'details' : 'edit')}>
+            <Settings size={16} />
+            {mode === 'edit' ? '查看详情' : '编辑'}
+          </button>
+          {tunnel.enabled ? (
             <button className="ghost" type="button" onClick={() => disable.mutate()} disabled={disable.isPending}>
               <Pause size={16} />
               停用
@@ -185,48 +236,61 @@ export function TunnelDetailPage({ tunnelId }: { tunnelId: string }) {
       {enable.error && <Banner text={enable.error instanceof Error ? enable.error.message : '启用失败'} />}
       {disable.error && <Banner text={disable.error instanceof Error ? disable.error.message : '停用失败'} />}
       {remove.error && <Banner text={remove.error instanceof Error ? remove.error.message : '删除失败'} />}
-      {query.data ? (
+      {tunnel ? (
         <>
-          <Panel>
-            <DetailGrid
-              items={[
-                { label: 'ID', value: query.data.id },
-                { label: '类型', value: query.data.type },
-                { label: '传输', value: query.data.transport },
-                { label: '路径', value: formatTunnelPath(query.data) },
-                { label: '配置版本', value: String(dashboardQuery.data?.revision ?? '-') },
-                { label: '创建时间', value: formatTime(query.data.created_at) },
-                { label: '更新时间', value: formatTime(query.data.updated_at) },
-                { label: '状态', value: <StatusPill value={query.data.enabled ? 'online' : 'offline'} /> },
-              ]}
+          {mode === 'edit' ? (
+            <TunnelEditor
+              initialTunnel={tunnel}
+              onSaved={async () => {
+                setMessage('已保存')
+                setMode('details')
+                await queryClient.invalidateQueries({ queryKey: ['tunnels'] })
+                await queryClient.invalidateQueries({ queryKey: ['tunnel', tunnelId] })
+                await queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+              }}
             />
-          </Panel>
-          <Panel>
-            <h2>Stages</h2>
-            <div className="hop-list">
-              {query.data.stages.map((stage) => (
-                <div className="hop" key={stage.id}>
-                  <span>{stage.index + 1}</span>
-                  <strong>{stage.role}</strong>
-                  <small>{stage.strategy}</small>
-                  <small>{stage.nodes.map((node) => node.node_id).join(' / ')}</small>
-                </div>
-              ))}
-            </div>
-          </Panel>
-          <TunnelEditor
-            initialTunnel={query.data}
-            onSaved={async () => {
-              setMessage('已保存')
-              await queryClient.invalidateQueries({ queryKey: ['tunnels'] })
-              await queryClient.invalidateQueries({ queryKey: ['tunnel', tunnelId] })
-              await queryClient.invalidateQueries({ queryKey: ['dashboard'] })
-            }}
-          />
-          {message && <Panel><p>{message}</p></Panel>}
+          ) : (
+            <TunnelDetailsContent tunnel={tunnel} revision={dashboardQuery.data?.revision} />
+          )}
+          {message && <p className="modal-message">{message}</p>}
         </>
       ) : null}
-    </PageFrame>
+    </Modal>
+  )
+}
+
+function TunnelDetailsContent({ tunnel, revision }: { tunnel: TunnelInfo; revision?: number }) {
+  return (
+    <>
+      <section className="modal-section">
+        <h3>基础信息</h3>
+        <DetailGrid
+          items={[
+            { label: 'ID', value: tunnel.id },
+            { label: '类型', value: tunnel.type },
+            { label: '传输', value: tunnel.transport },
+            { label: '路径', value: formatTunnelPath(tunnel) },
+            { label: '配置版本', value: String(revision ?? '-') },
+            { label: '创建时间', value: formatTime(tunnel.created_at) },
+            { label: '更新时间', value: formatTime(tunnel.updated_at) },
+            { label: '状态', value: <StatusPill value={tunnel.enabled ? 'online' : 'offline'} /> },
+          ]}
+        />
+      </section>
+      <section className="modal-section">
+        <h3>Stages</h3>
+        <div className="hop-list">
+          {tunnel.stages.map((stage) => (
+            <div className="hop" key={stage.id}>
+              <span>{stage.index + 1}</span>
+              <strong>{stage.role}</strong>
+              <small>{stage.strategy}</small>
+              <small>{stage.nodes.map((node) => node.node_id).join(' / ')}</small>
+            </div>
+          ))}
+        </div>
+      </section>
+    </>
   )
 }
 
@@ -415,9 +479,9 @@ function TunnelEditor({
                         }))}
                       >
                         <Trash2 size={16} />
-                      删除层
-                    </button>
-                  ) : null}
+                        删除层
+                      </button>
+                    ) : null}
                   </InlineActions>
                 </div>
                 <FieldGrid>

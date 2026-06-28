@@ -115,6 +115,11 @@ describe('tunnels and forwards pages', () => {
   it('hides revoked nodes in the tunnel selector', async () => {
     installFetch([
       {
+        path: '/api/tunnels',
+        method: 'GET',
+        response: jsonResponse([]),
+      },
+      {
         path: '/api/nodes',
         method: 'GET',
         response: jsonResponse(nodes),
@@ -123,7 +128,7 @@ describe('tunnels and forwards pages', () => {
 
     renderWithClient(<TunnelNewPage />)
 
-    expect(await screen.findByText('新建隧道')).toBeInTheDocument()
+    expect(await screen.findByRole('dialog', { name: '新建隧道' })).toBeInTheDocument()
     fireEvent.change(screen.getByLabelText('类型'), { target: { value: 'chain' } })
     expect(screen.getByRole('button', { name: '添加中间层' })).toBeInTheDocument()
     expect((await screen.findAllByRole('option', { name: 'cn-1' })).length).toBeGreaterThan(0)
@@ -132,6 +137,11 @@ describe('tunnels and forwards pages', () => {
 
   it('creates a chain tunnel and posts staged nodes', async () => {
     const fetchMock = installFetch([
+      {
+        path: '/api/tunnels',
+        method: 'GET',
+        response: jsonResponse([]),
+      },
       {
         path: '/api/nodes',
         method: 'GET',
@@ -150,6 +160,7 @@ describe('tunnels and forwards pages', () => {
 
     renderWithClient(<TunnelNewPage />)
 
+    expect(await screen.findByRole('dialog', { name: '新建隧道' })).toBeInTheDocument()
     expect(await screen.findByRole('option', { name: 'cn-1' })).toBeInTheDocument()
     expect(await screen.findByRole('option', { name: 'hk-1' })).toBeInTheDocument()
     fireEvent.change(screen.getByLabelText('名称'), { target: { value: 'cn-sg-hk' } })
@@ -237,6 +248,16 @@ describe('tunnels and forwards pages', () => {
   it('creates a tcp+udp forward and normalizes protocols', async () => {
     const fetchMock = installFetch([
       {
+        path: '/api/forwards',
+        method: 'GET',
+        response: jsonResponse([]),
+      },
+      {
+        path: '/api/nodes',
+        method: 'GET',
+        response: jsonResponse(nodes),
+      },
+      {
         path: '/api/tunnels',
         method: 'GET',
         response: jsonResponse([
@@ -268,6 +289,7 @@ describe('tunnels and forwards pages', () => {
 
     renderWithClient(<ForwardNewPage />)
 
+    expect(await screen.findByRole('dialog', { name: '新建转发' })).toBeInTheDocument()
     expect(await screen.findByRole('option', { name: 'cn-sg-hk' })).toBeInTheDocument()
     fireEvent.change(screen.getByLabelText('名称'), { target: { value: 'web' } })
     fireEvent.change(screen.getByLabelText('协议'), { target: { value: 'tcp_udp' } })
