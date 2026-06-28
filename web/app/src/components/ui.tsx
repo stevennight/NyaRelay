@@ -1,5 +1,6 @@
+import { X } from 'lucide-react'
 import type { ReactNode } from 'react'
-import { cloneElement, isValidElement, useId } from 'react'
+import { cloneElement, isValidElement, useEffect, useId } from 'react'
 
 export function PageFrame({
   title,
@@ -144,6 +145,67 @@ export function InlineActions({ children }: { children: ReactNode }) {
 
 export function FormActions({ children }: { children: ReactNode }) {
   return <div className="form-actions">{children}</div>
+}
+
+export function Modal({
+  title,
+  subtitle,
+  action,
+  children,
+  onClose,
+  size = 'md',
+}: {
+  title: string
+  subtitle?: string
+  action?: ReactNode
+  children: ReactNode
+  onClose: () => void
+  size?: 'md' | 'lg'
+}) {
+  const titleID = useId()
+
+  useEffect(() => {
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        onClose()
+      }
+    }
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.body.style.overflow = previousOverflow
+      document.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [onClose])
+
+  return (
+    <div
+      className="modal-backdrop"
+      role="presentation"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) {
+          onClose()
+        }
+      }}
+    >
+      <section className={`modal modal-${size}`} role="dialog" aria-modal="true" aria-labelledby={titleID}>
+        <header className="modal-header">
+          <div className="modal-title">
+            <h2 id={titleID}>{title}</h2>
+            {subtitle && <p>{subtitle}</p>}
+          </div>
+          <div className="modal-header-actions">
+            {action}
+            <button className="icon-button" type="button" aria-label="关闭" onClick={onClose}>
+              <X size={18} />
+            </button>
+          </div>
+        </header>
+        <div className="modal-body">{children}</div>
+      </section>
+    </div>
+  )
 }
 
 export function DetailGrid({ items }: { items: Array<{ label: string; value: ReactNode }> }) {

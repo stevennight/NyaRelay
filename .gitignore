@@ -4,6 +4,7 @@ bin/
 data/
 node-data/
 dist/
+.tmp-webdist/
 node_modules/
 *.tsbuildinfo
 *.db

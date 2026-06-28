@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate } from '@tanstack/react-router'
-import { ClipboardCopy, Download, Plus } from 'lucide-react'
+import { ClipboardCopy, Download, Plus, Settings, Trash2 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { api, post } from '../api'
 import type { NodeInfo, NodeInstallInfo } from '../types'
@@ -11,6 +11,8 @@ import {
   Field,
   FieldGrid,
   FormActions,
+  InlineActions,
+  Modal,
   PageFrame,
   Panel,
   StatusPill,
@@ -35,6 +37,40 @@ const emptyForm: NodeForm = {
 }
 
 export function NodesPage() {
+  const navigate = useNavigate()
+  return <NodesListView onCloseModal={() => navigate({ to: '/nodes', replace: true })} />
+}
+
+export function NodeNewPage() {
+  const navigate = useNavigate()
+  return (
+    <NodesListView
+      modal="new"
+      onCloseModal={() => navigate({ to: '/nodes', replace: true })}
+    />
+  )
+}
+
+export function NodeDetailPage({ nodeId }: { nodeId: string }) {
+  const navigate = useNavigate()
+  return (
+    <NodesListView
+      modal="detail"
+      nodeId={nodeId}
+      onCloseModal={() => navigate({ to: '/nodes', replace: true })}
+    />
+  )
+}
+
+function NodesListView({
+  modal,
+  nodeId,
+  onCloseModal,
+}: {
+  modal?: 'new' | 'detail'
+  nodeId?: string
+  onCloseModal: () => void
+}) {
   const query = useQuery({
     queryKey: ['nodes'],
     queryFn: () => api<NodeInfo[]>('/api/nodes'),
@@ -89,11 +125,13 @@ export function NodesPage() {
           ))}
         </Table>
       )}
+      {modal === 'new' && <NodeCreateModal onClose={onCloseModal} />}
+      {modal === 'detail' && nodeId && <NodeDetailModal nodeId={nodeId} onClose={onCloseModal} />}
     </PageFrame>
   )
 }
 
-export function NodeNewPage() {
+function NodeCreateModal({ onClose }: { onClose: () => void }) {
   const queryClient = useQueryClient()
   const [form, setForm] = useState<NodeForm>(emptyForm)
   const [error, setError] = useState('')
@@ -112,77 +150,35 @@ export function NodeNewPage() {
   })
 
   return (
-    <PageFrame
+    <Modal
       title="添加节点"
-      subtitle="系统会生成节点凭据和控制器签名公钥。"
+      subtitle={result ? '节点凭据已生成，请在目标机器执行安装命令。' : '填写基础信息后生成节点凭据和安装命令。'}
+      onClose={onClose}
+      size="lg"
     >
-      <form
-        className="form"
-        onSubmit={(event) => {
-          event.preventDefault()
-          setError('')
-          create.mutate()
-        }}
-      >
-        <FieldGrid>
-          <Field label="节点名称">
-            <input
-              value={form.name}
-              onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))}
-              placeholder="hk-1"
-            />
-          </Field>
-          <Field label="标签 JSON" wide hint="只会保存字符串值，例如 {&quot;region&quot;:&quot;hk&quot;}。">
-            <textarea
-              className="text-area"
-              value={form.labels}
-              onChange={(event) => setForm((current) => ({ ...current, labels: event.target.value }))}
-              rows={6}
-            />
-          </Field>
-          <Field label="公开 IP / 域名" hint="留空时会优先使用节点上报的地址。">
-            <input
-              value={form.public_host}
-              onChange={(event) => setForm((current) => ({ ...current, public_host: event.target.value }))}
-              placeholder="hk.example.com"
-            />
-          </Field>
-          <Field label="可用端口起始">
-            <input
-              type="number"
-              min={10000}
-              max={65535}
-              value={form.port_min}
-              onChange={(event) => setForm((current) => ({ ...current, port_min: event.target.value }))}
-            />
-          </Field>
-          <Field label="可用端口结束">
-            <input
-              type="number"
-              min={10000}
-              max={65535}
-              value={form.port_max}
-              onChange={(event) => setForm((current) => ({ ...current, port_max: event.target.value }))}
-            />
-          </Field>
-        </FieldGrid>
-        {error && <p className="error">{error}</p>}
-        <FormActions>
-          <button type="submit" disabled={create.isPending}>
-            生成节点凭据
-          </button>
-        </FormActions>
-      </form>
-      <NodeLaunchInfo
-        result={result}
-      />
-    </PageFrame>
+      {result ? (
+        <NodeInstallContent result={result} />
+      ) : (
+        <NodeForm
+          form={form}
+          error={error}
+          submitLabel="生成节点凭据"
+          pending={create.isPending}
+          onChange={setForm}
+          onSubmit={() => {
+            setError('')
+            create.mutate()
+          }}
+        />
+      )}
+    </Modal>
   )
 }
 
-export function NodeDetailPage({ nodeId }: { nodeId: string }) {
+function NodeDetailModal({ nodeId, onClose }: { nodeId: string; onClose: () => void }) {
   const queryClient = useQueryClient()
   const navigate = useNavigate()
+  const [mode, setMode] = useState<'details' | 'edit'>('details')
   const [installOpen, setInstallOpen] = useState(false)
   const [editForm, setEditForm] = useState<NodeForm>(emptyForm)
   const [message, setMessage] = useState('')
@@ -212,6 +208,7 @@ export function NodeDetailPage({ nodeId }: { nodeId: string }) {
       }),
     onSuccess: async () => {
       setMessage('已保存')
+      setMode('details')
       await queryClient.invalidateQueries({ queryKey: ['nodes'] })
       await queryClient.invalidateQueries({ queryKey: ['node', nodeId] })
     },
@@ -232,11 +229,17 @@ export function NodeDetailPage({ nodeId }: { nodeId: string }) {
   }, [node])
 
   return (
-    <PageFrame
+    <Modal
       title={node?.name || '节点详情'}
-      subtitle="查看节点状态、系统信息和吊销操作。"
-      action={
-        <div className="actions">
+      subtitle="查看节点状态、系统信息和节点配置。"
+      onClose={onClose}
+      size="lg"
+      action={node ? (
+        <InlineActions>
+          <button className="ghost" type="button" onClick={() => setMode(mode === 'edit' ? 'details' : 'edit')}>
+            <Settings size={16} />
+            {mode === 'edit' ? '查看详情' : '编辑'}
+          </button>
           <button
             className="ghost"
             type="button"
@@ -247,128 +250,177 @@ export function NodeDetailPage({ nodeId }: { nodeId: string }) {
             disabled={installQuery.isFetching}
           >
             <Download size={16} />
-            显示安装命令
+            安装命令
           </button>
           <button className="ghost danger" type="button" onClick={() => revoke.mutate()} disabled={revoke.isPending}>
-            吊销节点
+            <Trash2 size={16} />
+            吊销
           </button>
-        </div>
-      }
+        </InlineActions>
+      ) : undefined}
     >
       {nodeQuery.error && <Banner text={nodeQuery.error instanceof Error ? nodeQuery.error.message : '加载失败'} />}
       {node ? (
         <>
-          {installOpen ? (
-            <NodeInstallPanel
-              result={installQuery.data ?? null}
-              loading={installQuery.isFetching}
-              error={installQuery.error instanceof Error ? installQuery.error.message : ''}
-            />
-          ) : null}
-          <Panel>
-            <DetailGrid
-              items={[
-                { label: 'ID', value: node.id },
-                { label: '状态', value: <StatusPill value={node.revoked ? 'revoked' : node.status} /> },
-                { label: '版本', value: node.version || '-' },
-                { label: '公开入口', value: publicEndpoint(node) },
-                { label: '可用端口范围', value: `${node.port_min ?? 10000}-${node.port_max ?? 65535}` },
-                { label: '最近心跳', value: formatTime(node.last_seen) },
-                { label: '创建时间', value: formatTime(node.created_at) },
-                { label: '更新时间', value: formatTime(node.updated_at) },
-              ]}
-            />
-          </Panel>
-          <Panel>
-            <h2>系统信息</h2>
-            <DetailGrid
-              items={[
-                { label: '主机名', value: node.system?.hostname || '-' },
-                { label: '系统', value: [node.system?.os, node.system?.arch].filter(Boolean).join('/') || '-' },
-                { label: '地址', value: node.system?.ip || '-' },
-                { label: '标签', value: renderLabels(node.labels) },
-              ]}
-            />
-          </Panel>
-          <Panel>
-            <h2>节点设置</h2>
-            <form
-              className="form"
-              onSubmit={(event) => {
-                event.preventDefault()
+          {mode === 'edit' ? (
+            <NodeForm
+              form={editForm}
+              error={update.error instanceof Error ? update.error.message : ''}
+              submitLabel="保存节点设置"
+              pending={update.isPending}
+              onChange={setEditForm}
+              onSubmit={() => {
                 setMessage('')
                 update.mutate()
               }}
-            >
-              <FieldGrid>
-                <Field label="节点名称">
-                  <input
-                    value={editForm.name}
-                    onChange={(event) => setEditForm((current) => ({ ...current, name: event.target.value }))}
-                  />
-                </Field>
-                <Field label="公开 IP / 域名" hint="留空时会使用节点上报的地址。">
-                  <input
-                    value={editForm.public_host}
-                    onChange={(event) => setEditForm((current) => ({ ...current, public_host: event.target.value }))}
-                    placeholder={node.system?.ip || 'hk.example.com'}
-                  />
-                </Field>
-                <Field label="可用端口起始">
-                  <input
-                    type="number"
-                    min={10000}
-                    max={65535}
-                    value={editForm.port_min}
-                    onChange={(event) => setEditForm((current) => ({ ...current, port_min: event.target.value }))}
-                  />
-                </Field>
-                <Field label="可用端口结束">
-                  <input
-                    type="number"
-                    min={10000}
-                    max={65535}
-                    value={editForm.port_max}
-                    onChange={(event) => setEditForm((current) => ({ ...current, port_max: event.target.value }))}
-                  />
-                </Field>
-                <Field label="标签 JSON" wide hint="保存前会验证 JSON 对象格式。">
-                  <textarea
-                    className="text-area"
-                    rows={6}
-                    value={editForm.labels}
-                    onChange={(event) => setEditForm((current) => ({ ...current, labels: event.target.value }))}
-                  />
-                </Field>
-              </FieldGrid>
-              <FormActions>
-                <button type="submit" disabled={update.isPending}>保存节点设置</button>
-              </FormActions>
-            </form>
-            {message && <p>{message}</p>}
-          </Panel>
+              publicHostPlaceholder={node.system?.ip || 'hk.example.com'}
+            />
+          ) : (
+            <NodeDetailsContent node={node} />
+          )}
+          {message && <p className="modal-message">{message}</p>}
+          {installOpen ? (
+            <section className="modal-section">
+              <div className="modal-section-header">
+                <h3>节点安装命令</h3>
+                <button className="ghost" type="button" onClick={() => setInstallOpen(false)}>收起</button>
+              </div>
+              <NodeInstallContent
+                result={installQuery.data ?? null}
+                loading={installQuery.isFetching}
+                error={installQuery.error instanceof Error ? installQuery.error.message : ''}
+              />
+            </section>
+          ) : null}
         </>
       ) : null}
-    </PageFrame>
+    </Modal>
   )
 }
 
-function NodeLaunchInfo({
-  result,
+function NodeForm({
+  form,
+  error,
+  submitLabel,
+  pending,
+  onChange,
+  onSubmit,
+  publicHostPlaceholder = 'hk.example.com',
 }: {
-  result?: NodeInstallInfo | null
+  form: NodeForm
+  error?: string
+  submitLabel: string
+  pending: boolean
+  onChange: (form: NodeForm) => void
+  onSubmit: () => void
+  publicHostPlaceholder?: string
 }) {
-  return result ? (
-    <NodeInstallPanel result={result} />
-  ) : (
-    <Panel>
-      <h2>部署提示</h2>
-      <p>添加节点后，控制器会返回一次性的安装命令和下载脚本入口。</p>
-    </Panel>
+  return (
+    <form
+      className="form"
+      onSubmit={(event) => {
+        event.preventDefault()
+        onSubmit()
+      }}
+    >
+      <NodeFormFields form={form} onChange={onChange} publicHostPlaceholder={publicHostPlaceholder} />
+      {error && <p className="error">{error}</p>}
+      <FormActions>
+        <button type="submit" disabled={pending}>{submitLabel}</button>
+      </FormActions>
+    </form>
   )
 }
 
-function NodeInstallPanel({
+function NodeFormFields({
+  form,
+  onChange,
+  publicHostPlaceholder,
+}: {
+  form: NodeForm
+  onChange: (form: NodeForm) => void
+  publicHostPlaceholder: string
+}) {
+  return (
+    <FieldGrid>
+      <Field label="节点名称">
+        <input
+          value={form.name}
+          onChange={(event) => onChange({ ...form, name: event.target.value })}
+          placeholder="hk-1"
+        />
+      </Field>
+      <Field label="公开 IP / 域名" hint="留空时会优先使用节点上报的地址。">
+        <input
+          value={form.public_host}
+          onChange={(event) => onChange({ ...form, public_host: event.target.value })}
+          placeholder={publicHostPlaceholder}
+        />
+      </Field>
+      <Field label="可用端口起始">
+        <input
+          type="number"
+          min={10000}
+          max={65535}
+          value={form.port_min}
+          onChange={(event) => onChange({ ...form, port_min: event.target.value })}
+        />
+      </Field>
+      <Field label="可用端口结束">
+        <input
+          type="number"
+          min={10000}
+          max={65535}
+          value={form.port_max}
+          onChange={(event) => onChange({ ...form, port_max: event.target.value })}
+        />
+      </Field>
+      <Field label="标签 JSON" wide hint="只会保存字符串值，保存前会验证 JSON 对象格式。">
+        <textarea
+          className="text-area"
+          rows={6}
+          value={form.labels}
+          onChange={(event) => onChange({ ...form, labels: event.target.value })}
+        />
+      </Field>
+    </FieldGrid>
+  )
+}
+
+function NodeDetailsContent({ node }: { node: NodeInfo }) {
+  return (
+    <>
+      <section className="modal-section">
+        <h3>基础信息</h3>
+        <DetailGrid
+          items={[
+            { label: 'ID', value: node.id },
+            { label: '状态', value: <StatusPill value={node.revoked ? 'revoked' : node.status} /> },
+            { label: '版本', value: node.version || '-' },
+            { label: '公开入口', value: publicEndpoint(node) },
+            { label: '可用端口范围', value: `${node.port_min ?? 10000}-${node.port_max ?? 65535}` },
+            { label: '最近心跳', value: formatTime(node.last_seen) },
+            { label: '创建时间', value: formatTime(node.created_at) },
+            { label: '更新时间', value: formatTime(node.updated_at) },
+          ]}
+        />
+      </section>
+      <section className="modal-section">
+        <h3>系统信息</h3>
+        <DetailGrid
+          items={[
+            { label: '主机名', value: node.system?.hostname || '-' },
+            { label: '系统', value: [node.system?.os, node.system?.arch].filter(Boolean).join('/') || '-' },
+            { label: '地址', value: node.system?.ip || '-' },
+            { label: '标签', value: renderLabels(node.labels) },
+          ]}
+        />
+      </section>
+    </>
+  )
+}
+
+function NodeInstallContent({
   result,
   loading = false,
   error = '',
@@ -380,12 +432,10 @@ function NodeInstallPanel({
   if (!result) {
     return loading ? (
       <Panel>
-        <h2>节点安装命令</h2>
         <p>正在加载安装命令。</p>
       </Panel>
     ) : error ? (
       <Panel>
-        <h2>节点安装命令</h2>
         <p className="error">{error}</p>
       </Panel>
     ) : null
@@ -393,7 +443,7 @@ function NodeInstallPanel({
   const command = result.command || ''
   return (
     <Panel>
-      <h2>节点安装命令</h2>
+      <h3>节点安装命令</h3>
       <pre>{command}</pre>
       <DetailGrid
         items={[

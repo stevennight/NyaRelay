@@ -92,6 +92,7 @@ describe('node pages', () => {
 
     renderWithClient(<NodeNewPage />)
 
+    expect(await screen.findByRole('dialog', { name: '添加节点' })).toBeInTheDocument()
     fireEvent.change(screen.getByLabelText('节点名称'), { target: { value: 'hk-2' } })
     fireEvent.change(screen.getByLabelText('标签 JSON'), {
       target: { value: '{"region":"hk","tier":"premium"}' },
@@ -154,20 +155,21 @@ describe('node pages', () => {
 
     renderWithClient(<NodeDetailPage nodeId="node-1" />)
 
-    expect(await screen.findByText('hk-1')).toBeInTheDocument()
+    expect(await screen.findByRole('dialog', { name: 'hk-1' })).toBeInTheDocument()
     expect(screen.getByText('hk-1.local')).toBeInTheDocument()
     expect(screen.getByText('hk.example.com:10000-65535')).toBeInTheDocument()
     expect(screen.getByText('region=hk')).toBeInTheDocument()
 
+    fireEvent.click(screen.getByRole('button', { name: '编辑' }))
     fireEvent.change(screen.getByLabelText('公开 IP / 域名'), { target: { value: 'hk-new.example.com' } })
     fireEvent.click(screen.getByRole('button', { name: '保存节点设置' }))
     expect(await screen.findByText('已保存')).toBeInTheDocument()
 
-    fireEvent.click(screen.getByRole('button', { name: '显示安装命令' }))
+    fireEvent.click(screen.getByRole('button', { name: '安装命令' }))
     expect(await screen.findByText('节点安装命令')).toBeInTheDocument()
     expect(screen.getByText(/curl -fsSL https:\/\/relay\.example\.com\/install\.sh/)).toBeInTheDocument()
 
-    fireEvent.click(screen.getByRole('button', { name: '吊销节点' }))
+    fireEvent.click(screen.getByRole('button', { name: '吊销' }))
 
     await waitFor(() => {
       expect(routerMocks.navigate).toHaveBeenCalledWith({ to: '/nodes', replace: true })
