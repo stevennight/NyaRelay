@@ -3,7 +3,7 @@ import { Link, useNavigate } from '@tanstack/react-router'
 import { Pause, Play, Plus, Trash2 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { api, post } from '../api'
-import type { NodeInfo, TunnelInfo, TunnelTransport, TunnelType } from '../types'
+import type { NodeInfo, TunnelInfo, TunnelStageRole, TunnelTransport, TunnelType } from '../types'
 import {
   Banner,
   DetailGrid,
@@ -18,15 +18,25 @@ import {
   formatTime,
 } from '../components/ui'
 
+type TunnelNodeForm = {
+  id: string
+  node_id: string
+  weight: number
+}
+
+type TunnelStageForm = {
+  id: string
+  strategy: string
+  nodes: TunnelNodeForm[]
+}
+
 type TunnelForm = {
   id: string
   name: string
   type: TunnelType
   transport: TunnelTransport
-  entry_node: string
-  middle_nodes: string
-  exit_node: string
   enabled: boolean
+  stages: TunnelStageForm[]
 }
 
 const emptyTunnelForm = (): TunnelForm => ({
@@ -34,10 +44,8 @@ const emptyTunnelForm = (): TunnelForm => ({
   name: '',
   type: 'direct',
   transport: 'direct',
-  entry_node: '',
-  middle_nodes: '',
-  exit_node: '',
   enabled: true,
+  stages: [emptyStageForm()],
 })
 
 export function TunnelsPage() {
@@ -97,7 +105,7 @@ export function TunnelNewPage() {
   const queryClient = useQueryClient()
   const navigate = useNavigate()
   return (
-    <PageFrame title="新建隧道" subtitle="直入直出只需要入口节点；链式隧道需要入口和出口。">
+    <PageFrame title="新建隧道" subtitle="隧道由一层或多层 stage 组成，每层可放多个候选节点。">
       <TunnelEditor
         onSaved={async (saved) => {
           await queryClient.invalidateQueries({ queryKey: ['tunnels'] })
@@ -196,9 +204,10 @@ export function TunnelDetailPage({ tunnelId }: { tunnelId: string }) {
             <div className="hop-list">
               {query.data.stages.map((stage) => (
                 <div className="hop" key={stage.id}>
-                  <span>{stage.index}</span>
+                  <span>{stage.index + 1}</span>
                   <strong>{stage.role}</strong>
-                  <small>{stage.nodes.map((node) => node.node_id).join(', ')}</small>
+                  <small>{stage.strategy}</small>
+                  <small>{stage.nodes.map((node) => node.node_id).join(' / ')}</small>
                 </div>
               ))}
             </div>
@@ -230,51 +239,63 @@ function TunnelEditor({
     queryKey: ['nodes'],
     queryFn: () => api<NodeInfo[]>('/api/nodes'),
   })
+  const allNodes = nodesQuery.data ?? []
   const nodes = useMemo(() => {
-    const all = nodesQuery.data ?? []
     if (!initialTunnel) {
-      return all.filter((node) => !node.revoked)
+      return allNodes.filter((node) => !node.revoked)
     }
     const selectedIDs = new Set(
       initialTunnel.stages.flatMap((stage) => stage.nodes.map((node) => node.node_id)),
     )
-    return all.filter((node) => !node.revoked || selectedIDs.has(node.id))
-  }, [initialTunnel, nodesQuery.data])
+    return allNodes.filter((node) => !node.revoked || selectedIDs.has(node.id))
+  }, [allNodes, initialTunnel])
   const [form, setForm] = useState<TunnelForm>(emptyTunnelForm())
   const [error, setError] = useState('')
 
   useEffect(() => {
     if (!initialTunnel) return
-    const entry = initialTunnel.stages.find((stage) => stage.role === 'entry')?.nodes[0]?.node_id ?? ''
-    const middle = initialTunnel.stages
-      .filter((stage) => stage.role === 'middle')
-      .map((stage) => stage.nodes[0]?.node_id)
-      .filter(Boolean)
-      .join(',')
-    const exit = initialTunnel.stages.find((stage) => stage.role === 'exit')?.nodes[0]?.node_id ?? ''
     setForm({
       id: initialTunnel.id,
       name: initialTunnel.name,
       type: initialTunnel.type,
       transport: initialTunnel.transport,
-      entry_node: entry,
-      middle_nodes: middle,
-      exit_node: exit,
       enabled: initialTunnel.enabled,
+      stages: initialTunnel.stages.length > 0
+        ? initialTunnel.stages.map((stage) => ({
+          id: stage.id,
+          strategy: stage.strategy || 'single',
+          nodes: stage.nodes.length > 0
+            ? stage.nodes.map((node) => ({
+              id: node.id,
+              node_id: node.node_id,
+              weight: node.weight || 1,
+            }))
+            : [emptyNodeForm()],
+        }))
+        : defaultStagesForType(initialTunnel.type),
     })
   }, [initialTunnel])
 
   const save = useMutation({
     mutationFn: () => {
+      const stages = normalizeStagesForType(form.type, form.stages)
       const payload = {
         id: form.id,
         name: form.name,
         type: form.type,
         transport: form.type === 'direct' ? 'direct' : form.transport,
-        entry_node: form.entry_node,
-        middle_nodes: form.middle_nodes.split(',').map((item) => item.trim()).filter(Boolean),
-        exit_node: form.type === 'chain' ? form.exit_node : '',
         enabled: form.enabled,
+        stages: stages.map((stage, index) => ({
+          id: stage.id,
+          index,
+          role: stageRoleFor(form.type, index, stages.length),
+          strategy: stage.strategy || 'single',
+          nodes: stage.nodes.map((node) => ({
+            id: node.id,
+            node_id: node.node_id,
+            weight: node.weight || 1,
+          })),
+        })),
       }
       if (initialTunnel) {
         return api<TunnelInfo>(`/api/tunnels/${initialTunnel.id}`, {
@@ -304,7 +325,18 @@ function TunnelEditor({
           <input value={form.name} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} />
         </Field>
         <Field label="类型">
-          <select value={form.type} onChange={(event) => setForm((current) => ({ ...current, type: event.target.value as TunnelType }))}>
+          <select
+            value={form.type}
+            onChange={(event) => setForm((current) => {
+              const type = event.target.value as TunnelType
+              return {
+                ...current,
+                type,
+                transport: type === 'direct' ? 'direct' : current.transport,
+                stages: normalizeStagesForType(type, current.stages),
+              }
+            })}
+          >
             <option value="direct">直入直出</option>
             <option value="chain">链式隧道</option>
           </select>
@@ -321,37 +353,246 @@ function TunnelEditor({
             <option value="ws-tls">WS over TLS</option>
           </select>
         </Field>
-        <Field label="入口节点">
-          <select value={form.entry_node} onChange={(event) => setForm((current) => ({ ...current, entry_node: event.target.value }))}>
-            <option value="">选择节点</option>
-            {nodes.map((node) => <option key={node.id} value={node.id}>{node.name}</option>)}
-          </select>
-        </Field>
-        {form.type === 'chain' ? (
-          <>
-            <Field label="中间节点">
-              <input
-                value={form.middle_nodes}
-                onChange={(event) => setForm((current) => ({ ...current, middle_nodes: event.target.value }))}
-                placeholder="多个节点 ID 用英文逗号分隔"
-              />
-            </Field>
-            <Field label="出口节点">
-              <select value={form.exit_node} onChange={(event) => setForm((current) => ({ ...current, exit_node: event.target.value }))}>
-                <option value="">选择节点</option>
-                {nodes.map((node) => <option key={node.id} value={node.id}>{node.name}</option>)}
-              </select>
-            </Field>
-          </>
-        ) : null}
         <Field label="启用">
           <input type="checkbox" checked={form.enabled} onChange={(event) => setForm((current) => ({ ...current, enabled: event.target.checked }))} />
         </Field>
       </FieldGrid>
+      <Panel>
+        <div className="actions">
+          <h2 style={{ margin: 0 }}>Stages</h2>
+          {form.type === 'chain' ? (
+            <button
+              type="button"
+              className="ghost"
+              onClick={() => setForm((current) => ({
+                ...current,
+                stages: insertMiddleStage(current.stages),
+              }))}
+            >
+              <Plus size={16} />
+              添加中间层
+            </button>
+          ) : null}
+        </div>
+        <div className="hop-list">
+          {form.stages.map((stage, stageIndex) => {
+            const label = stageLabel(form.type, stageIndex, form.stages.length)
+            return (
+              <div key={stage.id || `${stageIndex}`} className="stage-editor">
+                <div className="actions" style={{ justifyContent: 'space-between' }}>
+                  <strong>{label}</strong>
+                  <InlineActions>
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={() => setForm((current) => ({
+                        ...current,
+                        stages: current.stages.map((item, idx) => (
+                          idx === stageIndex
+                            ? { ...item, nodes: [...item.nodes, emptyNodeForm()] }
+                            : item
+                        )),
+                      }))}
+                    >
+                      <Plus size={16} />
+                      添加候选
+                    </button>
+                    {form.type === 'chain' && stageIndex > 0 && stageIndex < form.stages.length - 1 ? (
+                      <button
+                        type="button"
+                        className="ghost danger"
+                        onClick={() => setForm((current) => ({
+                          ...current,
+                          stages: current.stages.filter((_, idx) => idx !== stageIndex),
+                        }))}
+                      >
+                        <Trash2 size={16} />
+                        删除层
+                      </button>
+                    ) : null}
+                  </InlineActions>
+                </div>
+                <FieldGrid>
+                  <Field label="策略">
+                    <select
+                      value={stage.strategy}
+                      onChange={(event) => setForm((current) => ({
+                        ...current,
+                        stages: current.stages.map((item, idx) => (
+                          idx === stageIndex ? { ...item, strategy: event.target.value } : item
+                        )),
+                      }))}
+                    >
+                      <option value="single">单候选</option>
+                      <option value="failover">故障切换</option>
+                      <option value="round_robin">轮询</option>
+                      <option value="random">随机</option>
+                    </select>
+                  </Field>
+                  <Field label="候选数量">
+                    <input value={String(stage.nodes.length)} readOnly />
+                  </Field>
+                </FieldGrid>
+                <div className="hop-list">
+                  {stage.nodes.map((nodeForm, nodeIndex) => (
+                    <div className="hop" key={nodeForm.id || `${stageIndex}-${nodeIndex}`}>
+                      <span>{nodeIndex + 1}</span>
+                      <select
+                        aria-label={`候选节点 ${stageIndex + 1}-${nodeIndex + 1}`}
+                        value={nodeForm.node_id}
+                        onChange={(event) => setForm((current) => ({
+                          ...current,
+                          stages: current.stages.map((item, idx) => (
+                            idx === stageIndex
+                              ? {
+                                ...item,
+                                nodes: item.nodes.map((candidate, cIndex) => (
+                                  cIndex === nodeIndex ? { ...candidate, node_id: event.target.value } : candidate
+                                )),
+                              }
+                              : item
+                          )),
+                        }))}
+                      >
+                        <option value="">选择节点</option>
+                        {nodes.map((node) => (
+                          <option key={node.id} value={node.id}>
+                            {node.name}
+                          </option>
+                        ))}
+                      </select>
+                      <input
+                        aria-label={`候选权重 ${stageIndex + 1}-${nodeIndex + 1}`}
+                        type="number"
+                        min={1}
+                        value={String(nodeForm.weight)}
+                        onChange={(event) => setForm((current) => ({
+                          ...current,
+                          stages: current.stages.map((item, idx) => (
+                            idx === stageIndex
+                              ? {
+                                ...item,
+                                nodes: item.nodes.map((candidate, cIndex) => (
+                                  cIndex === nodeIndex
+                                    ? {
+                                      ...candidate,
+                                      weight: Math.max(1, Number(event.target.value) || 1),
+                                    }
+                                    : candidate
+                                )),
+                              }
+                              : item
+                          )),
+                        }))}
+                      />
+                      <button
+                        type="button"
+                        className="ghost danger"
+                        disabled={stage.nodes.length === 1}
+                        onClick={() => setForm((current) => ({
+                          ...current,
+                          stages: current.stages.map((item, idx) => (
+                            idx === stageIndex
+                              ? {
+                                ...item,
+                                nodes: item.nodes.filter((_, cIndex) => cIndex !== nodeIndex),
+                              }
+                              : item
+                          )),
+                        }))}
+                      >
+                        <Trash2 size={16} />
+                        移除
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      </Panel>
       {error && <p className="error">{error}</p>}
       <button type="submit" disabled={save.isPending}>保存隧道</button>
     </form>
   )
+}
+
+function emptyNodeForm(): TunnelNodeForm {
+  return {
+    id: '',
+    node_id: '',
+    weight: 1,
+  }
+}
+
+function emptyStageForm(): TunnelStageForm {
+  return {
+    id: '',
+    strategy: 'single',
+    nodes: [emptyNodeForm()],
+  }
+}
+
+function defaultStagesForType(type: TunnelType): TunnelStageForm[] {
+  if (type === 'chain') {
+    return [emptyStageForm(), emptyStageForm()]
+  }
+  return [emptyStageForm()]
+}
+
+function normalizeStagesForType(type: TunnelType, stages: TunnelStageForm[]): TunnelStageForm[] {
+  const normalized = stages.length > 0 ? stages : defaultStagesForType(type)
+  if (type === 'direct') {
+    return [normalizeStage(normalized[0])]
+  }
+  if (normalized.length === 1) {
+    return [normalizeStage(normalized[0]), emptyStageForm()]
+  }
+  return normalized.map(normalizeStage)
+}
+
+function normalizeStage(stage: TunnelStageForm): TunnelStageForm {
+  const nodes = stage.nodes.length > 0 ? stage.nodes : [emptyNodeForm()]
+  return {
+    id: stage.id,
+    strategy: stage.strategy || 'single',
+    nodes: nodes.map((node) => ({
+      id: node.id,
+      node_id: node.node_id,
+      weight: node.weight > 0 ? node.weight : 1,
+    })),
+  }
+}
+
+function stageLabel(type: TunnelType, index: number, stageCount: number): string {
+  if (type === 'direct') {
+    return '入口层'
+  }
+  if (index === 0) {
+    return '入口层'
+  }
+  if (index === stageCount - 1) {
+    return '出口层'
+  }
+  return `中间层 ${index}`
+}
+
+function stageRoleFor(type: TunnelType, index: number, stageCount: number): TunnelStageRole {
+  if (type === 'direct' || index === 0) {
+    return 'entry'
+  }
+  if (index === stageCount - 1) {
+    return 'exit'
+  }
+  return 'middle'
+}
+
+function insertMiddleStage(stages: TunnelStageForm[]): TunnelStageForm[] {
+  if (stages.length <= 1) {
+    return [...stages, emptyStageForm()]
+  }
+  return [...stages.slice(0, stages.length - 1), emptyStageForm(), stages[stages.length - 1]]
 }
 
 function formatTunnelPath(tunnel: TunnelInfo) {

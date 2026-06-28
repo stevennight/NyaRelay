@@ -375,11 +375,14 @@ function formatProtocols(protocols: ForwardProtocol[]) {
 
 function formatForwardEndpoint(forward: ForwardInfo, tunnel?: TunnelInfo, nodes?: Map<string, NodeInfo>) {
   const port = portFromListen(forward.listen)
-  const entryNodeID = tunnel?.stages.find((stage) => stage.role === 'entry')?.nodes[0]?.node_id
-  const entryNode = entryNodeID ? nodes?.get(entryNodeID) : undefined
-  const host = entryNode?.public_host || entryNode?.system?.ip
-  if (host && port) {
-    return `${hostForEndpoint(host)}:${port}`
+  const entryNodes = tunnel?.stages.find((stage) => stage.role === 'entry')?.nodes ?? []
+  const endpoints = entryNodes
+    .map((entryNode) => nodes?.get(entryNode.node_id))
+    .filter((node): node is NodeInfo => Boolean(node))
+    .map((entryNode) => entryNode.public_host || entryNode.system?.ip)
+    .filter((host): host is string => Boolean(host))
+  if (endpoints.length > 0 && port) {
+    return endpoints.map((host) => `${hostForEndpoint(host)}:${port}`).join(' / ')
   }
   return forward.listen || '自动分配'
 }

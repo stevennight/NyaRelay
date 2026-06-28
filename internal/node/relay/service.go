@@ -23,6 +23,7 @@ type Service struct {
 	nodeID   string
 	forwards *metrics.Counters
 	tunnels  *metrics.Counters
+	selector *candidateSelector
 	mu       sync.Mutex
 	cancel   context.CancelFunc
 	revision int64
@@ -36,6 +37,7 @@ func New(log *slog.Logger, nodeID string) *Service {
 		nodeID:   nodeID,
 		forwards: metrics.New(),
 		tunnels:  metrics.New(),
+		selector: newCandidateSelector(),
 	}
 }
 
@@ -45,6 +47,8 @@ func (s *Service) Apply(ctx context.Context, cfg model.RelayConfig) error {
 	if cfg.Revision != 0 && cfg.Revision == s.revision {
 		return nil
 	}
+	previousConfig := s.config
+	previousRevision := s.revision
 	if s.cancel != nil {
 		s.cancel()
 	}
@@ -56,7 +60,41 @@ func (s *Service) Apply(ctx context.Context, cfg model.RelayConfig) error {
 	s.servers = nil
 	s.config = cfg
 	s.revision = cfg.Revision
+	if err := s.startConfigLocked(runCtx, cfg); err != nil {
+		s.restorePreviousConfig(ctx, previousConfig, previousRevision)
+		return err
+	}
+	return nil
+}
 
+func (s *Service) restorePreviousConfig(ctx context.Context, previousConfig model.RelayConfig, previousRevision int64) {
+	if s.cancel != nil {
+		s.cancel()
+	}
+	for _, closer := range s.servers {
+		_ = closer.Close()
+	}
+	s.cancel = nil
+	s.servers = nil
+	s.config = previousConfig
+	s.revision = previousRevision
+	if previousRevision == 0 && len(previousConfig.Forwards) == 0 && len(previousConfig.Tunnels) == 0 {
+		return
+	}
+	restoreCtx, restoreCancel := context.WithCancel(ctx)
+	s.cancel = restoreCancel
+	s.servers = nil
+	s.config = previousConfig
+	s.revision = previousRevision
+	if err := s.startConfigLocked(restoreCtx, previousConfig); err != nil {
+		s.log.Error("restore previous config failed", "revision", previousRevision, "error", err)
+		restoreCancel()
+		s.cancel = nil
+		s.servers = nil
+	}
+}
+
+func (s *Service) startConfigLocked(ctx context.Context, cfg model.RelayConfig) error {
 	for _, tunnel := range cfg.Tunnels {
 		for _, stage := range tunnel.Stages {
 			if stage.Role == model.TunnelStageEntry {
@@ -66,7 +104,7 @@ func (s *Service) Apply(ctx context.Context, cfg model.RelayConfig) error {
 			if !ok {
 				continue
 			}
-			if err := s.listenStage(runCtx, tunnel, stage, node); err != nil {
+			if err := s.listenStage(ctx, tunnel, stage, node); err != nil {
 				return err
 			}
 		}
@@ -82,11 +120,11 @@ func (s *Service) Apply(ctx context.Context, cfg model.RelayConfig) error {
 		for _, forwardProtocol := range forward.Protocols {
 			switch forwardProtocol {
 			case model.ForwardProtocolTCP:
-				if err := s.listenTCPForward(runCtx, forward, tunnel); err != nil {
+				if err := s.listenTCPForward(ctx, forward, tunnel); err != nil {
 					return err
 				}
 			case model.ForwardProtocolUDP:
-				if err := s.listenUDPForward(runCtx, forward, tunnel); err != nil {
+				if err := s.listenUDPForward(ctx, forward, tunnel); err != nil {
 					return err
 				}
 			}
@@ -309,23 +347,58 @@ func (s *Service) dialForwardNext(ctx context.Context, tunnel model.TunnelRuntim
 	if len(nextStage.Nodes) == 0 {
 		return nil, "", fmt.Errorf("tunnel stage %d has no node", nextIndex)
 	}
-	nextNode := nextStage.Nodes[0]
-	conn, err := s.dialStage(ctx, tunnel, nextNode)
-	if err != nil {
-		return nil, stageStatID(tunnel.ID, nextIndex), err
+	if network != "tcp" {
+		nextNode := nextStage.Nodes[0]
+		conn, err := s.dialStage(ctx, tunnel, nextNode)
+		if err != nil {
+			return nil, stageStatID(tunnel.ID, nextIndex), err
+		}
+		if err := protocol.WriteHello(conn, protocol.RelayHello{
+			TunnelID:       tunnel.ID,
+			ForwardID:      forward.ID,
+			FromStageIndex: fromStageIndex,
+			ToStageIndex:   nextIndex,
+			Network:        network,
+			Secret:         nextNode.Settings["secret"],
+		}); err != nil {
+			_ = conn.Close()
+			return nil, stageStatID(tunnel.ID, nextIndex), err
+		}
+		return conn, stageCandidateStatID(tunnel.ID, nextIndex, nextNode.NodeID), nil
 	}
-	if err := protocol.WriteHello(conn, protocol.RelayHello{
-		TunnelID:       tunnel.ID,
-		ForwardID:      forward.ID,
-		FromStageIndex: fromStageIndex,
-		ToStageIndex:   nextIndex,
-		Network:        network,
-		Secret:         nextNode.Settings["secret"],
-	}); err != nil {
-		_ = conn.Close()
-		return nil, stageStatID(tunnel.ID, nextIndex), err
+	order := s.selector.order(tunnel.ID, nextStage, network)
+	if len(order) == 0 {
+		return nil, stageStatID(tunnel.ID, nextIndex), fmt.Errorf("no available candidate in stage %d", nextIndex)
 	}
-	return conn, stageStatID(tunnel.ID, nextIndex), nil
+	var lastErr error
+	for _, idx := range order {
+		nextNode := nextStage.Nodes[idx]
+		conn, err := s.dialStage(ctx, tunnel, nextNode)
+		if err != nil {
+			s.selector.recordFailure(tunnel.ID, nextIndex, nextNode.NodeID)
+			lastErr = err
+			continue
+		}
+		if err := protocol.WriteHello(conn, protocol.RelayHello{
+			TunnelID:       tunnel.ID,
+			ForwardID:      forward.ID,
+			FromStageIndex: fromStageIndex,
+			ToStageIndex:   nextIndex,
+			Network:        network,
+			Secret:         nextNode.Settings["secret"],
+		}); err != nil {
+			_ = conn.Close()
+			s.selector.recordFailure(tunnel.ID, nextIndex, nextNode.NodeID)
+			lastErr = err
+			continue
+		}
+		s.selector.recordSuccess(tunnel.ID, nextIndex, nextNode.NodeID)
+		return conn, stageCandidateStatID(tunnel.ID, nextIndex, nextNode.NodeID), nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no available candidate in stage %d", nextIndex)
+	}
+	return nil, stageStatID(tunnel.ID, nextIndex), lastErr
 }
 
 func (s *Service) dialStage(ctx context.Context, tunnel model.TunnelRuntime, node model.TunnelRuntimeNode) (net.Conn, error) {
@@ -345,7 +418,7 @@ func (s *Service) dialStage(ctx context.Context, tunnel model.TunnelRuntime, nod
 		}
 		serverName := node.Settings["server_name"]
 		if serverName == "" {
-			serverName = strings.Split(addr, ":")[0]
+			serverName = hostOnly(addr)
 		}
 		clientTLS, err := s.clientTLSConfig(tunnel, node, serverName)
 		if err != nil {
@@ -365,7 +438,7 @@ func (s *Service) dialStage(ctx context.Context, tunnel model.TunnelRuntime, nod
 		}
 		host := node.Settings["server_name"]
 		if host == "" {
-			host = strings.Split(addr, ":")[0]
+			host = hostOnly(addr)
 		}
 		clientTLS, err := s.clientTLSConfig(tunnel, node, host)
 		if err != nil {
@@ -456,7 +529,7 @@ func (s *Service) isEntryNode(tunnel model.TunnelRuntime) bool {
 	if len(tunnel.Stages) == 0 || len(tunnel.Stages[0].Nodes) == 0 {
 		return false
 	}
-	return tunnel.Stages[0].Nodes[0].NodeID == s.nodeID
+	return stageHasNode(tunnel.Stages[0], s.nodeID)
 }
 
 func stageNodeFor(stage model.TunnelRuntimeStage, nodeID string) (model.TunnelRuntimeNode, bool) {
@@ -479,6 +552,42 @@ func forwardSupports(forward model.ForwardRuntime, protocolValue model.ForwardPr
 
 func stageStatID(tunnelID string, stageIndex int) string {
 	return fmt.Sprintf("tunnel:%s:stage:%d", tunnelID, stageIndex)
+}
+
+func stageCandidateStatID(tunnelID string, stageIndex int, nodeID string) string {
+	return fmt.Sprintf("tunnel:%s:stage:%d:candidate:%s", tunnelID, stageIndex, nodeID)
+}
+
+func stageHasNode(stage model.TunnelRuntimeStage, nodeID string) bool {
+	for _, node := range stage.Nodes {
+		if node.NodeID == nodeID {
+			return true
+		}
+	}
+	return false
+}
+
+func hostOnly(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(value)
+	if err == nil {
+		return trimEnclosingBrackets(host)
+	}
+	trimmed := trimEnclosingBrackets(value)
+	if ip := net.ParseIP(trimmed); ip != nil {
+		return ip.String()
+	}
+	return trimmed
+}
+
+func trimEnclosingBrackets(value string) string {
+	if strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]") && len(value) >= 2 {
+		return value[1 : len(value)-1]
+	}
+	return value
 }
 
 type closerFunc func() error

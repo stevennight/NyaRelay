@@ -403,6 +403,15 @@ td small {
   gap: 10px;
 }
 
+.stage-editor {
+  display: grid;
+  gap: 16px;
+  padding: 14px;
+  border: 1px solid #e2e6ed;
+  border-radius: 8px;
+  background: #fafbfc;
+}
+
 .detail-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

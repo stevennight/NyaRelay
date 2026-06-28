@@ -204,7 +204,7 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err, http.StatusInternalServerError)
 		return
 	}
-	setSessionCookie(w, session)
+	setSessionCookie(w, r, session)
 	writeJSON(w, map[string]any{"user": user})
 }
 
@@ -218,7 +218,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err, http.StatusBadRequest)
 		return
 	}
-	limitKey := r.RemoteAddr + ":" + req.Username
+	limitKey := loginLimitKey(r, req.Username)
 	if !s.limiter.Allow(limitKey) {
 		writeError(w, errors.New("too many failed login attempts"), http.StatusTooManyRequests)
 		return
@@ -243,7 +243,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.limiter.Success(limitKey)
-	setSessionCookie(w, session)
+	setSessionCookie(w, r, session)
 	_ = s.store.AddAudit(r.Context(), user.Username, "auth.login", "controller", map[string]any{"ip": r.RemoteAddr})
 	writeJSON(w, map[string]any{"user": user})
 }
@@ -800,99 +800,105 @@ func (s *Server) prepareTunnel(ctx context.Context, req tunnelRequest) (model.Tu
 			}
 		}
 		if stage.Strategy == "" {
-			stage.Strategy = "single"
-		}
-		if len(stage.Nodes) != 1 {
-			return model.Tunnel{}, nil, fmt.Errorf("stage %d must have exactly one node", i)
-		}
-		node := &stage.Nodes[0]
-		node.TunnelID = tunnel.ID
-		node.StageID = stage.ID
-		node.NodeID = strings.TrimSpace(node.NodeID)
-		if node.NodeID == "" {
-			return model.Tunnel{}, nil, fmt.Errorf("stage %d node id is required", i)
-		}
-		if seenNodes[node.NodeID] {
-			return model.Tunnel{}, nil, fmt.Errorf("node %s appears more than once in tunnel", node.NodeID)
-		}
-		seenNodes[node.NodeID] = true
-		realNode, ok := nodeByID[node.NodeID]
-		if !ok || realNode.Revoked {
-			return model.Tunnel{}, nil, fmt.Errorf("node %s not found", node.NodeID)
-		}
-		existingNode := findExistingStageNode(existing, i, node.NodeID)
-		if node.ID == "" {
-			if existingNode.ID != "" {
-				node.ID = existingNode.ID
+			if len(stage.Nodes) > 1 {
+				stage.Strategy = "failover"
 			} else {
-				node.ID = ids.New("stage_node")
+				stage.Strategy = "single"
 			}
 		}
-		if node.Weight <= 0 {
-			node.Weight = 1
+		if len(stage.Nodes) == 0 {
+			return model.Tunnel{}, nil, fmt.Errorf("stage %d must have at least one node", i)
 		}
-		node.Settings = mergeSettings(existingNode.Settings, node.Settings)
-		if tunnel.Type == model.TunnelDirect || stage.Role == model.TunnelStageEntry {
-			node.ListenAddr = ""
-			node.PublicAddr = ""
-			node.ConnectAddr = strings.TrimSpace(node.ConnectAddr)
-			node.Settings = map[string]string{}
-			continue
-		}
-		if node.ListenAddr == "" {
-			node.ListenAddr = existingNode.ListenAddr
-		}
-		if node.PublicAddr == "" {
-			node.PublicAddr = existingNode.PublicAddr
-		}
-		if node.ConnectAddr == "" {
-			node.ConnectAddr = existingNode.ConnectAddr
-		}
-		port := 0
-		if node.ListenAddr == "" {
-			port, err = allocatePort(realNode, "tcp", used)
-			if err != nil {
+		for j := range stage.Nodes {
+			node := &stage.Nodes[j]
+			node.TunnelID = tunnel.ID
+			node.StageID = stage.ID
+			node.NodeID = strings.TrimSpace(node.NodeID)
+			if node.NodeID == "" {
+				return model.Tunnel{}, nil, fmt.Errorf("stage %d node id is required", i)
+			}
+			if seenNodes[node.NodeID] {
+				return model.Tunnel{}, nil, fmt.Errorf("node %s appears more than once in tunnel", node.NodeID)
+			}
+			seenNodes[node.NodeID] = true
+			realNode, ok := nodeByID[node.NodeID]
+			if !ok || realNode.Revoked {
+				return model.Tunnel{}, nil, fmt.Errorf("node %s not found", node.NodeID)
+			}
+			existingNode := findExistingStageNode(existing, i, node.NodeID)
+			if node.ID == "" {
+				if existingNode.ID != "" {
+					node.ID = existingNode.ID
+				} else {
+					node.ID = ids.New("stage_node")
+				}
+			}
+			if node.Weight <= 0 {
+				node.Weight = 1
+			}
+			node.Settings = mergeSettings(existingNode.Settings, node.Settings)
+			if tunnel.Type == model.TunnelDirect || stage.Role == model.TunnelStageEntry {
+				node.ListenAddr = ""
+				node.PublicAddr = ""
+				node.ConnectAddr = strings.TrimSpace(node.ConnectAddr)
+				node.Settings = map[string]string{}
+				continue
+			}
+			if node.ListenAddr == "" {
+				node.ListenAddr = existingNode.ListenAddr
+			}
+			if node.PublicAddr == "" {
+				node.PublicAddr = existingNode.PublicAddr
+			}
+			if node.ConnectAddr == "" {
+				node.ConnectAddr = existingNode.ConnectAddr
+			}
+			port := 0
+			if node.ListenAddr == "" {
+				port, err = allocatePort(realNode, "tcp", used)
+				if err != nil {
+					return model.Tunnel{}, nil, err
+				}
+				node.ListenAddr = net.JoinHostPort("", strconv.Itoa(port))
+			} else {
+				port, err = portFromAddr(node.ListenAddr)
+				if err != nil {
+					return model.Tunnel{}, nil, err
+				}
+				if err := ensurePortInRange(realNode, port); err != nil {
+					return model.Tunnel{}, nil, err
+				}
+				markPortUsed(used, realNode.ID, "tcp", port)
+			}
+			if node.PublicAddr == "" && realNode.PublicHost != "" {
+				node.PublicAddr = net.JoinHostPort(realNode.PublicHost, strconv.Itoa(port))
+			}
+			if node.PublicAddr == "" && node.ConnectAddr == "" {
+				return model.Tunnel{}, nil, fmt.Errorf("node %s requires public_host or connect_addr for chain stage", realNode.ID)
+			}
+			if node.Settings == nil {
+				node.Settings = map[string]string{}
+			}
+			if node.Settings["secret"] == "" {
+				secret, err := randomToken()
+				if err != nil {
+					return model.Tunnel{}, nil, err
+				}
+				node.Settings["secret"] = secret
+			}
+			if err := ensureTunnelCertificates(tunnel, node); err != nil {
 				return model.Tunnel{}, nil, err
 			}
-			node.ListenAddr = net.JoinHostPort("", strconv.Itoa(port))
-		} else {
-			port, err = portFromAddr(node.ListenAddr)
-			if err != nil {
-				return model.Tunnel{}, nil, err
-			}
-			if err := ensurePortInRange(realNode, port); err != nil {
-				return model.Tunnel{}, nil, err
-			}
-			markPortUsed(used, realNode.ID, "tcp", port)
+			outAllocations = append(outAllocations, model.PortAllocation{
+				ID:        ids.New("alloc"),
+				NodeID:    realNode.ID,
+				OwnerKind: "tunnel_stage_node",
+				OwnerID:   node.ID,
+				Protocol:  "tcp",
+				Port:      port,
+				BindAddr:  node.ListenAddr,
+			})
 		}
-		if node.PublicAddr == "" && realNode.PublicHost != "" {
-			node.PublicAddr = net.JoinHostPort(realNode.PublicHost, strconv.Itoa(port))
-		}
-		if node.PublicAddr == "" && node.ConnectAddr == "" {
-			return model.Tunnel{}, nil, fmt.Errorf("node %s requires public_host or connect_addr for chain stage", realNode.ID)
-		}
-		if node.Settings == nil {
-			node.Settings = map[string]string{}
-		}
-		if node.Settings["secret"] == "" {
-			secret, err := randomToken()
-			if err != nil {
-				return model.Tunnel{}, nil, err
-			}
-			node.Settings["secret"] = secret
-		}
-		if err := ensureTunnelCertificates(tunnel, node); err != nil {
-			return model.Tunnel{}, nil, err
-		}
-		outAllocations = append(outAllocations, model.PortAllocation{
-			ID:        ids.New("alloc"),
-			NodeID:    realNode.ID,
-			OwnerKind: "tunnel_stage_node",
-			OwnerID:   node.ID,
-			Protocol:  "tcp",
-			Port:      port,
-			BindAddr:  node.ListenAddr,
-		})
 	}
 	return tunnel, outAllocations, nil
 }
@@ -934,13 +940,17 @@ func (s *Server) prepareForward(ctx context.Context, req forwardRequest) (model.
 	if !tunnel.Enabled {
 		return model.Forward{}, nil, errors.New("tunnel is disabled")
 	}
-	entryNodeID, err := tunnelEntryNodeID(tunnel)
+	entryNodeIDs, err := tunnelEntryNodeIDs(tunnel)
 	if err != nil {
 		return model.Forward{}, nil, err
 	}
-	entryNode, err := s.store.GetNode(ctx, entryNodeID)
-	if err != nil || entryNode.Revoked {
-		return model.Forward{}, nil, errors.New("entry node not found")
+	entryNodes := make([]model.Node, 0, len(entryNodeIDs))
+	for _, entryNodeID := range entryNodeIDs {
+		entryNode, err := s.store.GetNode(ctx, entryNodeID)
+		if err != nil || entryNode.Revoked {
+			return model.Forward{}, nil, errors.New("entry node not found")
+		}
+		entryNodes = append(entryNodes, entryNode)
 	}
 	forward := model.Forward{
 		ID:        strings.TrimSpace(req.ID),
@@ -959,7 +969,7 @@ func (s *Server) prepareForward(ctx context.Context, req forwardRequest) (model.
 	used := usedPortSet(allocations, excludedOwners)
 	port := 0
 	if forward.Listen == "" {
-		port, err = allocateSharedProtocolPort(entryNode, protocols, used)
+		port, err = allocateSharedProtocolPortAcrossNodes(entryNodes, protocols, used)
 		if err != nil {
 			return model.Forward{}, nil, err
 		}
@@ -969,27 +979,23 @@ func (s *Server) prepareForward(ctx context.Context, req forwardRequest) (model.
 		if err != nil {
 			return model.Forward{}, nil, err
 		}
-		if err := ensurePortInRange(entryNode, port); err != nil {
+		if err := ensurePortAvailableAcrossNodes(entryNodes, protocols, port, used); err != nil {
 			return model.Forward{}, nil, err
-		}
-		for _, protocol := range protocols {
-			if isPortUsed(used, entryNode.ID, string(protocol), port) {
-				return model.Forward{}, nil, fmt.Errorf("listen port %d/%s is already in use on node %s", port, protocol, entryNode.ID)
-			}
-			markPortUsed(used, entryNode.ID, string(protocol), port)
 		}
 	}
 	var outAllocations []model.PortAllocation
-	for _, protocol := range protocols {
-		outAllocations = append(outAllocations, model.PortAllocation{
-			ID:        ids.New("alloc"),
-			NodeID:    entryNode.ID,
-			OwnerKind: "forward",
-			OwnerID:   forward.ID,
-			Protocol:  string(protocol),
-			Port:      port,
-			BindAddr:  forward.Listen,
-		})
+	for _, entryNode := range entryNodes {
+		for _, protocol := range protocols {
+			outAllocations = append(outAllocations, model.PortAllocation{
+				ID:        ids.New("alloc"),
+				NodeID:    entryNode.ID,
+				OwnerKind: "forward",
+				OwnerID:   forward.ID,
+				Protocol:  string(protocol),
+				Port:      port,
+				BindAddr:  forward.Listen,
+			})
+		}
 	}
 	return forward, outAllocations, nil
 }
@@ -1078,14 +1084,9 @@ func ensureTunnelCertificates(tunnel model.Tunnel, node *model.TunnelStageNode) 
 
 func firstHost(addrs ...string) string {
 	for _, addr := range addrs {
-		if addr == "" {
-			continue
-		}
-		host, _, err := net.SplitHostPort(addr)
-		if err == nil {
+		if host := hostOnly(addr); host != "" {
 			return host
 		}
-		return strings.Split(addr, ":")[0]
 	}
 	return ""
 }
@@ -1113,11 +1114,28 @@ func normalizeForwardProtocols(protocols []model.ForwardProtocol) ([]model.Forwa
 	return out, nil
 }
 
-func tunnelEntryNodeID(tunnel model.Tunnel) (string, error) {
+func tunnelEntryNodeIDs(tunnel model.Tunnel) ([]string, error) {
 	if len(tunnel.Stages) == 0 || len(tunnel.Stages[0].Nodes) == 0 {
-		return "", errors.New("tunnel has no entry node")
+		return nil, errors.New("tunnel has no entry node")
 	}
-	return tunnel.Stages[0].Nodes[0].NodeID, nil
+	out := make([]string, 0, len(tunnel.Stages[0].Nodes))
+	for _, node := range tunnel.Stages[0].Nodes {
+		if strings.TrimSpace(node.NodeID) != "" {
+			out = append(out, node.NodeID)
+		}
+	}
+	if len(out) == 0 {
+		return nil, errors.New("tunnel has no entry node")
+	}
+	return out, nil
+}
+
+func tunnelEntryNodeID(tunnel model.Tunnel) (string, error) {
+	ids, err := tunnelEntryNodeIDs(tunnel)
+	if err != nil {
+		return "", err
+	}
+	return ids[0], nil
 }
 
 type usedPorts map[string]map[string]map[int]bool
@@ -1152,6 +1170,70 @@ func allocateSharedProtocolPort(node model.Node, protocols []model.ForwardProtoc
 		return port, nil
 	}
 	return 0, fmt.Errorf("no free forward port available on node %s", node.ID)
+}
+
+func allocateSharedProtocolPortAcrossNodes(nodes []model.Node, protocols []model.ForwardProtocol, used usedPorts) (int, error) {
+	if len(nodes) == 0 {
+		return 0, errors.New("no entry nodes available")
+	}
+	min, max := normalizedPortRange(nodes[0])
+	for _, node := range nodes[1:] {
+		nodeMin, nodeMax := normalizedPortRange(node)
+		if nodeMin > min {
+			min = nodeMin
+		}
+		if nodeMax < max {
+			max = nodeMax
+		}
+	}
+	for port := min; port <= max; port++ {
+		if !portAvailableAcrossNodes(nodes, protocols, port, used) {
+			continue
+		}
+		for _, node := range nodes {
+			for _, protocol := range protocols {
+				markPortUsed(used, node.ID, string(protocol), port)
+			}
+		}
+		return port, nil
+	}
+	return 0, errors.New("no common forward port available across entry nodes")
+}
+
+func ensurePortAvailableAcrossNodes(nodes []model.Node, protocols []model.ForwardProtocol, port int, used usedPorts) error {
+	if len(nodes) == 0 {
+		return errors.New("no entry nodes available")
+	}
+	for _, node := range nodes {
+		if err := ensurePortInRange(node, port); err != nil {
+			return err
+		}
+		for _, protocol := range protocols {
+			if isPortUsed(used, node.ID, string(protocol), port) {
+				return fmt.Errorf("listen port %d/%s is already in use on node %s", port, protocol, node.ID)
+			}
+		}
+	}
+	for _, node := range nodes {
+		for _, protocol := range protocols {
+			markPortUsed(used, node.ID, string(protocol), port)
+		}
+	}
+	return nil
+}
+
+func portAvailableAcrossNodes(nodes []model.Node, protocols []model.ForwardProtocol, port int, used usedPorts) bool {
+	for _, node := range nodes {
+		if err := ensurePortInRange(node, port); err != nil {
+			return false
+		}
+		for _, protocol := range protocols {
+			if isPortUsed(used, node.ID, string(protocol), port) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func allocatePort(node model.Node, protocol string, used usedPorts) (int, error) {
@@ -1494,7 +1576,7 @@ func scopeTunnelRuntime(nodeID string, tunnel model.Tunnel) model.TunnelRuntime 
 			switch {
 			case node.NodeID == nodeID:
 				runtimeNode.Settings = listenerSettings(tunnel.Transport, node.Settings)
-			case stageIndex > 0 && previousStageNodeID(tunnel, stageIndex) == nodeID:
+			case stageIndex > 0 && previousStageNodeHasNode(tunnel, stageIndex, nodeID):
 				runtimeNode.Settings = dialerSettings(tunnel.Transport, node.Settings)
 			}
 			runtimeStage.Nodes = append(runtimeStage.Nodes, runtimeNode)
@@ -1549,6 +1631,19 @@ func previousStageNodeID(tunnel model.Tunnel, stageIndex int) string {
 		return ""
 	}
 	return prev.Nodes[0].NodeID
+}
+
+func previousStageNodeHasNode(tunnel model.Tunnel, stageIndex int, nodeID string) bool {
+	if stageIndex <= 0 || stageIndex > len(tunnel.Stages)-1 {
+		return false
+	}
+	prev := tunnel.Stages[stageIndex-1]
+	for _, node := range prev.Nodes {
+		if node.NodeID == nodeID {
+			return true
+		}
+	}
+	return false
 }
 
 func listenerSettings(transport model.TunnelTransport, settings map[string]string) map[string]string {
@@ -1629,16 +1724,86 @@ func (s *Server) withNode(next func(http.ResponseWriter, *http.Request, model.No
 	}
 }
 
-func setSessionCookie(w http.ResponseWriter, session auth.Session) {
+func setSessionCookie(w http.ResponseWriter, r *http.Request, session auth.Session) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    session.ID,
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   false,
+		Secure:   requestIsSecure(r),
 		Expires:  session.ExpiresAt,
 	})
+}
+
+func loginLimitKey(r *http.Request, username string) string {
+	return requestClientIP(r) + ":" + strings.TrimSpace(username)
+}
+
+func requestClientIP(r *http.Request) string {
+	for _, candidate := range []string{
+		forwardedHeaderValue(r.Header.Get("X-Forwarded-For")),
+		strings.TrimSpace(r.Header.Get("X-Real-IP")),
+		remoteAddrHost(r.RemoteAddr),
+	} {
+		if candidate != "" {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func forwardedHeaderValue(value string) string {
+	if value == "" {
+		return ""
+	}
+	for _, part := range strings.Split(value, ",") {
+		if candidate := strings.TrimSpace(part); candidate != "" {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func remoteAddrHost(value string) string {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(value))
+	if err == nil {
+		return trimEnclosingBrackets(host)
+	}
+	return trimEnclosingBrackets(strings.TrimSpace(value))
+}
+
+func requestIsSecure(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if r.TLS != nil {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(forwardedHeaderValue(r.Header.Get("X-Forwarded-Proto"))), "https")
+}
+
+func hostOnly(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(value)
+	if err == nil {
+		return trimEnclosingBrackets(host)
+	}
+	trimmed := trimEnclosingBrackets(value)
+	if ip := net.ParseIP(trimmed); ip != nil {
+		return ip.String()
+	}
+	return trimmed
+}
+
+func trimEnclosingBrackets(value string) string {
+	if strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]") && len(value) >= 2 {
+		return value[1 : len(value)-1]
+	}
+	return value
 }
 
 func secureHeaders(next http.Handler) http.Handler {

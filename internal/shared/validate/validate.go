@@ -55,35 +55,41 @@ func Tunnel(tunnel model.Tunnel) error {
 		if stage.Role != expectedRole {
 			return fmt.Errorf("stage %d role must be %s", index, expectedRole)
 		}
-		if len(stage.Nodes) != 1 {
-			return fmt.Errorf("stage %d must have exactly one node in plan 001", index)
+		switch strings.ToLower(strings.TrimSpace(stage.Strategy)) {
+		case "", "single", "round_robin", "random", "failover":
+		default:
+			return fmt.Errorf("unsupported stage %d strategy %q", index, stage.Strategy)
 		}
-		node := stage.Nodes[0]
-		if strings.TrimSpace(node.NodeID) == "" {
-			return fmt.Errorf("stage %d node id is required", index)
+		if len(stage.Nodes) == 0 {
+			return fmt.Errorf("stage %d must have at least one node", index)
 		}
-		if seenNodes[node.NodeID] {
-			return fmt.Errorf("node %s appears more than once in tunnel", node.NodeID)
-		}
-		seenNodes[node.NodeID] = true
-		if tunnel.Type == model.TunnelChain && stage.Role != model.TunnelStageEntry {
-			if strings.TrimSpace(node.ListenAddr) == "" {
-				return fmt.Errorf("stage %d listen address is required", index)
+		for _, node := range stage.Nodes {
+			if strings.TrimSpace(node.NodeID) == "" {
+				return fmt.Errorf("stage %d node id is required", index)
 			}
-			if _, _, err := net.SplitHostPort(node.ListenAddr); err != nil {
-				return fmt.Errorf("invalid stage %d listen address: %w", index, err)
+			if seenNodes[node.NodeID] {
+				return fmt.Errorf("node %s appears more than once in tunnel", node.NodeID)
 			}
-			if strings.TrimSpace(node.PublicAddr) == "" && strings.TrimSpace(node.ConnectAddr) == "" {
-				return fmt.Errorf("stage %d requires public_addr or connect_addr", index)
-			}
-			if node.PublicAddr != "" {
-				if _, _, err := net.SplitHostPort(node.PublicAddr); err != nil {
-					return fmt.Errorf("invalid stage %d public address: %w", index, err)
+			seenNodes[node.NodeID] = true
+			if tunnel.Type == model.TunnelChain && stage.Role != model.TunnelStageEntry {
+				if strings.TrimSpace(node.ListenAddr) == "" {
+					return fmt.Errorf("stage %d listen address is required", index)
 				}
-			}
-			if node.ConnectAddr != "" {
-				if _, _, err := net.SplitHostPort(node.ConnectAddr); err != nil {
-					return fmt.Errorf("invalid stage %d connect address: %w", index, err)
+				if _, _, err := net.SplitHostPort(node.ListenAddr); err != nil {
+					return fmt.Errorf("invalid stage %d listen address: %w", index, err)
+				}
+				if strings.TrimSpace(node.PublicAddr) == "" && strings.TrimSpace(node.ConnectAddr) == "" {
+					return fmt.Errorf("stage %d requires public_addr or connect_addr", index)
+				}
+				if node.PublicAddr != "" {
+					if _, _, err := net.SplitHostPort(node.PublicAddr); err != nil {
+						return fmt.Errorf("invalid stage %d public address: %w", index, err)
+					}
+				}
+				if node.ConnectAddr != "" {
+					if _, _, err := net.SplitHostPort(node.ConnectAddr); err != nil {
+						return fmt.Errorf("invalid stage %d connect address: %w", index, err)
+					}
 				}
 			}
 		}

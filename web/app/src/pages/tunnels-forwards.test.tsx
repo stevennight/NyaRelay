@@ -124,8 +124,9 @@ describe('tunnels and forwards pages', () => {
     renderWithClient(<TunnelNewPage />)
 
     expect(await screen.findByText('新建隧道')).toBeInTheDocument()
-    expect(screen.getByRole('combobox', { name: '入口节点' })).toBeInTheDocument()
-    expect(await screen.findByRole('option', { name: 'cn-1' })).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('类型'), { target: { value: 'chain' } })
+    expect(screen.getByRole('button', { name: '添加中间层' })).toBeInTheDocument()
+    expect((await screen.findAllByRole('option', { name: 'cn-1' })).length).toBeGreaterThan(0)
     expect(screen.queryByRole('option', { name: 'revoked-node' })).not.toBeInTheDocument()
   })
 
@@ -154,9 +155,10 @@ describe('tunnels and forwards pages', () => {
     fireEvent.change(screen.getByLabelText('名称'), { target: { value: 'cn-sg-hk' } })
     fireEvent.change(screen.getByLabelText('类型'), { target: { value: 'chain' } })
     fireEvent.change(screen.getByLabelText('传输'), { target: { value: 'tls' } })
-    fireEvent.change(screen.getByLabelText('入口节点'), { target: { value: 'cn-1' } })
-    fireEvent.change(screen.getByLabelText('中间节点'), { target: { value: 'sg-1' } })
-    fireEvent.change(screen.getByLabelText('出口节点'), { target: { value: 'hk-1' } })
+    fireEvent.change(screen.getByLabelText('候选节点 1-1'), { target: { value: 'cn-1' } })
+    fireEvent.click(screen.getByRole('button', { name: '添加中间层' }))
+    fireEvent.change(screen.getByLabelText('候选节点 2-1'), { target: { value: 'sg-1' } })
+    fireEvent.change(screen.getByLabelText('候选节点 3-1'), { target: { value: 'hk-1' } })
     fireEvent.click(screen.getByRole('button', { name: '保存隧道' }))
 
     await waitFor(() => {
@@ -173,10 +175,48 @@ describe('tunnels and forwards pages', () => {
       name: 'cn-sg-hk',
       type: 'chain',
       transport: 'tls',
-      entry_node: 'cn-1',
-      middle_nodes: ['sg-1'],
-      exit_node: 'hk-1',
       enabled: true,
+      stages: [
+        {
+          id: '',
+          index: 0,
+          role: 'entry',
+          strategy: 'single',
+          nodes: [
+            {
+              id: '',
+              node_id: 'cn-1',
+              weight: 1,
+            },
+          ],
+        },
+        {
+          id: '',
+          index: 1,
+          role: 'middle',
+          strategy: 'single',
+          nodes: [
+            {
+              id: '',
+              node_id: 'sg-1',
+              weight: 1,
+            },
+          ],
+        },
+        {
+          id: '',
+          index: 2,
+          role: 'exit',
+          strategy: 'single',
+          nodes: [
+            {
+              id: '',
+              node_id: 'hk-1',
+              weight: 1,
+            },
+          ],
+        },
+      ],
     })
   })
 

@@ -230,6 +230,104 @@ func TestControllerNodeThreeNodeTCPIntegration(t *testing.T) {
 	assertTCPRoundTrip(t, entryListen, "nya-three-hop")
 }
 
+func TestControllerNodeTCPMultiCandidateFailoverIntegration(t *testing.T) {
+	h := newControllerHarness(t, "127.0.0.1:0")
+	pub := mustSigningKey(t, h.store)
+
+	entry, entryToken := createNode(t, h.server, "entry-failover")
+	midA, _ := createNode(t, h.server, "mid-a")
+	midB, midBToken := createNode(t, h.server, "mid-b")
+	exit, exitToken := createNode(t, h.server, "exit-failover")
+
+	for _, item := range []struct {
+		node       model.Node
+		publicHost string
+		portMin    int
+		portMax    int
+	}{
+		{node: entry, publicHost: "127.0.0.1", portMin: 12000, portMax: 12005},
+		{node: midA, publicHost: "127.0.0.1", portMin: 12010, portMax: 12015},
+		{node: midB, publicHost: "127.0.0.1", portMin: 12020, portMax: 12025},
+		{node: exit, publicHost: "127.0.0.1", portMin: 12030, portMax: 12035},
+	} {
+		item.node.PublicHost = item.publicHost
+		item.node.PortMin = item.portMin
+		item.node.PortMax = item.portMax
+		if err := h.store.UpdateNode(context.Background(), item.node); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	entryCancel := startNode(t, h.url, entry.ID, entryToken, pub, t.TempDir())
+	midBCancel := startNode(t, h.url, midB.ID, midBToken, pub, t.TempDir())
+	exitCancel := startNode(t, h.url, exit.ID, exitToken, pub, t.TempDir())
+	defer entryCancel()
+	defer midBCancel()
+	defer exitCancel()
+
+	waitForNodeOnline(t, h.store, entry.ID)
+	waitForNodeOnline(t, h.store, midB.ID)
+	waitForNodeOnline(t, h.store, exit.ID)
+
+	targetAddr, closeTarget := tcpEchoServer(t)
+	defer closeTarget()
+
+	tunnel := upsertTunnel(t, h.server, tunnelRequest{
+		ID:        "tun_failover",
+		Name:      "failover",
+		Type:      model.TunnelChain,
+		Transport: model.TunnelTransportDirect,
+		Enabled:   boolPtr(true),
+		Stages: []model.TunnelStage{
+			{
+				ID:       "stage_entry",
+				TunnelID: "tun_failover",
+				Index:    0,
+				Role:     model.TunnelStageEntry,
+				Strategy: "single",
+				Nodes: []model.TunnelStageNode{
+					{ID: "stage_entry_node", TunnelID: "tun_failover", StageID: "stage_entry", NodeID: entry.ID, Weight: 1},
+				},
+			},
+			{
+				ID:       "stage_mid",
+				TunnelID: "tun_failover",
+				Index:    1,
+				Role:     model.TunnelStageMiddle,
+				Strategy: "failover",
+				Nodes: []model.TunnelStageNode{
+					{ID: "stage_mid_a", TunnelID: "tun_failover", StageID: "stage_mid", NodeID: midA.ID, Weight: 1},
+					{ID: "stage_mid_b", TunnelID: "tun_failover", StageID: "stage_mid", NodeID: midB.ID, Weight: 1},
+				},
+			},
+			{
+				ID:       "stage_exit",
+				TunnelID: "tun_failover",
+				Index:    2,
+				Role:     model.TunnelStageExit,
+				Strategy: "single",
+				Nodes: []model.TunnelStageNode{
+					{ID: "stage_exit_node", TunnelID: "tun_failover", StageID: "stage_exit", NodeID: exit.ID, Weight: 1},
+				},
+			},
+		},
+	})
+
+	forward := upsertForward(t, h.server, forwardRequest{
+		ID:        "fwd_failover",
+		Name:      "failover",
+		TunnelID:  tunnel.ID,
+		Protocols: []model.ForwardProtocol{model.ForwardProtocolTCP},
+		Target:    targetAddr,
+		Enabled:   boolPtr(true),
+	})
+	if forward.Listen != ":12000" {
+		t.Fatalf("listen = %q, want :12000", forward.Listen)
+	}
+
+	assertTCPRoundTrip(t, "127.0.0.1"+forward.Listen, "nya-failover")
+}
+
 func TestControllerForwardTargetUpdateAppliesWithoutRestart(t *testing.T) {
 	h := newControllerHarness(t, "127.0.0.1:0")
 	pub := mustSigningKey(t, h.store)
@@ -473,6 +571,210 @@ func TestForwardRejectsDuplicatePortOnSameEntryNode(t *testing.T) {
 	}
 }
 
+func TestForwardAutoAssignsCommonPortAcrossMultipleEntryNodes(t *testing.T) {
+	h := newControllerHarness(t, "127.0.0.1:0")
+	entryA, _ := createNode(t, h.server, "entry-a")
+	entryB, _ := createNode(t, h.server, "entry-b")
+	entryA.PortMin = 12000
+	entryA.PortMax = 12001
+	entryB.PortMin = 12000
+	entryB.PortMax = 12001
+	if err := h.store.UpdateNode(context.Background(), entryA); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.UpdateNode(context.Background(), entryB); err != nil {
+		t.Fatal(err)
+	}
+
+	tunnel := upsertTunnel(t, h.server, tunnelRequest{
+		ID:        "tun_multi_entry",
+		Name:      "multi-entry",
+		Type:      model.TunnelDirect,
+		Transport: model.TunnelTransportDirect,
+		Enabled:   boolPtr(true),
+		Stages: []model.TunnelStage{
+			{
+				ID:       "stage_entry",
+				TunnelID: "tun_multi_entry",
+				Index:    0,
+				Role:     model.TunnelStageEntry,
+				Strategy: "failover",
+				Nodes: []model.TunnelStageNode{
+					{ID: "stage_node_a", TunnelID: "tun_multi_entry", StageID: "stage_entry", NodeID: entryA.ID, Weight: 1},
+					{ID: "stage_node_b", TunnelID: "tun_multi_entry", StageID: "stage_entry", NodeID: entryB.ID, Weight: 1},
+				},
+			},
+		},
+	})
+
+	forward := upsertForward(t, h.server, forwardRequest{
+		ID:        "fwd_multi_entry",
+		Name:      "multi-entry",
+		TunnelID:  tunnel.ID,
+		Protocols: []model.ForwardProtocol{model.ForwardProtocolTCP},
+		Target:    "127.0.0.1:443",
+		Enabled:   boolPtr(true),
+	})
+
+	if forward.Listen != ":12000" {
+		t.Fatalf("listen = %q, want :12000", forward.Listen)
+	}
+	allocations, err := h.store.ListPortAllocations(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(allocations) != 2 {
+		t.Fatalf("allocations = %d, want 2", len(allocations))
+	}
+	seen := map[string]bool{}
+	for _, allocation := range allocations {
+		if allocation.Port != 12000 {
+			t.Fatalf("allocation port = %d, want 12000", allocation.Port)
+		}
+		seen[allocation.NodeID] = true
+	}
+	if !seen[entryA.ID] || !seen[entryB.ID] {
+		t.Fatalf("allocations did not cover both entry nodes: %#v", allocations)
+	}
+}
+
+func TestCompileConfigScopesAndRedactsTunnelSecrets(t *testing.T) {
+	h := newControllerHarness(t, "127.0.0.1:0")
+
+	entry, _ := createNode(t, h.server, "entry-scope")
+	mid, _ := createNode(t, h.server, "mid-scope")
+	exit, _ := createNode(t, h.server, "exit-scope")
+
+	for _, node := range []model.Node{entry, mid, exit} {
+		node.PublicHost = node.Name + ".example.com"
+		node.PortMin = 12000
+		node.PortMax = 12010
+		if err := h.store.UpdateNode(context.Background(), node); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tunnel := upsertTunnel(t, h.server, tunnelRequest{
+		ID:        "tun_scope",
+		Name:      "scope",
+		Type:      model.TunnelChain,
+		Transport: model.TunnelTransportMTLS,
+		Enabled:   boolPtr(true),
+		Stages: []model.TunnelStage{
+			{
+				ID:       "stage_entry",
+				TunnelID: "tun_scope",
+				Index:    0,
+				Role:     model.TunnelStageEntry,
+				Strategy: "failover",
+				Nodes: []model.TunnelStageNode{
+					{ID: "stage_entry_node", TunnelID: "tun_scope", StageID: "stage_entry", NodeID: entry.ID, Weight: 1},
+				},
+			},
+			{
+				ID:       "stage_mid",
+				TunnelID: "tun_scope",
+				Index:    1,
+				Role:     model.TunnelStageMiddle,
+				Strategy: "round_robin",
+				Nodes: []model.TunnelStageNode{
+					{ID: "stage_mid_node", TunnelID: "tun_scope", StageID: "stage_mid", NodeID: mid.ID, Weight: 1},
+				},
+			},
+			{
+				ID:       "stage_exit",
+				TunnelID: "tun_scope",
+				Index:    2,
+				Role:     model.TunnelStageExit,
+				Strategy: "single",
+				Nodes: []model.TunnelStageNode{
+					{ID: "stage_exit_node", TunnelID: "tun_scope", StageID: "stage_exit", NodeID: exit.ID, Weight: 1},
+				},
+			},
+		},
+	})
+
+	entrySigned, err := h.server.compileConfig(context.Background(), entry.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entryTunnels := entrySigned.Config.Tunnels
+	if len(entryTunnels) != 1 {
+		t.Fatalf("entry config tunnels = %d, want 1", len(entryTunnels))
+	}
+	entryStage0 := mustRuntimeNodeSettings(t, entryTunnels[0], 0, entry.ID)
+	if len(entryStage0) != 0 {
+		t.Fatalf("entry listener settings = %#v, want empty", entryStage0)
+	}
+	entryStage1 := mustRuntimeNodeSettings(t, entryTunnels[0], 1, mid.ID)
+	if entryStage1["secret"] == "" || entryStage1["ca_cert"] == "" || entryStage1["client_cert"] == "" || entryStage1["client_key"] == "" {
+		t.Fatalf("entry dialer settings incomplete: %#v", entryStage1)
+	}
+	if entryStage1["server_cert"] != "" || entryStage1["server_key"] != "" {
+		t.Fatalf("entry dialer leaked listener material: %#v", entryStage1)
+	}
+	entryStage2 := mustRuntimeNodeSettings(t, entryTunnels[0], 2, exit.ID)
+	if len(entryStage2) != 0 {
+		t.Fatalf("entry config leaked exit settings: %#v", entryStage2)
+	}
+
+	midSigned, err := h.server.compileConfig(context.Background(), mid.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	midTunnels := midSigned.Config.Tunnels
+	if len(midTunnels) != 1 {
+		t.Fatalf("mid config tunnels = %d, want 1", len(midTunnels))
+	}
+	midStage1 := mustRuntimeNodeSettings(t, midTunnels[0], 1, mid.ID)
+	if midStage1["secret"] == "" || midStage1["server_cert"] == "" || midStage1["server_key"] == "" || midStage1["ca_cert"] == "" {
+		t.Fatalf("mid listener settings incomplete: %#v", midStage1)
+	}
+	if midStage1["client_cert"] != "" || midStage1["client_key"] != "" {
+		t.Fatalf("mid listener leaked client material: %#v", midStage1)
+	}
+	midStage2 := mustRuntimeNodeSettings(t, midTunnels[0], 2, exit.ID)
+	if midStage2["secret"] == "" || midStage2["ca_cert"] == "" || midStage2["client_cert"] == "" || midStage2["client_key"] == "" {
+		t.Fatalf("mid dialer settings incomplete: %#v", midStage2)
+	}
+	if midStage2["server_cert"] != "" || midStage2["server_key"] != "" {
+		t.Fatalf("mid dialer leaked listener material: %#v", midStage2)
+	}
+
+	exitSigned, err := h.server.compileConfig(context.Background(), exit.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exitTunnels := exitSigned.Config.Tunnels
+	if len(exitTunnels) != 1 {
+		t.Fatalf("exit config tunnels = %d, want 1", len(exitTunnels))
+	}
+	exitStage2 := mustRuntimeNodeSettings(t, exitTunnels[0], 2, exit.ID)
+	if exitStage2["secret"] == "" || exitStage2["server_cert"] == "" || exitStage2["server_key"] == "" || exitStage2["ca_cert"] == "" {
+		t.Fatalf("exit listener settings incomplete: %#v", exitStage2)
+	}
+	if exitStage2["client_cert"] != "" || exitStage2["client_key"] != "" {
+		t.Fatalf("exit listener leaked client material: %#v", exitStage2)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/tunnels/"+tunnel.ID, nil)
+	req.SetPathValue("id", tunnel.ID)
+	rec := httptest.NewRecorder()
+	h.server.handleGetTunnel(rec, req, auth.Session{UserID: 1, Username: "admin"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get tunnel failed: %d %s", rec.Code, rec.Body.String())
+	}
+	var redacted model.Tunnel
+	if err := json.Unmarshal(rec.Body.Bytes(), &redacted); err != nil {
+		t.Fatal(err)
+	}
+	for _, stage := range redacted.Stages {
+		for _, node := range stage.Nodes {
+			assertRedactedTunnelSettings(t, node.Settings)
+		}
+	}
+}
+
 func mustSigningKey(t *testing.T, st *store.Store) string {
 	t.Helper()
 	pub, _, err := st.GetSetting(context.Background(), signingPubSetting)
@@ -544,6 +846,31 @@ func upsertForward(t *testing.T, s *Server, reqBody forwardRequest) model.Forwar
 		t.Fatal(err)
 	}
 	return resp
+}
+
+func mustRuntimeNodeSettings(t *testing.T, tunnel model.TunnelRuntime, stageIndex int, nodeID string) map[string]string {
+	t.Helper()
+	for _, stage := range tunnel.Stages {
+		if stage.Index != stageIndex {
+			continue
+		}
+		for _, node := range stage.Nodes {
+			if node.NodeID == nodeID {
+				return node.Settings
+			}
+		}
+	}
+	t.Fatalf("node %s not found in tunnel %s stage %d", nodeID, tunnel.ID, stageIndex)
+	return nil
+}
+
+func assertRedactedTunnelSettings(t *testing.T, settings map[string]string) {
+	t.Helper()
+	for _, key := range []string{"secret", "server_key", "client_key", "server_cert", "client_cert", "ca_cert"} {
+		if settings[key] != "" {
+			t.Fatalf("setting %s leaked as %q", key, settings[key])
+		}
+	}
 }
 
 func directTunnelRequest(id, entryNode string) tunnelRequest {

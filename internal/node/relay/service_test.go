@@ -232,6 +232,61 @@ func TestTwoNodeUDPChain(t *testing.T) {
 	assertUDPRoundTrip(t, entryListen, "nya-udp-hop")
 }
 
+func TestApplyKeepsPreviousListenersWhenNewConfigFails(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	targetAddr, closeTarget := tcpEchoServer(t)
+	defer closeTarget()
+
+	listenAddr := freeTCPAddr(t)
+	service := New(testLogger(), "node_entry")
+	if err := service.Apply(ctx, model.RelayConfig{
+		NodeID:   "node_entry",
+		Revision: 1,
+		Tunnels:  []model.TunnelRuntime{directTunnel()},
+		Forwards: []model.ForwardRuntime{{
+			ID:        "fwd_1",
+			Name:      "single",
+			TunnelID:  "tun_direct",
+			Protocols: []model.ForwardProtocol{model.ForwardProtocolTCP},
+			Listen:    listenAddr,
+			Target:    targetAddr,
+			Enabled:   true,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	assertTCPRoundTrip(t, listenAddr, "before-bad-update")
+
+	err := service.Apply(ctx, model.RelayConfig{
+		NodeID:   "node_entry",
+		Revision: 2,
+		Tunnels:  []model.TunnelRuntime{directTunnel()},
+		Forwards: []model.ForwardRuntime{{
+			ID:        "fwd_1",
+			Name:      "single",
+			TunnelID:  "tun_direct",
+			Protocols: []model.ForwardProtocol{model.ForwardProtocolTCP},
+			Listen:    "invalid-listen-address",
+			Target:    targetAddr,
+			Enabled:   true,
+		}},
+	})
+	if err == nil {
+		t.Fatal("expected apply to fail for invalid listen address")
+	}
+
+	assertTCPRoundTrip(t, listenAddr, "after-bad-update")
+}
+
+func TestHostOnlyHandlesIPv6(t *testing.T) {
+	if got := hostOnly("[2001:db8::1]:443"); got != "2001:db8::1" {
+		t.Fatalf("hostOnly = %q, want IPv6 host", got)
+	}
+}
+
 func directTunnel() model.TunnelRuntime {
 	return model.TunnelRuntime{
 		ID:        "tun_direct",
