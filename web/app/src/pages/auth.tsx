@@ -3,6 +3,7 @@ import { useNavigate } from '@tanstack/react-router'
 import { ShieldCheck } from 'lucide-react'
 import { useState } from 'react'
 import { post } from '../api'
+import { Field } from '../components/ui'
 
 export function SetupPage() {
   const queryClient = useQueryClient()
@@ -34,18 +35,16 @@ export function SetupPage() {
       >
         <ShieldCheck size={32} />
         <h1>初始化控制器</h1>
-        <label>
-          <span>管理员账号</span>
+        <Field label="管理员账号">
           <input value={username} onChange={(event) => setUsername(event.target.value)} />
-        </label>
-        <label>
-          <span>管理员密码</span>
+        </Field>
+        <Field label="管理员密码">
           <input
             type="password"
             value={password}
             onChange={(event) => setPassword(event.target.value)}
           />
-        </label>
+        </Field>
         {error && <p className="error">{error}</p>}
         <button type="submit" disabled={setup.isPending}>
           完成初始化
@@ -86,26 +85,23 @@ export function LoginPage() {
       >
         <ShieldCheck size={32} />
         <h1>登录 NyaRelay</h1>
-        <label>
-          <span>账号</span>
+        <Field label="账号">
           <input value={username} onChange={(event) => setUsername(event.target.value)} />
-        </label>
-        <label>
-          <span>密码</span>
+        </Field>
+        <Field label="密码">
           <input
             type="password"
             value={password}
             onChange={(event) => setPassword(event.target.value)}
           />
-        </label>
-        <label>
-          <span>TOTP</span>
+        </Field>
+        <Field label="TOTP">
           <input
             value={totpCode}
             onChange={(event) => setTotpCode(event.target.value)}
             placeholder="启用后填写"
           />
-        </label>
+        </Field>
         {error && <p className="error">{error}</p>}
         <button type="submit" disabled={login.isPending}>
           登录

@@ -10,6 +10,7 @@ import {
   EmptyState,
   Field,
   FieldGrid,
+  FormActions,
   PageFrame,
   Panel,
   StatusPill,
@@ -131,7 +132,7 @@ export function NodeNewPage() {
               placeholder="hk-1"
             />
           </Field>
-          <Field label="标签 JSON" wide>
+          <Field label="标签 JSON" wide hint="只会保存字符串值，例如 {&quot;region&quot;:&quot;hk&quot;}。">
             <textarea
               className="text-area"
               value={form.labels}
@@ -139,7 +140,7 @@ export function NodeNewPage() {
               rows={6}
             />
           </Field>
-          <Field label="公开 IP / 域名">
+          <Field label="公开 IP / 域名" hint="留空时会优先使用节点上报的地址。">
             <input
               value={form.public_host}
               onChange={(event) => setForm((current) => ({ ...current, public_host: event.target.value }))}
@@ -166,9 +167,11 @@ export function NodeNewPage() {
           </Field>
         </FieldGrid>
         {error && <p className="error">{error}</p>}
-        <button type="submit" disabled={create.isPending}>
-          生成节点凭据
-        </button>
+        <FormActions>
+          <button type="submit" disabled={create.isPending}>
+            生成节点凭据
+          </button>
+        </FormActions>
       </form>
       <NodeLaunchInfo
         result={result}
@@ -290,7 +293,7 @@ export function NodeDetailPage({ nodeId }: { nodeId: string }) {
           <Panel>
             <h2>节点设置</h2>
             <form
-              className="form grid"
+              className="form"
               onSubmit={(event) => {
                 event.preventDefault()
                 setMessage('')
@@ -304,7 +307,7 @@ export function NodeDetailPage({ nodeId }: { nodeId: string }) {
                     onChange={(event) => setEditForm((current) => ({ ...current, name: event.target.value }))}
                   />
                 </Field>
-                <Field label="公开 IP / 域名">
+                <Field label="公开 IP / 域名" hint="留空时会使用节点上报的地址。">
                   <input
                     value={editForm.public_host}
                     onChange={(event) => setEditForm((current) => ({ ...current, public_host: event.target.value }))}
@@ -329,7 +332,7 @@ export function NodeDetailPage({ nodeId }: { nodeId: string }) {
                     onChange={(event) => setEditForm((current) => ({ ...current, port_max: event.target.value }))}
                   />
                 </Field>
-                <Field label="标签 JSON" wide>
+                <Field label="标签 JSON" wide hint="保存前会验证 JSON 对象格式。">
                   <textarea
                     className="text-area"
                     rows={6}
@@ -338,7 +341,9 @@ export function NodeDetailPage({ nodeId }: { nodeId: string }) {
                   />
                 </Field>
               </FieldGrid>
-              <button type="submit" disabled={update.isPending}>保存节点设置</button>
+              <FormActions>
+                <button type="submit" disabled={update.isPending}>保存节点设置</button>
+              </FormActions>
             </form>
             {message && <p>{message}</p>}
           </Panel>

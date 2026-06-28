@@ -1,4 +1,5 @@
 import type { ReactNode } from 'react'
+import { cloneElement, isValidElement, useId } from 'react'
 
 export function PageFrame({
   title,
@@ -70,28 +71,79 @@ export function StatusPill({ value }: { value: string }) {
 }
 
 export function FieldGrid({ children }: { children: ReactNode }) {
-  return <div className="form grid">{children}</div>
+  return <div className="field-grid">{children}</div>
 }
 
 export function Field({
   label,
   children,
   wide,
+  hint,
 }: {
   label: string
   children: ReactNode
   wide?: boolean
+  hint?: string
+}) {
+  const controlID = useId()
+  const hintID = useId()
+  const control = isValidElement<{ id?: string; 'aria-describedby'?: string }>(children)
+    ? cloneElement(children, {
+      id: children.props.id ?? controlID,
+      'aria-describedby': hint
+        ? [children.props['aria-describedby'], hintID].filter(Boolean).join(' ')
+        : children.props['aria-describedby'],
+    })
+    : children
+
+  return (
+    <div className={`field ${wide ? 'wide-field' : ''}`.trim()}>
+      <label htmlFor={isValidElement<{ id?: string }>(children) ? children.props.id ?? controlID : undefined}>
+        {label}
+      </label>
+      {control}
+      {hint && <small id={hintID}>{hint}</small>}
+    </div>
+  )
+}
+
+export function ToggleField({
+  label,
+  description,
+  checked,
+  onChange,
+  disabled,
+}: {
+  label: string
+  description?: string
+  checked: boolean
+  onChange: (checked: boolean) => void
+  disabled?: boolean
 }) {
   return (
-    <label className={wide ? 'wide-field' : undefined}>
-      <span>{label}</span>
-      {children}
+    <label className="toggle-field">
+      <input
+        type="checkbox"
+        aria-label={label}
+        checked={checked}
+        disabled={disabled}
+        onChange={(event) => onChange(event.target.checked)}
+      />
+      <span className="toggle-control" aria-hidden="true" />
+      <span className="toggle-copy">
+        <strong>{label}</strong>
+        {description && <small>{description}</small>}
+      </span>
     </label>
   )
 }
 
 export function InlineActions({ children }: { children: ReactNode }) {
   return <div className="actions">{children}</div>
+}
+
+export function FormActions({ children }: { children: ReactNode }) {
+  return <div className="form-actions">{children}</div>
 }
 
 export function DetailGrid({ items }: { items: Array<{ label: string; value: ReactNode }> }) {

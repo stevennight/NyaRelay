@@ -10,11 +10,13 @@ import {
   EmptyState,
   Field,
   FieldGrid,
+  FormActions,
   InlineActions,
   PageFrame,
   Panel,
   StatusPill,
   Table,
+  ToggleField,
   formatTime,
 } from '../components/ui'
 
@@ -305,7 +307,7 @@ function ForwardEditor({
 
   return (
     <form
-      className="form grid"
+      className="form"
       onSubmit={(event) => {
         event.preventDefault()
         setError('')
@@ -329,26 +331,31 @@ function ForwardEditor({
             {tunnels.map((tunnel) => <option key={tunnel.id} value={tunnel.id}>{tunnel.name}</option>)}
           </select>
         </Field>
-        <Field label="监听地址">
+        <Field label="监听地址" hint="留空自动分配，也可以填写 :8443。">
           <input
             value={form.listen}
             onChange={(event) => setForm((current) => ({ ...current, listen: event.target.value }))}
             placeholder="留空自动分配，例如 :8443"
           />
         </Field>
-        <Field label="目标地址">
+        <Field label="目标地址" hint="最终目标地址，例如 10.0.0.8:443。">
           <input
             value={form.target}
             onChange={(event) => setForm((current) => ({ ...current, target: event.target.value }))}
             placeholder="10.0.0.8:443"
           />
         </Field>
-        <Field label="启用">
-          <input type="checkbox" checked={form.enabled} onChange={(event) => setForm((current) => ({ ...current, enabled: event.target.checked }))} />
-        </Field>
+        <ToggleField
+          label="启用"
+          description="保存后入口节点会按配置监听。"
+          checked={form.enabled}
+          onChange={(checked) => setForm((current) => ({ ...current, enabled: checked }))}
+        />
       </FieldGrid>
       {error && <p className="error">{error}</p>}
-      <button type="submit" disabled={save.isPending}>保存转发</button>
+      <FormActions>
+        <button type="submit" disabled={save.isPending}>保存转发</button>
+      </FormActions>
     </form>
   )
 }

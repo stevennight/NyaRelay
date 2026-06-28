@@ -10,11 +10,13 @@ import {
   EmptyState,
   Field,
   FieldGrid,
+  FormActions,
   InlineActions,
   PageFrame,
   Panel,
   StatusPill,
   Table,
+  ToggleField,
   formatTime,
 } from '../components/ui'
 
@@ -313,7 +315,7 @@ function TunnelEditor({
 
   return (
     <form
-      className="form grid"
+      className="form"
       onSubmit={(event) => {
         event.preventDefault()
         setError('')
@@ -353,13 +355,16 @@ function TunnelEditor({
             <option value="ws-tls">WS over TLS</option>
           </select>
         </Field>
-        <Field label="启用">
-          <input type="checkbox" checked={form.enabled} onChange={(event) => setForm((current) => ({ ...current, enabled: event.target.checked }))} />
-        </Field>
+        <ToggleField
+          label="启用"
+          description="保存后立即推送到相关节点。"
+          checked={form.enabled}
+          onChange={(checked) => setForm((current) => ({ ...current, enabled: checked }))}
+        />
       </FieldGrid>
-      <Panel>
-        <div className="actions">
-          <h2 style={{ margin: 0 }}>Stages</h2>
+      <section className="form-section">
+        <div className="form-section-header">
+          <h2>Stages</h2>
           {form.type === 'chain' ? (
             <button
               type="button"
@@ -379,8 +384,11 @@ function TunnelEditor({
             const label = stageLabel(form.type, stageIndex, form.stages.length)
             return (
               <div key={stage.id || `${stageIndex}`} className="stage-editor">
-                <div className="actions" style={{ justifyContent: 'space-between' }}>
-                  <strong>{label}</strong>
+                <div className="stage-header">
+                  <div className="stage-title">
+                    <strong>{label}</strong>
+                    <small>{stageRoleFor(form.type, stageIndex, form.stages.length)} · {stage.nodes.length} 个候选</small>
+                  </div>
                   <InlineActions>
                     <button
                       type="button"
@@ -407,9 +415,9 @@ function TunnelEditor({
                         }))}
                       >
                         <Trash2 size={16} />
-                        删除层
-                      </button>
-                    ) : null}
+                      删除层
+                    </button>
+                  ) : null}
                   </InlineActions>
                 </div>
                 <FieldGrid>
@@ -435,7 +443,7 @@ function TunnelEditor({
                 </FieldGrid>
                 <div className="hop-list">
                   {stage.nodes.map((nodeForm, nodeIndex) => (
-                    <div className="hop" key={nodeForm.id || `${stageIndex}-${nodeIndex}`}>
+                    <div className="hop candidate-row" key={nodeForm.id || `${stageIndex}-${nodeIndex}`}>
                       <span>{nodeIndex + 1}</span>
                       <select
                         aria-label={`候选节点 ${stageIndex + 1}-${nodeIndex + 1}`}
@@ -461,30 +469,33 @@ function TunnelEditor({
                           </option>
                         ))}
                       </select>
-                      <input
-                        aria-label={`候选权重 ${stageIndex + 1}-${nodeIndex + 1}`}
-                        type="number"
-                        min={1}
-                        value={String(nodeForm.weight)}
-                        onChange={(event) => setForm((current) => ({
-                          ...current,
-                          stages: current.stages.map((item, idx) => (
-                            idx === stageIndex
-                              ? {
-                                ...item,
-                                nodes: item.nodes.map((candidate, cIndex) => (
-                                  cIndex === nodeIndex
-                                    ? {
-                                      ...candidate,
-                                      weight: Math.max(1, Number(event.target.value) || 1),
-                                    }
-                                    : candidate
-                                )),
-                              }
-                              : item
-                          )),
-                        }))}
-                      />
+                      <label className="candidate-weight">
+                        <span>权重</span>
+                        <input
+                          aria-label={`候选权重 ${stageIndex + 1}-${nodeIndex + 1}`}
+                          type="number"
+                          min={1}
+                          value={String(nodeForm.weight)}
+                          onChange={(event) => setForm((current) => ({
+                            ...current,
+                            stages: current.stages.map((item, idx) => (
+                              idx === stageIndex
+                                ? {
+                                  ...item,
+                                  nodes: item.nodes.map((candidate, cIndex) => (
+                                    cIndex === nodeIndex
+                                      ? {
+                                        ...candidate,
+                                        weight: Math.max(1, Number(event.target.value) || 1),
+                                      }
+                                      : candidate
+                                  )),
+                                }
+                                : item
+                            )),
+                          }))}
+                        />
+                      </label>
                       <button
                         type="button"
                         className="ghost danger"
@@ -511,9 +522,11 @@ function TunnelEditor({
             )
           })}
         </div>
-      </Panel>
+      </section>
       {error && <p className="error">{error}</p>}
-      <button type="submit" disabled={save.isPending}>保存隧道</button>
+      <FormActions>
+        <button type="submit" disabled={save.isPending}>保存隧道</button>
+      </FormActions>
     </form>
   )
 }

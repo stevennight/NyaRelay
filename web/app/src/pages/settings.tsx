@@ -3,7 +3,7 @@ import { Link, Navigate } from '@tanstack/react-router'
 import { useEffect, useState } from 'react'
 import { api, post } from '../api'
 import type { ControllerInfo } from '../types'
-import { Banner, DetailGrid, Field, FieldGrid, InlineActions, PageFrame, Panel, Subnav } from '../components/ui'
+import { Banner, DetailGrid, Field, FieldGrid, FormActions, InlineActions, PageFrame, Panel, Subnav } from '../components/ui'
 
 export function SettingsIndexPage() {
   return <Navigate to="/settings/security" replace />
@@ -127,7 +127,9 @@ export function ControllerSettingsPage() {
               />
             </Field>
           </FieldGrid>
-          <button type="submit" disabled={update.isPending}>保存公开地址</button>
+          <FormActions>
+            <button type="submit" disabled={update.isPending}>保存公开地址</button>
+          </FormActions>
         </form>
         {message && <p>{message}</p>}
       </Panel>
