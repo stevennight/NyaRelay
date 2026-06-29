@@ -37,6 +37,31 @@ func TestLoginLimitKeyPrefersForwardedAddress(t *testing.T) {
 	}
 }
 
+func TestValidateNodePortRangeAllowsPortsBelowDefault(t *testing.T) {
+	if err := validateNodePortRange(80, 443); err != nil {
+		t.Fatalf("expected low valid port range to pass: %v", err)
+	}
+}
+
+func TestValidateNodePortRangeRejectsInvalidPorts(t *testing.T) {
+	tests := []struct {
+		name    string
+		portMin int
+		portMax int
+	}{
+		{name: "below valid port range", portMin: -1, portMax: 443},
+		{name: "above valid port range", portMin: 10000, portMax: 65536},
+		{name: "reversed range", portMin: 443, portMax: 80},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := validateNodePortRange(tt.portMin, tt.portMax); err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
+}
+
 func TestSetSessionCookieUsesSecureWhenForwardedHTTPS(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "http://panel.example/api/auth/login", nil)
 	req.Header.Set("X-Forwarded-Proto", "https")

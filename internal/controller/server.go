@@ -2161,8 +2161,8 @@ func validateNodePortRange(portMin, portMax int) error {
 	if portMin == 0 || portMax == 0 {
 		return fmt.Errorf("port_min and port_max must be set together")
 	}
-	if portMin < 10000 || portMax > 65535 {
-		return fmt.Errorf("port range must be within 10000-65535")
+	if portMin < 1 || portMax > 65535 {
+		return fmt.Errorf("port range must be within 1-65535")
 	}
 	if portMin > portMax {
 		return fmt.Errorf("port_min must be less than or equal to port_max")

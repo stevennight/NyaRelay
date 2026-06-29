@@ -360,7 +360,7 @@ function NodeFormFields({
       <Field label="可用端口起始">
         <input
           type="number"
-          min={10000}
+          min={1}
           max={65535}
           value={form.port_min}
           onChange={(event) => onChange({ ...form, port_min: event.target.value })}
@@ -369,7 +369,7 @@ function NodeFormFields({
       <Field label="可用端口结束">
         <input
           type="number"
-          min={10000}
+          min={1}
           max={65535}
           value={form.port_max}
           onChange={(event) => onChange({ ...form, port_max: event.target.value })}

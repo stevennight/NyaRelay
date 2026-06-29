@@ -108,14 +108,61 @@ describe('node pages', () => {
     expect(createCall).toBeDefined()
     expect(JSON.parse(String(createCall?.[1]?.body))).toEqual({
       name: 'hk-2',
-        labels: {
-          region: 'hk',
-          tier: 'premium',
-        },
-        public_host: '',
-        port_min: 10000,
-        port_max: 65535,
-      })
+      labels: {
+        region: 'hk',
+        tier: 'premium',
+      },
+      public_host: '',
+      port_min: 10000,
+      port_max: 65535,
+    })
+  })
+
+  it('allows node port ranges below the default range', async () => {
+    const fetchMock = installFetch([
+      {
+        path: '/api/nodes',
+        method: 'POST',
+        response: jsonResponse({
+          node: {
+            ...node,
+            id: 'node-2',
+            name: 'edge-80',
+            port_min: 80,
+            port_max: 443,
+          },
+          token: 'node-token-123',
+          script_url: 'https://relay.example.com/install.sh',
+          binary_url: 'https://relay.example.com/downloads/nyarelay-node',
+          command: 'curl -fsSL https://relay.example.com/install.sh | sudo sh -s -- --controller https://relay.example.com --id node-2 --token node-token-123 --signing-key pub-key',
+        }),
+      },
+      {
+        path: '/api/nodes',
+        method: 'GET',
+        response: jsonResponse([]),
+      },
+    ])
+
+    renderWithClient(<NodeNewPage />)
+
+    expect(await screen.findByRole('dialog', { name: '添加节点' })).toBeInTheDocument()
+    expect(screen.getByLabelText('可用端口起始')).toHaveAttribute('min', '1')
+    expect(screen.getByLabelText('可用端口结束')).toHaveAttribute('min', '1')
+    fireEvent.change(screen.getByLabelText('节点名称'), { target: { value: 'edge-80' } })
+    fireEvent.change(screen.getByLabelText('可用端口起始'), { target: { value: '80' } })
+    fireEvent.change(screen.getByLabelText('可用端口结束'), { target: { value: '443' } })
+    fireEvent.click(screen.getByRole('button', { name: '生成节点凭据' }))
+
+    expect(await screen.findByText('节点安装命令')).toBeInTheDocument()
+
+    const createCall = fetchMock.mock.calls.find(([path, init]) => path === '/api/nodes' && init?.method === 'POST')
+    expect(createCall).toBeDefined()
+    expect(JSON.parse(String(createCall?.[1]?.body))).toMatchObject({
+      name: 'edge-80',
+      port_min: 80,
+      port_max: 443,
+    })
   })
 
   it('renders node details, shows install command and revokes the node', async () => {
