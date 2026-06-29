@@ -1,7 +1,6 @@
 services:
   controller:
-    build:
-      context: ../..
+    image: "${NYARELAY_IMAGE:?set in deploy/docker/.env}:${NYARELAY_VERSION:?set in deploy/docker/.env}"
     restart: unless-stopped
     environment:
       NYARELAY_LISTEN: ${NYARELAY_LISTEN:-:8080}

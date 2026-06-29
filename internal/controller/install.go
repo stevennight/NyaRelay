@@ -87,7 +87,20 @@ command -v systemctl >/dev/null 2>&1 || { echo "systemd is required" >&2; exit 1
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
-binary_url="${controller%/}/downloads/nyarelay-node"
+os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+case "$os" in
+	linux) os="linux" ;;
+	*) echo "unsupported operating system: $os" >&2; exit 1 ;;
+esac
+
+arch="$(uname -m)"
+case "$arch" in
+	x86_64|amd64) arch="amd64" ;;
+	aarch64|arm64) arch="arm64" ;;
+	*) echo "unsupported architecture: $arch" >&2; exit 1 ;;
+esac
+
+binary_url="${controller%/}/downloads/nyarelay-node?os=${os}&arch=${arch}"
 curl -fsSL "$binary_url" -o "$tmpdir/nyarelay-node"
 install -m 0755 "$tmpdir/nyarelay-node" /usr/local/bin/nyarelay-node
 

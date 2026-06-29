@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -2044,7 +2045,11 @@ func closeWebSocket(conn *websocket.Conn, code websocket.StatusCode, reason stri
 }
 
 func (s *Server) handleDownloadNodeBinary(w http.ResponseWriter, r *http.Request) {
-	path := s.cfg.NodeBinaryPath
+	path, filename, err := s.nodeBinaryPathForRequest(r)
+	if err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
 	if path == "" {
 		writeError(w, errors.New("node binary path is not configured"), http.StatusInternalServerError)
 		return
@@ -2054,8 +2059,40 @@ func (s *Server) handleDownloadNodeBinary(w http.ResponseWriter, r *http.Request
 		return
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Disposition", `attachment; filename="nyarelay-node"`)
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
 	http.ServeFile(w, r, path)
+}
+
+func (s *Server) nodeBinaryPathForRequest(r *http.Request) (string, string, error) {
+	targetOS := r.URL.Query().Get("os")
+	targetArch := r.URL.Query().Get("arch")
+	if targetOS == "" && targetArch == "" {
+		return s.cfg.NodeBinaryPath, "nyarelay-node", nil
+	}
+	targetOS, targetArch, err := normalizeNodeBinaryTarget(targetOS, targetArch)
+	if err != nil {
+		return "", "", err
+	}
+	filename := fmt.Sprintf("nyarelay-node-%s-%s", targetOS, targetArch)
+	return filepath.Join(s.cfg.NodeBinaryDir, filename), filename, nil
+}
+
+func normalizeNodeBinaryTarget(targetOS, targetArch string) (string, string, error) {
+	switch strings.ToLower(strings.TrimSpace(targetOS)) {
+	case "linux":
+		targetOS = "linux"
+	default:
+		return "", "", fmt.Errorf("unsupported node binary operating system: %s", targetOS)
+	}
+	switch strings.ToLower(strings.TrimSpace(targetArch)) {
+	case "amd64", "x86_64":
+		targetArch = "amd64"
+	case "arm64", "aarch64":
+		targetArch = "arm64"
+	default:
+		return "", "", fmt.Errorf("unsupported node binary architecture: %s", targetArch)
+	}
+	return targetOS, targetArch, nil
 }
 
 func controllerBaseURL(configured string, r *http.Request) string {

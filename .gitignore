@@ -11,3 +11,5 @@ node_modules/
 *.db-shm
 *.db-wal
 deploy/docker/.env
+
+.idea

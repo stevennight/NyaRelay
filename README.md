@@ -63,23 +63,44 @@ The node caches the last valid signed configuration under its data directory. Ex
 
 ## Deployment
 
-Controller:
+Recommended controller deployment uses the versioned Docker image published by GitHub Actions.
 
 ```bash
+git clone https://github.com/<owner>/NyaRelay.git
+cd NyaRelay
 cp deploy/docker/.env.example deploy/docker/.env
-docker compose --env-file deploy/docker/.env -f deploy/docker/docker-compose.yml up -d --build
 ```
 
-`deploy/docker/.env` stays local; the repository keeps only the example file.
+Edit `deploy/docker/.env` on each server:
 
-Node:
+```dotenv
+NYARELAY_IMAGE=ghcr.io/<owner>/nyarelay
+NYARELAY_VERSION=v0.1.0
+NYARELAY_PUBLIC_URL=https://relay.example.com
+NYARELAY_BIND_ADDR=127.0.0.1
+NYARELAY_HOST_PORT=8080
+```
+
+Run or update the controller:
 
 ```bash
-install -m 755 nyarelay-node /usr/local/bin/nyarelay-node
-install -d -m 700 /etc/nyarelay /var/lib/nyarelay
-cp deploy/systemd/node.env.example /etc/nyarelay/node.env
-systemctl enable --now nyarelay-node
+docker compose --env-file deploy/docker/.env -f deploy/docker/docker-compose.yml pull
+docker compose --env-file deploy/docker/.env -f deploy/docker/docker-compose.yml up -d
 ```
+
+If the GHCR package is private, run `docker login ghcr.io` on the server first with a token that can read packages.
+
+`deploy/docker/.env` stays local; the repository keeps only `deploy/docker/.env.example`. Server-specific values such as public URL, bind address, host port, image name, and version belong in `.env`, not in the committed compose file.
+
+For local source builds, add the build override:
+
+```bash
+docker compose --env-file deploy/docker/.env -f deploy/docker/docker-compose.yml -f deploy/docker/docker-compose.build.yml up -d --build
+```
+
+Release a version by pushing a tag such as `v0.1.0`. The release workflow publishes `ghcr.io/<owner>/nyarelay:v0.1.0` and Linux node binaries for amd64 and arm64. Deploying a version is just changing `NYARELAY_VERSION` in the server `.env` and running the compose commands above.
+
+Node installation is one command from the panel. Create a node, copy the generated install command, and run it on the node machine as a sudo-capable user. The script downloads itself from the controller, detects the node machine architecture, downloads the matching `nyarelay-node` binary from `/downloads/nyarelay-node`, writes `/etc/nyarelay/node.env`, installs the systemd unit, and starts `nyarelay-node`. You do not need to manually download or copy the node binary.
 
 ## Database Choice
 

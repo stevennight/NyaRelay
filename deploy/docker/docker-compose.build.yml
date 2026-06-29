@@ -1,0 +1,5 @@
+services:
+  controller:
+    build:
+      context: ../..
+    image: "${NYARELAY_IMAGE:-nyarelay}:${NYARELAY_VERSION:-dev}"

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -52,6 +53,61 @@ func TestSetSessionCookieUsesSecureWhenForwardedHTTPS(t *testing.T) {
 	}
 	if !cookies[0].Secure {
 		t.Fatal("session cookie should be secure for https requests")
+	}
+}
+
+func TestNormalizeNodeBinaryTarget(t *testing.T) {
+	tests := []struct {
+		name       string
+		targetOS   string
+		targetArch string
+		wantOS     string
+		wantArch   string
+		wantErr    bool
+	}{
+		{name: "linux amd64", targetOS: "linux", targetArch: "amd64", wantOS: "linux", wantArch: "amd64"},
+		{name: "linux x86_64", targetOS: "linux", targetArch: "x86_64", wantOS: "linux", wantArch: "amd64"},
+		{name: "linux arm64", targetOS: "linux", targetArch: "arm64", wantOS: "linux", wantArch: "arm64"},
+		{name: "linux aarch64", targetOS: "linux", targetArch: "aarch64", wantOS: "linux", wantArch: "arm64"},
+		{name: "unsupported os", targetOS: "darwin", targetArch: "arm64", wantErr: true},
+		{name: "unsupported arch", targetOS: "linux", targetArch: "armv7l", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotOS, gotArch, err := normalizeNodeBinaryTarget(tt.targetOS, tt.targetArch)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gotOS != tt.wantOS || gotArch != tt.wantArch {
+				t.Fatalf("target = %s/%s, want %s/%s", gotOS, gotArch, tt.wantOS, tt.wantArch)
+			}
+		})
+	}
+}
+
+func TestNodeBinaryPathForRequestUsesPlatformSpecificBinary(t *testing.T) {
+	dir := t.TempDir()
+	srv := &Server{cfg: Config{
+		NodeBinaryPath: filepath.Join(dir, "nyarelay-node"),
+		NodeBinaryDir:  dir,
+	}}
+	req := httptest.NewRequest(http.MethodGet, "/downloads/nyarelay-node?os=linux&arch=aarch64", nil)
+
+	path, filename, err := srv.nodeBinaryPathForRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filename != "nyarelay-node-linux-arm64" {
+		t.Fatalf("filename = %q", filename)
+	}
+	if path != filepath.Join(dir, "nyarelay-node-linux-arm64") {
+		t.Fatalf("path = %q", path)
 	}
 }
 
