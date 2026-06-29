@@ -2069,6 +2069,14 @@ func (s *Server) handleDownloadNodeBinary(w http.ResponseWriter, r *http.Request
 }
 
 func serveGzippedFile(w http.ResponseWriter, r *http.Request, path, filename string) {
+	if gzPath := path + ".gz"; fileExists(gzPath) {
+		w.Header().Set("Content-Type", "application/gzip")
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.gz"`, filename))
+		w.Header().Set("Cache-Control", "no-store")
+		http.ServeFile(w, r, gzPath)
+		return
+	}
+
 	file, err := os.Open(path)
 	if err != nil {
 		writeError(w, errors.New("node binary not found"), http.StatusNotFound)
@@ -2084,6 +2092,11 @@ func serveGzippedFile(w http.ResponseWriter, r *http.Request, path, filename str
 	if _, err := file.WriteTo(gz); err != nil {
 		slog.WarnContext(r.Context(), "failed to stream gzipped node binary", "err", err)
 	}
+}
+
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
 }
 
 func (s *Server) nodeBinaryPathForRequest(r *http.Request) (string, string, error) {

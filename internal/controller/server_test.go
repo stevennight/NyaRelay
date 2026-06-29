@@ -150,6 +150,60 @@ func TestDownloadNodeBinaryCanStreamGzip(t *testing.T) {
 	}
 }
 
+func TestDownloadNodeBinaryPrefersPrecompressedGzip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nyarelay-node-linux-amd64")
+	if err := os.WriteFile(path, []byte("raw-node-binary"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gzPath := path + ".gz"
+	gzFile, err := os.Create(gzPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gzWriter := gzip.NewWriter(gzFile)
+	if _, err := gzWriter.Write([]byte("precompressed-node-binary")); err != nil {
+		t.Fatal(err)
+	}
+	if err := gzWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gzFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	gzInfo, err := os.Stat(gzPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{cfg: Config{
+		NodeBinaryPath: filepath.Join(dir, "nyarelay-node"),
+		NodeBinaryDir:  dir,
+	}}
+	req := httptest.NewRequest(http.MethodGet, "/downloads/nyarelay-node?os=linux&arch=amd64&compress=gzip", nil)
+	rec := httptest.NewRecorder()
+
+	srv.handleDownloadNodeBinary(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("download failed: %d %s", rec.Code, rec.Body.String())
+	}
+	if int64(rec.Body.Len()) != gzInfo.Size() {
+		t.Fatalf("response size = %d, want precompressed size %d", rec.Body.Len(), gzInfo.Size())
+	}
+	reader, err := gzip.NewReader(rec.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = reader.Close() }()
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "precompressed-node-binary" {
+		t.Fatalf("body = %q, want precompressed content", body)
+	}
+}
+
 func TestFirstHostHandlesIPv6(t *testing.T) {
 	if got := firstHost("[2001:db8::1]:443"); got != "2001:db8::1" {
 		t.Fatalf("firstHost = %q, want IPv6 host", got)

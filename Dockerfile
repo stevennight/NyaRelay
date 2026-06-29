@@ -15,6 +15,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" go build -buildvcs=false -o /out/nyarelay-controller ./cmd/controller
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false -o /out/nodes/nyarelay-node-linux-amd64 ./cmd/node
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -buildvcs=false -o /out/nodes/nyarelay-node-linux-arm64 ./cmd/node
+RUN gzip -k -9 /out/nodes/nyarelay-node-linux-amd64 /out/nodes/nyarelay-node-linux-arm64
 RUN cp "/out/nodes/nyarelay-node-${TARGETOS}-${TARGETARCH}" /out/nyarelay-node
 
 FROM alpine:3.22

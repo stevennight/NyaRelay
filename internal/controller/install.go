@@ -85,6 +85,11 @@ command -v curl >/dev/null 2>&1 || { echo "curl is required" >&2; exit 1; }
 command -v gzip >/dev/null 2>&1 || { echo "gzip is required" >&2; exit 1; }
 command -v systemctl >/dev/null 2>&1 || { echo "systemd is required" >&2; exit 1; }
 
+curl_progress=""
+if curl --progress-meter --version >/dev/null 2>&1; then
+	curl_progress="--progress-meter"
+fi
+
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
@@ -102,11 +107,14 @@ case "$arch" in
 esac
 
 binary_url="${controller%/}/downloads/nyarelay-node?os=${os}&arch=${arch}&compress=gzip"
-echo "downloading nyarelay-node for ${os}/${arch}"
-curl -fL --progress-bar --retry 3 "$binary_url" -o "$tmpdir/nyarelay-node.gz"
+echo "[1/5] Downloading nyarelay-node for ${os}/${arch}"
+curl -fL $curl_progress --retry 3 --retry-delay 2 "$binary_url" -o "$tmpdir/nyarelay-node.gz"
+echo "[2/5] Decompressing nyarelay-node"
 gzip -dc "$tmpdir/nyarelay-node.gz" > "$tmpdir/nyarelay-node"
+echo "[3/5] Installing nyarelay-node"
 install -m 0755 "$tmpdir/nyarelay-node" /usr/local/bin/nyarelay-node
 
+echo "[4/5] Writing node configuration"
 install -d -m 0755 /etc/nyarelay
 install -d -m 0755 /var/lib/nyarelay
 
@@ -120,6 +128,7 @@ NYARELAY_LOG_LEVEL=info
 EOF
 chmod 600 /etc/nyarelay/node.env
 
+echo "[5/5] Installing and starting systemd service"
 cat > /etc/systemd/system/nyarelay-node.service <<'EOF'
 [Unit]
 Description=NyaRelay node
