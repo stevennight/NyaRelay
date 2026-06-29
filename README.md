@@ -66,8 +66,11 @@ The node caches the last valid signed configuration under its data directory. Ex
 Controller:
 
 ```bash
-docker compose -f deploy/docker/docker-compose.yml up -d --build
+cp deploy/docker/.env.example deploy/docker/.env
+docker compose --env-file deploy/docker/.env -f deploy/docker/docker-compose.yml up -d --build
 ```
+
+`deploy/docker/.env` stays local; the repository keeps only the example file.
 
 Node:
 
