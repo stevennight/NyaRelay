@@ -1,9 +1,12 @@
 package controller
 
 import (
+	"compress/gzip"
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -108,6 +111,42 @@ func TestNodeBinaryPathForRequestUsesPlatformSpecificBinary(t *testing.T) {
 	}
 	if path != filepath.Join(dir, "nyarelay-node-linux-arm64") {
 		t.Fatalf("path = %q", path)
+	}
+}
+
+func TestDownloadNodeBinaryCanStreamGzip(t *testing.T) {
+	dir := t.TempDir()
+	content := []byte("nyarelay-node-binary")
+	path := filepath.Join(dir, "nyarelay-node-linux-amd64")
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{cfg: Config{
+		NodeBinaryPath: filepath.Join(dir, "nyarelay-node"),
+		NodeBinaryDir:  dir,
+	}}
+	req := httptest.NewRequest(http.MethodGet, "/downloads/nyarelay-node?os=linux&arch=amd64&compress=gzip", nil)
+	rec := httptest.NewRecorder()
+
+	srv.handleDownloadNodeBinary(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("download failed: %d %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/gzip" {
+		t.Fatalf("content type = %q", got)
+	}
+	reader, err := gzip.NewReader(rec.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = reader.Close() }()
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != string(content) {
+		t.Fatalf("body = %q, want %q", body, content)
 	}
 }
 

@@ -82,6 +82,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 command -v curl >/dev/null 2>&1 || { echo "curl is required" >&2; exit 1; }
+command -v gzip >/dev/null 2>&1 || { echo "gzip is required" >&2; exit 1; }
 command -v systemctl >/dev/null 2>&1 || { echo "systemd is required" >&2; exit 1; }
 
 tmpdir="$(mktemp -d)"
@@ -100,8 +101,10 @@ case "$arch" in
 	*) echo "unsupported architecture: $arch" >&2; exit 1 ;;
 esac
 
-binary_url="${controller%/}/downloads/nyarelay-node?os=${os}&arch=${arch}"
-curl -fsSL "$binary_url" -o "$tmpdir/nyarelay-node"
+binary_url="${controller%/}/downloads/nyarelay-node?os=${os}&arch=${arch}&compress=gzip"
+echo "downloading nyarelay-node for ${os}/${arch}"
+curl -fL --progress-bar --retry 3 "$binary_url" -o "$tmpdir/nyarelay-node.gz"
+gzip -dc "$tmpdir/nyarelay-node.gz" > "$tmpdir/nyarelay-node"
 install -m 0755 "$tmpdir/nyarelay-node" /usr/local/bin/nyarelay-node
 
 install -d -m 0755 /etc/nyarelay

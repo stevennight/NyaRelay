@@ -100,7 +100,7 @@ docker compose --env-file deploy/docker/.env -f deploy/docker/docker-compose.yml
 
 Release a version by pushing a tag such as `v0.1.0`. The release workflow publishes `ghcr.io/<owner>/nyarelay:v0.1.0` and Linux node binaries for amd64 and arm64. Deploying a version is just changing `NYARELAY_VERSION` in the server `.env` and running the compose commands above.
 
-Node installation is one command from the panel. Create a node, copy the generated install command, and run it on the node machine as a sudo-capable user. The script downloads itself from the controller, detects the node machine architecture, downloads the matching `nyarelay-node` binary from `/downloads/nyarelay-node`, writes `/etc/nyarelay/node.env`, installs the systemd unit, and starts `nyarelay-node`. You do not need to manually download or copy the node binary.
+Node installation is one command from the panel. Create a node, copy the generated install command, and run it on the node machine as a sudo-capable user. The script downloads itself from the controller, detects the node machine architecture, downloads the matching `nyarelay-node` binary from `/downloads/nyarelay-node` with gzip compression and a visible progress bar, writes `/etc/nyarelay/node.env`, installs the systemd unit, and starts `nyarelay-node`. You do not need to manually download or copy the node binary.
 
 ## Database Choice
 
