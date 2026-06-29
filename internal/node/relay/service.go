@@ -255,7 +255,7 @@ func (s *Service) acceptLoop(ctx context.Context, ln net.Listener, handle func(n
 }
 
 func (s *Service) handleTCPForward(ctx context.Context, forward model.ForwardRuntime, tunnel model.TunnelRuntime, inbound net.Conn) {
-	defer inbound.Close()
+	defer s.closeConn(inbound, "tcp forward inbound")
 	counter := s.forwards.Get("forward:" + forward.ID)
 	counter.AddConnection()
 	outbound, statID, err := s.dialForwardNext(ctx, tunnel, forward, 0, "tcp", "")
@@ -263,12 +263,12 @@ func (s *Service) handleTCPForward(ctx context.Context, forward model.ForwardRun
 		s.log.Warn("forward dial failed", "forward", forward.Name, "error", err)
 		return
 	}
-	defer outbound.Close()
+	defer s.closeConn(outbound, "tcp forward outbound")
 	s.pipe(inbound, outbound, counter, s.tunnels.Get(statID))
 }
 
 func (s *Service) handleStageConn(ctx context.Context, tunnel model.TunnelRuntime, stage model.TunnelRuntimeStage, node model.TunnelRuntimeNode, inbound net.Conn) {
-	defer inbound.Close()
+	defer s.closeConn(inbound, "stage inbound")
 	hello, err := protocol.ReadHello(inbound)
 	if err != nil {
 		s.log.Warn("invalid relay hello", "tunnel", tunnel.Name, "stage", stage.Index, "error", err)
@@ -295,7 +295,7 @@ func (s *Service) handleStageConn(ctx context.Context, tunnel model.TunnelRuntim
 			s.log.Warn("target dial failed", "forward", forward.Name, "error", err)
 			return
 		}
-		defer outbound.Close()
+		defer s.closeConn(outbound, "stage target outbound")
 		s.pipe(inbound, outbound, counter, s.tunnels.Get("target:"+forward.ID))
 		return
 	}
@@ -308,7 +308,7 @@ func (s *Service) handleStageConn(ctx context.Context, tunnel model.TunnelRuntim
 		s.log.Warn("next stage dial failed", "forward", forward.Name, "error", err)
 		return
 	}
-	defer next.Close()
+	defer s.closeConn(next, "stage next outbound")
 	s.pipe(inbound, next, counter, s.tunnels.Get(statID))
 }
 
@@ -470,7 +470,9 @@ func (s *Service) dialStage(ctx context.Context, tunnel model.TunnelRuntime, nod
 		}
 		tlsConn := tls.Client(raw, clientTLS)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
-			_ = raw.Close()
+			if closeErr := tlsConn.Close(); closeErr != nil {
+				err = errors.Join(err, closeErr)
+			}
 			return nil, err
 		}
 		return tlsConn, nil
@@ -490,7 +492,9 @@ func (s *Service) dialStage(ctx context.Context, tunnel model.TunnelRuntime, nod
 		}
 		tlsConn := tls.Client(raw, clientTLS)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
-			_ = raw.Close()
+			if closeErr := tlsConn.Close(); closeErr != nil {
+				err = errors.Join(err, closeErr)
+			}
 			return nil, err
 		}
 		req := fmt.Sprintf("GET / HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: nyarelay\r\n\r\n", host)
@@ -550,6 +554,12 @@ func (s *Service) pipe(a, b net.Conn, forwardCounter *metrics.Counter, tunnelCou
 	<-done
 }
 
+func (s *Service) closeConn(conn net.Conn, name string) {
+	if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		s.log.Debug("connection close failed", "conn", name, "error", err)
+	}
+}
+
 func (s *Service) findTunnel(id string) (model.TunnelRuntime, bool) {
 	for _, tunnel := range s.config.Tunnels {
 		if tunnel.ID == id {
@@ -585,8 +595,8 @@ func stageNodeFor(stage model.TunnelRuntimeStage, nodeID string) (model.TunnelRu
 }
 
 func forwardSupports(forward model.ForwardRuntime, protocolValue model.ForwardProtocol) bool {
-	for _, protocol := range forward.Protocols {
-		if protocol == protocolValue {
+	for _, forwardProtocol := range forward.Protocols {
+		if forwardProtocol == protocolValue {
 			return true
 		}
 	}

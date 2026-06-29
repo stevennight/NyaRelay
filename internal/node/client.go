@@ -64,14 +64,17 @@ func (c *client) connectWS(ctx context.Context) (*websocket.Conn, error) {
 	hdr := http.Header{}
 	hdr.Set("X-NyaRelay-Node-ID", c.nodeID)
 	hdr.Set("X-NyaRelay-Node-Token", c.token)
-	conn, _, err := websocket.Dial(ctx, parsed.String(), &websocket.DialOptions{HTTPHeader: hdr})
+	conn, resp, err := websocket.Dial(ctx, parsed.String(), &websocket.DialOptions{HTTPHeader: hdr})
 	if err != nil {
+		if closeErr := closeResponseBody(resp); closeErr != nil {
+			return nil, fmt.Errorf("%w; close response body: %v", err, closeErr)
+		}
 		return nil, err
 	}
 	return conn, nil
 }
 
-func (c *client) doJSON(ctx context.Context, method, path string, body any, dest any) error {
+func (c *client) doJSON(ctx context.Context, method, path string, body any, dest any) (err error) {
 	var reqBody *bytes.Reader
 	if body == nil {
 		reqBody = bytes.NewReader(nil)
@@ -93,7 +96,11 @@ func (c *client) doJSON(ctx context.Context, method, path string, body any, dest
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if closeErr := resp.Body.Close(); err == nil {
+			err = closeErr
+		}
+	}()
 	if resp.StatusCode >= 300 {
 		var apiErr struct {
 			Error string `json:"error"`
@@ -108,6 +115,13 @@ func (c *client) doJSON(ctx context.Context, method, path string, body any, dest
 		return nil
 	}
 	return json.NewDecoder(resp.Body).Decode(dest)
+}
+
+func closeResponseBody(resp *http.Response) error {
+	if resp == nil || resp.Body == nil {
+		return nil
+	}
+	return resp.Body.Close()
 }
 
 func hostname() string {

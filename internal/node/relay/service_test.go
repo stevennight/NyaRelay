@@ -558,10 +558,10 @@ func tcpEchoServer(t *testing.T) (string, func()) {
 			if err != nil {
 				return
 			}
-			go func() {
-				defer conn.Close()
+			go func(conn net.Conn) {
+				defer closeTestConn(conn)
 				_, _ = io.Copy(conn, conn)
-			}()
+			}(conn)
 		}
 	}()
 	return ln.Addr().String(), func() {
@@ -653,7 +653,7 @@ func brokenUDPStageServer(t *testing.T, addr string) func() {
 				return
 			}
 			go func(conn net.Conn) {
-				defer conn.Close()
+				defer closeTestConn(conn)
 				_, _ = protocol.ReadHello(conn)
 			}(conn)
 		}
@@ -693,7 +693,7 @@ func assertTCPRoundTrip(t *testing.T, addr, payload string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer closeTestConn(conn)
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 	if _, err := conn.Write([]byte(payload)); err != nil {
 		t.Fatal(err)
@@ -740,6 +740,10 @@ func newUDPTestClient(t *testing.T, addr string) udpTestClient {
 
 func (c udpTestClient) close() {
 	_ = c.conn.Close()
+}
+
+func closeTestConn(conn net.Conn) {
+	_ = conn.Close()
 }
 
 func (c udpTestClient) roundTrip(t *testing.T, payload string) string {

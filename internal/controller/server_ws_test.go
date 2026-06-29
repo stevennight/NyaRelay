@@ -28,7 +28,7 @@ func TestNodeWebSocketReceivesConfigPush(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer closeTestStore(t, st)
 
 	s := &Server{
 		cfg: Config{
@@ -68,7 +68,7 @@ func TestNodeWebSocketReceivesConfigPush(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close(websocket.StatusNormalClosure, "done")
+	defer closeTestWebSocket(t, conn, websocket.StatusNormalClosure, "done")
 
 	hello := sharedprotocol.ControlMessage{
 		Type:    "hello",
@@ -133,7 +133,7 @@ func TestRevokedNodeCannotConnectWebSocket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer closeTestStore(t, st)
 
 	s := &Server{
 		cfg: Config{
@@ -172,5 +172,19 @@ func TestRevokedNodeCannotConnectWebSocket(t *testing.T) {
 	headers.Set("X-NyaRelay-Node-Token", "node-token")
 	if _, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{HTTPHeader: headers}); err == nil {
 		t.Fatal("expected revoked node websocket dial to fail")
+	}
+}
+
+func closeTestStore(t *testing.T, st *store.Store) {
+	t.Helper()
+	if err := st.Close(); err != nil {
+		t.Errorf("close store: %v", err)
+	}
+}
+
+func closeTestWebSocket(t *testing.T, conn *websocket.Conn, code websocket.StatusCode, reason string) {
+	t.Helper()
+	if err := conn.Close(code, reason); err != nil {
+		t.Errorf("close websocket: %v", err)
 	}
 }

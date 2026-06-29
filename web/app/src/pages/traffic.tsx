@@ -1,7 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { api } from '../api'
 import type { TrafficSummary } from '../types'
-import { Banner, EmptyState, PageFrame, Panel, Table, formatBytes, formatTime } from '../components/ui'
+import { Banner, EmptyState, PageFrame, Table, formatBytes, formatTime } from '../components/ui'
 
 export function TrafficPage() {
   const query = useQuery({

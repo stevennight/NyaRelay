@@ -116,13 +116,13 @@ func TestPrepareTunnelEntryAddressDefaultsToFirstEntryNode(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	clear := ""
+	emptyEntryAddress := ""
 	tunnel, _, err := srv.prepareTunnel(context.Background(), tunnelRequest{
 		ID:           "tun_entry_default",
 		Name:         "entry default",
 		Type:         model.TunnelDirect,
 		Transport:    model.TunnelTransportDirect,
-		EntryAddress: &clear,
+		EntryAddress: &emptyEntryAddress,
 		Stages: []model.TunnelStage{{
 			Nodes: []model.TunnelStageNode{
 				{NodeID: "entry-a"},

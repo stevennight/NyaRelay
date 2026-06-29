@@ -501,21 +501,22 @@ function renderLabels(labels?: Record<string, string>) {
 function parseLabels(raw: string) {
   const trimmed = raw.trim()
   if (!trimmed) return {}
+  let value: unknown
   try {
-    const value = JSON.parse(trimmed) as unknown
-    if (!value || typeof value !== 'object' || Array.isArray(value)) {
-      throw new Error('标签必须是对象')
-    }
-    const out: Record<string, string> = {}
-    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-      if (typeof entry === 'string') {
-        out[key] = entry
-      }
-    }
-    return out
-  } catch (err) {
-    throw new Error(err instanceof Error ? err.message : '标签 JSON 无效')
+    value = JSON.parse(trimmed) as unknown
+  } catch {
+    throw new Error('标签 JSON 无效')
   }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('标签必须是对象')
+  }
+  const out: Record<string, string> = {}
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof entry === 'string') {
+      out[key] = entry
+    }
+  }
+  return out
 }
 
 function nodePayload(form: NodeForm) {

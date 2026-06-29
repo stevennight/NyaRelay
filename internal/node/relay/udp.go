@@ -83,6 +83,9 @@ func (s *Service) forwardUDPOverTunnel(ctx context.Context, tunnel model.TunnelR
 		Payload:   payload,
 	}
 	response, statID, err := s.forwardUDPFrameWithRetry(ctx, tunnel, forward, 0, frame)
+	if err != nil {
+		return nil, statID, err
+	}
 	return response.Payload, statID, err
 }
 
@@ -224,7 +227,7 @@ func candidateNodeIDFromStatID(statID string) (string, bool) {
 	return nodeID, nodeID != ""
 }
 
-func udpRoundTrip(ctx context.Context, addr string, payload []byte) ([]byte, error) {
+func udpRoundTrip(ctx context.Context, addr string, payload []byte) (response []byte, err error) {
 	remote, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return nil, err
@@ -233,7 +236,11 @@ func udpRoundTrip(ctx context.Context, addr string, payload []byte) ([]byte, err
 	if err != nil {
 		return nil, err
 	}
-	defer out.Close()
+	defer func() {
+		if closeErr := out.Close(); err == nil {
+			err = closeErr
+		}
+	}()
 	deadline := time.Now().Add(10 * time.Second)
 	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
 		deadline = d

@@ -55,7 +55,7 @@ func Run(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer st.Close()
+	defer closeStore(st)
 
 	s := &Server{
 		cfg:      cfg,
@@ -298,13 +298,13 @@ func (s *Server) handleTOTPDisable(w http.ResponseWriter, r *http.Request, sessi
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
-func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, session auth.Session) {
+func (s *Server) handleLogout(w http.ResponseWriter, _ *http.Request, session auth.Session) {
 	s.sessions.Delete(session.ID)
 	http.SetCookie(w, &http.Cookie{Name: sessionCookieName, Value: "", Path: "/", MaxAge: -1})
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
-func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, session auth.Session) {
+func (s *Server) handleMe(w http.ResponseWriter, _ *http.Request, session auth.Session) {
 	writeJSON(w, map[string]any{
 		"user": map[string]any{
 			"id":       session.UserID,
@@ -313,7 +313,7 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, session auth.S
 	})
 }
 
-func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request, session auth.Session) {
+func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request, _ auth.Session) {
 	nodes, err := s.store.ListNodes(r.Context())
 	if err != nil {
 		writeError(w, err, http.StatusInternalServerError)
@@ -351,7 +351,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request, session
 	})
 }
 
-func (s *Server) handleControllerInfo(w http.ResponseWriter, r *http.Request, session auth.Session) {
+func (s *Server) handleControllerInfo(w http.ResponseWriter, r *http.Request, _ auth.Session) {
 	pub, _, err := s.store.GetSetting(r.Context(), signingPubSetting)
 	if err != nil {
 		writeError(w, err, http.StatusInternalServerError)
@@ -381,7 +381,7 @@ func (s *Server) handleUpdateControllerInfo(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, map[string]string{"public_url": value})
 }
 
-func (s *Server) handleListNodes(w http.ResponseWriter, r *http.Request, session auth.Session) {
+func (s *Server) handleListNodes(w http.ResponseWriter, r *http.Request, _ auth.Session) {
 	nodes, err := s.store.ListNodes(r.Context())
 	if err != nil {
 		writeError(w, err, http.StatusInternalServerError)
@@ -391,7 +391,7 @@ func (s *Server) handleListNodes(w http.ResponseWriter, r *http.Request, session
 	writeJSON(w, nodes)
 }
 
-func (s *Server) handleGetNode(w http.ResponseWriter, r *http.Request, session auth.Session) {
+func (s *Server) handleGetNode(w http.ResponseWriter, r *http.Request, _ auth.Session) {
 	node, err := s.store.GetNode(r.Context(), r.PathValue("id"))
 	if err != nil || node.Revoked {
 		writeError(w, errors.New("node not found"), http.StatusNotFound)
@@ -400,7 +400,7 @@ func (s *Server) handleGetNode(w http.ResponseWriter, r *http.Request, session a
 	writeJSON(w, node)
 }
 
-func (s *Server) handleGetNodeInstall(w http.ResponseWriter, r *http.Request, session auth.Session) {
+func (s *Server) handleGetNodeInstall(w http.ResponseWriter, r *http.Request, _ auth.Session) {
 	node, token, err := s.store.GetNodeWithToken(r.Context(), r.PathValue("id"))
 	if err != nil || node.Revoked {
 		writeError(w, errors.New("node not found"), http.StatusNotFound)
@@ -534,7 +534,7 @@ func (s *Server) handleRevokeNode(w http.ResponseWriter, r *http.Request, sessio
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
-func (s *Server) handleListTunnels(w http.ResponseWriter, r *http.Request, session auth.Session) {
+func (s *Server) handleListTunnels(w http.ResponseWriter, r *http.Request, _ auth.Session) {
 	tunnels, err := s.store.ListTunnels(r.Context())
 	if err != nil {
 		writeError(w, err, http.StatusInternalServerError)
@@ -546,7 +546,7 @@ func (s *Server) handleListTunnels(w http.ResponseWriter, r *http.Request, sessi
 	writeJSON(w, tunnels)
 }
 
-func (s *Server) handleGetTunnel(w http.ResponseWriter, r *http.Request, session auth.Session) {
+func (s *Server) handleGetTunnel(w http.ResponseWriter, r *http.Request, _ auth.Session) {
 	tunnel, err := s.store.GetTunnel(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeError(w, err, http.StatusNotFound)
@@ -626,7 +626,7 @@ func (s *Server) setTunnelEnabled(w http.ResponseWriter, r *http.Request, sessio
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
-func (s *Server) handleListForwards(w http.ResponseWriter, r *http.Request, session auth.Session) {
+func (s *Server) handleListForwards(w http.ResponseWriter, r *http.Request, _ auth.Session) {
 	forwards, err := s.store.ListForwards(r.Context())
 	if err != nil {
 		writeError(w, err, http.StatusInternalServerError)
@@ -635,7 +635,7 @@ func (s *Server) handleListForwards(w http.ResponseWriter, r *http.Request, sess
 	writeJSON(w, forwards)
 }
 
-func (s *Server) handleGetForward(w http.ResponseWriter, r *http.Request, session auth.Session) {
+func (s *Server) handleGetForward(w http.ResponseWriter, r *http.Request, _ auth.Session) {
 	forward, err := s.store.GetForward(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeError(w, err, http.StatusNotFound)
@@ -1284,11 +1284,11 @@ func tunnelEntryNodeIDs(tunnel model.Tunnel) ([]string, error) {
 }
 
 func tunnelEntryNodeID(tunnel model.Tunnel) (string, error) {
-	ids, err := tunnelEntryNodeIDs(tunnel)
+	entryNodeIDs, err := tunnelEntryNodeIDs(tunnel)
 	if err != nil {
 		return "", err
 	}
-	return ids[0], nil
+	return entryNodeIDs[0], nil
 }
 
 func defaultTunnelEntryAddress(node model.Node) string {
@@ -1311,92 +1311,21 @@ func usedPortSet(allocations []model.PortAllocation, excludedOwners map[string]b
 	return used
 }
 
-func allocateSharedProtocolPort(node model.Node, protocols []model.ForwardProtocol, used usedPorts) (int, error) {
-	min, max := normalizedPortRange(node)
-	for port := min; port <= max; port++ {
-		free := true
-		for _, protocol := range protocols {
-			if isPortUsed(used, node.ID, string(protocol), port) {
-				free = false
-				break
-			}
-		}
-		if !free {
-			continue
-		}
-		for _, protocol := range protocols {
-			markPortUsed(used, node.ID, string(protocol), port)
-		}
-		return port, nil
-	}
-	return 0, fmt.Errorf("no free forward port available on node %s", node.ID)
-}
-
-func allocateSharedProtocolPortAcrossNodes(nodes []model.Node, protocols []model.ForwardProtocol, used usedPorts) (int, error) {
-	if len(nodes) == 0 {
-		return 0, errors.New("no entry nodes available")
-	}
-	min, max := normalizedPortRange(nodes[0])
-	for _, node := range nodes[1:] {
-		nodeMin, nodeMax := normalizedPortRange(node)
-		if nodeMin > min {
-			min = nodeMin
-		}
-		if nodeMax < max {
-			max = nodeMax
-		}
-	}
-	for port := min; port <= max; port++ {
-		if !portAvailableAcrossNodes(nodes, protocols, port, used) {
-			continue
-		}
-		for _, node := range nodes {
-			for _, protocol := range protocols {
-				markPortUsed(used, node.ID, string(protocol), port)
-			}
-		}
-		return port, nil
-	}
-	return 0, errors.New("no common forward port available across entry nodes")
-}
-
-func ensurePortAvailableAcrossNodes(nodes []model.Node, protocols []model.ForwardProtocol, port int, used usedPorts) error {
-	if len(nodes) == 0 {
-		return errors.New("no entry nodes available")
-	}
-	for _, node := range nodes {
-		if err := ensurePortInRange(node, port); err != nil {
-			return err
-		}
-		for _, protocol := range protocols {
-			if isPortUsed(used, node.ID, string(protocol), port) {
-				return fmt.Errorf("listen port %d/%s is already in use on node %s", port, protocol, node.ID)
-			}
-		}
-	}
-	for _, node := range nodes {
-		for _, protocol := range protocols {
-			markPortUsed(used, node.ID, string(protocol), port)
-		}
-	}
-	return nil
-}
-
 func allocateSharedProtocolPortAcrossEntryCandidates(candidates []forwardEntryCandidate, used usedPorts) (int, error) {
 	if len(candidates) == 0 {
 		return 0, errors.New("no entry nodes available")
 	}
-	min, max := normalizedPortRange(candidates[0].Node)
+	portMin, portMax := normalizedPortRange(candidates[0].Node)
 	for _, candidate := range candidates[1:] {
 		nodeMin, nodeMax := normalizedPortRange(candidate.Node)
-		if nodeMin > min {
-			min = nodeMin
+		if nodeMin > portMin {
+			portMin = nodeMin
 		}
-		if nodeMax < max {
-			max = nodeMax
+		if nodeMax < portMax {
+			portMax = nodeMax
 		}
 	}
-	for port := min; port <= max; port++ {
+	for port := portMin; port <= portMax; port++ {
 		if !portAvailableAcrossEntryCandidates(candidates, port, used) {
 			continue
 		}
@@ -1446,23 +1375,9 @@ func portAvailableAcrossEntryCandidates(candidates []forwardEntryCandidate, port
 	return true
 }
 
-func portAvailableAcrossNodes(nodes []model.Node, protocols []model.ForwardProtocol, port int, used usedPorts) bool {
-	for _, node := range nodes {
-		if err := ensurePortInRange(node, port); err != nil {
-			return false
-		}
-		for _, protocol := range protocols {
-			if isPortUsed(used, node.ID, string(protocol), port) {
-				return false
-			}
-		}
-	}
-	return true
-}
-
 func allocatePort(node model.Node, protocol string, used usedPorts) (int, error) {
-	min, max := normalizedPortRange(node)
-	for port := min; port <= max; port++ {
+	portMin, portMax := normalizedPortRange(node)
+	for port := portMin; port <= portMax; port++ {
 		if isPortUsed(used, node.ID, protocol, port) {
 			continue
 		}
@@ -1473,20 +1388,20 @@ func allocatePort(node model.Node, protocol string, used usedPorts) (int, error)
 }
 
 func normalizedPortRange(node model.Node) (int, int) {
-	min, max := node.PortMin, node.PortMax
-	if min <= 0 {
-		min = 10000
+	portMin, portMax := node.PortMin, node.PortMax
+	if portMin <= 0 {
+		portMin = 10000
 	}
-	if max <= 0 {
-		max = 65535
+	if portMax <= 0 {
+		portMax = 65535
 	}
-	return min, max
+	return portMin, portMax
 }
 
 func ensurePortInRange(node model.Node, port int) error {
-	min, max := normalizedPortRange(node)
-	if port < min || port > max {
-		return fmt.Errorf("port %d is outside node %s range %d-%d", port, node.ID, min, max)
+	portMin, portMax := normalizedPortRange(node)
+	if port < portMin || port > portMax {
+		return fmt.Errorf("port %d is outside node %s range %d-%d", port, node.ID, portMin, portMax)
 	}
 	return nil
 }
@@ -1565,7 +1480,7 @@ func redactSettings(settings map[string]string) map[string]string {
 	return out
 }
 
-func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, session auth.Session) {
+func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, _ auth.Session) {
 	events, err := s.store.ListAudit(r.Context(), 100)
 	if err != nil {
 		writeError(w, err, http.StatusInternalServerError)
@@ -1574,7 +1489,7 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, session aut
 	writeJSON(w, events)
 }
 
-func (s *Server) handleTraffic(w http.ResponseWriter, r *http.Request, session auth.Session) {
+func (s *Server) handleTraffic(w http.ResponseWriter, r *http.Request, _ auth.Session) {
 	summary, err := s.store.MetricSummary(r.Context(), 200)
 	if err != nil {
 		writeError(w, err, http.StatusInternalServerError)
@@ -1601,7 +1516,7 @@ func (s *Server) handleNodeWS(w http.ResponseWriter, r *http.Request, node model
 	if err != nil {
 		return
 	}
-	defer conn.Close(websocket.StatusNormalClosure, "bye")
+	defer closeWebSocket(conn, websocket.StatusNormalClosure, "bye")
 	s.hub.RegisterSocket(node.ID, conn)
 	defer s.hub.UnregisterSocket(node.ID, conn)
 
@@ -1869,17 +1784,6 @@ func tunnelStageNodeForNode(tunnel model.Tunnel, nodeID string) (model.TunnelSta
 	return model.TunnelStageNode{}, false
 }
 
-func previousStageNodeID(tunnel model.Tunnel, stageIndex int) string {
-	if stageIndex <= 0 || stageIndex > len(tunnel.Stages)-1 {
-		return ""
-	}
-	prev := tunnel.Stages[stageIndex-1]
-	if len(prev.Nodes) == 0 {
-		return ""
-	}
-	return prev.Nodes[0].NodeID
-}
-
 func previousStageNodeHasNode(tunnel model.Tunnel, stageIndex int, nodeID string) bool {
 	if stageIndex <= 0 || stageIndex > len(tunnel.Stages)-1 {
 		return false
@@ -2062,8 +1966,12 @@ func secureHeaders(next http.Handler) http.Handler {
 	})
 }
 
-func readJSON(r *http.Request, dest any) error {
-	defer r.Body.Close()
+func readJSON(r *http.Request, dest any) (err error) {
+	defer func() {
+		if closeErr := r.Body.Close(); err == nil {
+			err = closeErr
+		}
+	}()
 	decoder := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
 	decoder.DisallowUnknownFields()
 	return decoder.Decode(dest)
@@ -2120,11 +2028,19 @@ func (s *Server) handleFallbackWeb(w http.ResponseWriter, r *http.Request) {
 </html>`))
 }
 
-func (s *Server) handleInstallScript(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleInstallScript(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="install.sh"`)
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write([]byte(installScript()))
+}
+
+func closeStore(st *store.Store) {
+	_ = st.Close()
+}
+
+func closeWebSocket(conn *websocket.Conn, code websocket.StatusCode, reason string) {
+	_ = conn.Close(code, reason)
 }
 
 func (s *Server) handleDownloadNodeBinary(w http.ResponseWriter, r *http.Request) {

@@ -33,7 +33,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	db.SetMaxOpenConns(1)
 	s := &Store{db: db}
 	if err := s.migrate(ctx); err != nil {
-		_ = db.Close()
+		closeDB(db)
 		return nil, err
 	}
 	return s, nil
@@ -233,7 +233,7 @@ func (s *Store) tableColumns(ctx context.Context, table string) (map[string]bool
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	columns := make(map[string]bool)
 	for rows.Next() {
 		var cid int
@@ -319,7 +319,7 @@ func (s *Store) SettingsPrefix(ctx context.Context, prefix string) (map[string]s
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	out := make(map[string]string)
 	for rows.Next() {
 		var key, value string
@@ -422,7 +422,7 @@ func (s *Store) ListNodes(ctx context.Context) ([]model.Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	var out []model.Node
 	for rows.Next() {
 		node, _, err := scanNode(rows)
@@ -476,7 +476,7 @@ func (s *Store) SaveTunnel(ctx context.Context, tunnel model.Tunnel, allocations
 	if err != nil {
 		return 0, err
 	}
-	defer tx.Rollback()
+	defer rollbackTx(tx)
 	now := time.Now().UTC()
 	if tunnel.CreatedAt.IsZero() {
 		tunnel.CreatedAt = now
@@ -569,7 +569,7 @@ func (s *Store) ListTunnels(ctx context.Context) ([]model.Tunnel, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	var out []model.Tunnel
 	for rows.Next() {
 		tunnel, err := scanTunnel(rows)
@@ -612,7 +612,7 @@ func (s *Store) DeleteTunnel(ctx context.Context, id string, force bool) (int64,
 	if err != nil {
 		return 0, err
 	}
-	defer tx.Rollback()
+	defer rollbackTx(tx)
 	var count int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM forwards WHERE tunnel_id = ?`, id).Scan(&count); err != nil {
 		return 0, err
@@ -666,7 +666,7 @@ func (s *Store) SetTunnelEnabled(ctx context.Context, id string, enabled bool) (
 	if err != nil {
 		return 0, err
 	}
-	defer tx.Rollback()
+	defer rollbackTx(tx)
 	res, err := tx.ExecContext(ctx, `UPDATE tunnels SET enabled = ?, updated_at = ? WHERE id = ?`, boolInt(enabled), time.Now().UTC().Format(time.RFC3339Nano), id)
 	if err != nil {
 		return 0, err
@@ -690,7 +690,7 @@ func (s *Store) loadTunnelStages(ctx context.Context, tunnel *model.Tunnel) erro
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	var stages []model.TunnelStage
 	for rows.Next() {
 		stage, err := scanTunnelStage(rows)
@@ -725,7 +725,7 @@ func (s *Store) listStageNodes(ctx context.Context, stageID string) ([]model.Tun
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	var out []model.TunnelStageNode
 	for rows.Next() {
 		node, err := scanTunnelStageNode(rows)
@@ -742,7 +742,7 @@ func (s *Store) SaveForward(ctx context.Context, forward model.Forward, allocati
 	if err != nil {
 		return 0, err
 	}
-	defer tx.Rollback()
+	defer rollbackTx(tx)
 	now := time.Now().UTC()
 	if forward.CreatedAt.IsZero() {
 		forward.CreatedAt = now
@@ -787,7 +787,7 @@ func (s *Store) ListForwards(ctx context.Context) ([]model.Forward, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	var out []model.Forward
 	for rows.Next() {
 		forward, err := scanForward(rows)
@@ -808,7 +808,7 @@ func (s *Store) ListForwardsByTunnel(ctx context.Context, tunnelID string) ([]mo
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	var out []model.Forward
 	for rows.Next() {
 		forward, err := scanForward(rows)
@@ -833,7 +833,7 @@ func (s *Store) DeleteForward(ctx context.Context, id string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer tx.Rollback()
+	defer rollbackTx(tx)
 	if _, err := tx.ExecContext(ctx, `DELETE FROM port_allocations WHERE owner_kind = 'forward' AND owner_id = ?`, id); err != nil {
 		return 0, err
 	}
@@ -856,7 +856,7 @@ func (s *Store) SetForwardEnabled(ctx context.Context, id string, enabled bool) 
 	if err != nil {
 		return 0, err
 	}
-	defer tx.Rollback()
+	defer rollbackTx(tx)
 	res, err := tx.ExecContext(ctx, `UPDATE forwards SET enabled = ?, updated_at = ? WHERE id = ?`, boolInt(enabled), time.Now().UTC().Format(time.RFC3339Nano), id)
 	if err != nil {
 		return 0, err
@@ -879,7 +879,7 @@ func (s *Store) ListPortAllocations(ctx context.Context) ([]model.PortAllocation
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	var out []model.PortAllocation
 	for rows.Next() {
 		allocation, err := scanPortAllocation(rows)
@@ -896,7 +896,7 @@ func (s *Store) InsertMetrics(ctx context.Context, report model.MetricsReport) e
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer rollbackTx(tx)
 	observed := report.ObservedAt
 	if observed.IsZero() {
 		observed = time.Now().UTC()
@@ -944,7 +944,7 @@ func (s *Store) ListAudit(ctx context.Context, limit int) ([]model.AuditEvent, e
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	var out []model.AuditEvent
 	for rows.Next() {
 		var event model.AuditEvent
@@ -981,7 +981,7 @@ func (s *Store) MetricSummary(ctx context.Context, limit int) ([]MetricSummary, 
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	var out []MetricSummary
 	for rows.Next() {
 		var item MetricSummary
@@ -998,7 +998,7 @@ func (s *Store) BumpRevision(ctx context.Context) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer tx.Rollback()
+	defer rollbackTx(tx)
 	rev, err := bumpRevisionTx(ctx, tx)
 	if err != nil {
 		return 0, err
@@ -1189,4 +1189,16 @@ func emptyMap(m map[string]string) map[string]string {
 		return map[string]string{}
 	}
 	return m
+}
+
+func closeDB(db *sql.DB) {
+	_ = db.Close()
+}
+
+func closeRows(rows *sql.Rows) {
+	_ = rows.Close()
+}
+
+func rollbackTx(tx *sql.Tx) {
+	_ = tx.Rollback()
 }

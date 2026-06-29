@@ -756,11 +756,11 @@ func TestCompileConfigScopesAndRedactsTunnelSecrets(t *testing.T) {
 	mid, _ := createNode(t, h.server, "mid-scope")
 	exit, _ := createNode(t, h.server, "exit-scope")
 
-	for _, node := range []model.Node{entry, mid, exit} {
-		node.PublicHost = node.Name + ".example.com"
-		node.PortMin = 12000
-		node.PortMax = 12010
-		if err := h.store.UpdateNode(context.Background(), node); err != nil {
+	for _, testNode := range []model.Node{entry, mid, exit} {
+		testNode.PublicHost = testNode.Name + ".example.com"
+		testNode.PortMin = 12000
+		testNode.PortMax = 12010
+		if err := h.store.UpdateNode(context.Background(), testNode); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -880,8 +880,8 @@ func TestCompileConfigScopesAndRedactsTunnelSecrets(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, stage := range redacted.Stages {
-		for _, node := range stage.Nodes {
-			assertRedactedTunnelSettings(t, node.Settings)
+		for _, stageNode := range stage.Nodes {
+			assertRedactedTunnelSettings(t, stageNode.Settings)
 		}
 	}
 }
@@ -965,9 +965,9 @@ func mustRuntimeNodeSettings(t *testing.T, tunnel model.TunnelRuntime, stageInde
 		if stage.Index != stageIndex {
 			continue
 		}
-		for _, node := range stage.Nodes {
-			if node.NodeID == nodeID {
-				return node.Settings
+		for _, stageNode := range stage.Nodes {
+			if stageNode.NodeID == nodeID {
+				return stageNode.Settings
 			}
 		}
 	}
@@ -1069,8 +1069,8 @@ func waitForNodeOnline(t *testing.T, st *store.Store, nodeID string) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		node, err := st.GetNode(context.Background(), nodeID)
-		if err == nil && node.Status == model.NodeOnline {
+		currentNode, err := st.GetNode(context.Background(), nodeID)
+		if err == nil && currentNode.Status == model.NodeOnline {
 			return
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -1093,7 +1093,7 @@ func tcpEchoServer(t *testing.T) (string, func()) {
 				return
 			}
 			go func(c net.Conn) {
-				defer c.Close()
+				defer closeTestConn(c)
 				_, _ = io.Copy(c, c)
 			}(conn)
 		}
@@ -1119,7 +1119,7 @@ func tcpReplyServer(t *testing.T, reply string) (string, func()) {
 				return
 			}
 			go func(c net.Conn) {
-				defer c.Close()
+				defer closeTestConn(c)
 				buf := make([]byte, 32)
 				_, _ = c.Read(buf)
 				_, _ = c.Write([]byte(reply))
@@ -1153,7 +1153,7 @@ func dualProtoEchoServer(t *testing.T) (string, func()) {
 				return
 			}
 			go func(c net.Conn) {
-				defer c.Close()
+				defer closeTestConn(c)
 				_, _ = io.Copy(c, c)
 			}(conn)
 		}
@@ -1218,7 +1218,7 @@ func udpStageResponder(t *testing.T, addr, prefix string) func() {
 				return
 			}
 			go func(conn net.Conn) {
-				defer conn.Close()
+				defer closeTestConn(conn)
 				hello, err := protocol.ReadHello(conn)
 				if err != nil || hello.Network != "udp" {
 					return
@@ -1363,7 +1363,7 @@ func assertTCPRoundTrip(t *testing.T, addr, payload string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer closeTestConn(conn)
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 	if _, err := conn.Write([]byte(payload)); err != nil {
 		t.Fatal(err)
@@ -1391,7 +1391,7 @@ func assertTCPResponse(t *testing.T, addr, payload, want string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer closeTestConn(conn)
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 	if _, err := conn.Write([]byte(payload)); err != nil {
 		t.Fatal(err)
@@ -1422,7 +1422,7 @@ func assertUDPRoundTrip(t *testing.T, addr, payload string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer closeTestConn(conn)
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 	if _, err := conn.Write([]byte(payload)); err != nil {
 		t.Fatal(err)
@@ -1456,6 +1456,10 @@ func newControllerUDPClient(t *testing.T, addr string) controllerUDPClient {
 
 func (c controllerUDPClient) close() {
 	_ = c.conn.Close()
+}
+
+func closeTestConn(conn net.Conn) {
+	_ = conn.Close()
 }
 
 func (c controllerUDPClient) roundTrip(t *testing.T, payload string) string {
