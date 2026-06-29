@@ -3,7 +3,7 @@ import { Link, useNavigate } from '@tanstack/react-router'
 import { Pause, Play, Plus, Settings, Trash2 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { api, post } from '../api'
-import type { NodeInfo, TunnelInfo, TunnelStageRole, TunnelTransport, TunnelType } from '../types'
+import type { ForwardProtocol, NodeInfo, TunnelInfo, TunnelStageRole, TunnelTransport, TunnelType } from '../types'
 import {
   Banner,
   DetailGrid,
@@ -24,11 +24,14 @@ type TunnelNodeForm = {
   id: string
   node_id: string
   weight: number
+  protocols: ForwardProtocol[]
 }
 
 type TunnelStageForm = {
   id: string
   strategy: string
+  tcp_strategy: string
+  udp_strategy: string
   nodes: TunnelNodeForm[]
 }
 
@@ -307,8 +310,8 @@ function TunnelDetailsContent({
             <div className="hop" key={stage.id}>
               <span>{stage.index + 1}</span>
               <strong>{stage.role}</strong>
-              <small>{stage.strategy}</small>
-              <small>{stage.nodes.map((node) => nodeDisplayName(node.node_id, nodes)).join(' / ')}</small>
+              <small>TCP {stage.tcp_strategy || stage.strategy || 'single'} · UDP {stage.udp_strategy || stage.strategy || 'single'}</small>
+              <small>{stage.nodes.map((node) => `${nodeDisplayName(node.node_id, nodes)} (${formatProtocols(normalizeNodeProtocols(node.protocols))})`).join(' / ')}</small>
             </div>
           ))}
         </div>
@@ -354,11 +357,14 @@ function TunnelEditor({
         ? initialTunnel.stages.map((stage) => ({
           id: stage.id,
           strategy: stage.strategy || 'single',
+          tcp_strategy: stage.tcp_strategy || '',
+          udp_strategy: stage.udp_strategy || '',
           nodes: stage.nodes.length > 0
             ? stage.nodes.map((node) => ({
               id: node.id,
               node_id: node.node_id,
               weight: node.weight || 1,
+              protocols: normalizeNodeProtocols(node.protocols),
             }))
             : [emptyNodeForm()],
         }))
@@ -381,10 +387,13 @@ function TunnelEditor({
           index,
           role: stageRoleFor(form.type, index, stages.length),
           strategy: stage.strategy || 'single',
+          tcp_strategy: stage.tcp_strategy,
+          udp_strategy: stage.udp_strategy,
           nodes: stage.nodes.map((node) => ({
             id: node.id,
             node_id: node.node_id,
             weight: node.weight || 1,
+            protocols: normalizeNodeProtocols(node.protocols),
           })),
         })),
       }
@@ -517,13 +526,29 @@ function TunnelEditor({
                   </InlineActions>
                 </div>
                 <FieldGrid>
-                  <Field label="策略">
+                  <Field label="TCP 策略">
                     <select
-                      value={stage.strategy}
+                      value={stage.tcp_strategy || stage.strategy || 'single'}
                       onChange={(event) => setForm((current) => ({
                         ...current,
                         stages: current.stages.map((item, idx) => (
-                          idx === stageIndex ? { ...item, strategy: event.target.value } : item
+                          idx === stageIndex ? { ...item, tcp_strategy: event.target.value } : item
+                        )),
+                      }))}
+                    >
+                      <option value="single">单候选</option>
+                      <option value="failover">故障切换</option>
+                      <option value="round_robin">轮询</option>
+                      <option value="random">随机</option>
+                    </select>
+                  </Field>
+                  <Field label="UDP 策略">
+                    <select
+                      value={stage.udp_strategy || stage.strategy || 'single'}
+                      onChange={(event) => setForm((current) => ({
+                        ...current,
+                        stages: current.stages.map((item, idx) => (
+                          idx === stageIndex ? { ...item, udp_strategy: event.target.value } : item
                         )),
                       }))}
                     >
@@ -592,6 +617,35 @@ function TunnelEditor({
                           }))}
                         />
                       </label>
+                      <div className="candidate-protocols">
+                        {(['tcp', 'udp'] as const).map((protocol) => (
+                          <label key={protocol}>
+                            <input
+                              type="checkbox"
+                              checked={nodeForm.protocols.includes(protocol)}
+                              onChange={(event) => setForm((current) => ({
+                                ...current,
+                                stages: current.stages.map((item, idx) => (
+                                  idx === stageIndex
+                                    ? {
+                                      ...item,
+                                      nodes: item.nodes.map((candidate, cIndex) => (
+                                        cIndex === nodeIndex
+                                          ? {
+                                            ...candidate,
+                                            protocols: toggleNodeProtocol(candidate.protocols, protocol, event.target.checked),
+                                          }
+                                          : candidate
+                                      )),
+                                    }
+                                    : item
+                                )),
+                              }))}
+                            />
+                            {protocol.toUpperCase()}
+                          </label>
+                        ))}
+                      </div>
                       <button
                         type="button"
                         className="ghost danger"
@@ -632,6 +686,7 @@ function emptyNodeForm(): TunnelNodeForm {
     id: '',
     node_id: '',
     weight: 1,
+    protocols: ['tcp', 'udp'],
   }
 }
 
@@ -639,6 +694,8 @@ function emptyStageForm(): TunnelStageForm {
   return {
     id: '',
     strategy: 'single',
+    tcp_strategy: 'single',
+    udp_strategy: 'single',
     nodes: [emptyNodeForm()],
   }
 }
@@ -666,10 +723,13 @@ function normalizeStage(stage: TunnelStageForm): TunnelStageForm {
   return {
     id: stage.id,
     strategy: stage.strategy || 'single',
+    tcp_strategy: stage.tcp_strategy || stage.strategy || 'single',
+    udp_strategy: stage.udp_strategy || stage.strategy || 'single',
     nodes: nodes.map((node) => ({
       id: node.id,
       node_id: node.node_id,
       weight: node.weight > 0 ? node.weight : 1,
+      protocols: normalizeNodeProtocols(node.protocols),
     })),
   }
 }
@@ -702,6 +762,28 @@ function insertMiddleStage(stages: TunnelStageForm[]): TunnelStageForm[] {
     return [...stages, emptyStageForm()]
   }
   return [...stages.slice(0, stages.length - 1), emptyStageForm(), stages[stages.length - 1]]
+}
+
+function normalizeNodeProtocols(protocols?: ForwardProtocol[]): ForwardProtocol[] {
+  const enabled = new Set(protocols && protocols.length > 0 ? protocols : ['tcp', 'udp'])
+  const out: ForwardProtocol[] = []
+  if (enabled.has('tcp')) out.push('tcp')
+  if (enabled.has('udp')) out.push('udp')
+  return out.length > 0 ? out : ['tcp', 'udp']
+}
+
+function toggleNodeProtocol(protocols: ForwardProtocol[], protocol: ForwardProtocol, enabled: boolean): ForwardProtocol[] {
+  const next = new Set(normalizeNodeProtocols(protocols))
+  if (enabled) {
+    next.add(protocol)
+  } else {
+    next.delete(protocol)
+  }
+  return normalizeNodeProtocols(Array.from(next) as ForwardProtocol[])
+}
+
+function formatProtocols(protocols: ForwardProtocol[]) {
+  return normalizeNodeProtocols(protocols).map((protocol) => protocol.toUpperCase()).join('+')
 }
 
 function indexByID<T extends { id: string }>(items: T[]) {

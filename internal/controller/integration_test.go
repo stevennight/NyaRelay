@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"nyarelay/internal/controller/store"
 	"nyarelay/internal/node"
 	"nyarelay/internal/shared/model"
+	"nyarelay/internal/shared/protocol"
 )
 
 type controllerHarness struct {
@@ -326,6 +328,115 @@ func TestControllerNodeTCPMultiCandidateFailoverIntegration(t *testing.T) {
 	}
 
 	assertTCPRoundTrip(t, "127.0.0.1"+forward.Listen, "nya-failover")
+}
+
+func TestControllerNodeUDPMultiCandidateRoundRobinIntegration(t *testing.T) {
+	h := newControllerHarness(t, "127.0.0.1:0")
+	pub := mustSigningKey(t, h.store)
+
+	entry, entryToken := createNode(t, h.server, "entry-udp-multi")
+	tcpOnly, _ := createNode(t, h.server, "udp-tcp-only")
+	exitA, _ := createNode(t, h.server, "udp-exit-a")
+	exitB, _ := createNode(t, h.server, "udp-exit-b")
+
+	entryCancel := startNode(t, h.url, entry.ID, entryToken, pub, t.TempDir())
+	defer entryCancel()
+	waitForNodeOnline(t, h.store, entry.ID)
+
+	entryListen := freeUDPAddr(t)
+	tcpOnlyListen := freeTCPAddr(t)
+	exitAListen := freeTCPAddr(t)
+	exitBListen := freeTCPAddr(t)
+	closeTCPOnly := udpStageResponder(t, tcpOnlyListen, "tcp-only:")
+	closeExitA := udpStageResponder(t, exitAListen, "a:")
+	closeExitB := udpStageResponder(t, exitBListen, "b:")
+	defer closeTCPOnly()
+	defer closeExitA()
+	defer closeExitB()
+
+	tunnel := upsertTunnel(t, h.server, tunnelRequest{
+		ID:        "tun_udp_multi_controller",
+		Name:      "udp multi controller",
+		Type:      model.TunnelChain,
+		Transport: model.TunnelTransportDirect,
+		Enabled:   boolPtr(true),
+		Stages: []model.TunnelStage{
+			{
+				ID:       "stage_udp_entry",
+				TunnelID: "tun_udp_multi_controller",
+				Index:    0,
+				Role:     model.TunnelStageEntry,
+				Strategy: "single",
+				Nodes: []model.TunnelStageNode{
+					{ID: "stage_udp_entry_node", TunnelID: "tun_udp_multi_controller", StageID: "stage_udp_entry", NodeID: entry.ID, Weight: 1},
+				},
+			},
+			{
+				ID:          "stage_udp_exit",
+				TunnelID:    "tun_udp_multi_controller",
+				Index:       1,
+				Role:        model.TunnelStageExit,
+				Strategy:    "failover",
+				UDPStrategy: "round_robin",
+				Nodes: []model.TunnelStageNode{
+					{
+						ID:         "stage_udp_a_tcp_only",
+						TunnelID:   "tun_udp_multi_controller",
+						StageID:    "stage_udp_exit",
+						NodeID:     tcpOnly.ID,
+						Weight:     1,
+						Protocols:  []model.ForwardProtocol{model.ForwardProtocolTCP},
+						ListenAddr: tcpOnlyListen,
+						PublicAddr: tcpOnlyListen,
+					},
+					{
+						ID:         "stage_udp_b_exit_a",
+						TunnelID:   "tun_udp_multi_controller",
+						StageID:    "stage_udp_exit",
+						NodeID:     exitA.ID,
+						Weight:     1,
+						Protocols:  []model.ForwardProtocol{model.ForwardProtocolTCP, model.ForwardProtocolUDP},
+						ListenAddr: exitAListen,
+						PublicAddr: exitAListen,
+					},
+					{
+						ID:         "stage_udp_0_exit_b",
+						TunnelID:   "tun_udp_multi_controller",
+						StageID:    "stage_udp_exit",
+						NodeID:     exitB.ID,
+						Weight:     1,
+						Protocols:  []model.ForwardProtocol{model.ForwardProtocolUDP},
+						ListenAddr: exitBListen,
+						PublicAddr: exitBListen,
+					},
+				},
+			},
+		},
+	})
+	upsertForward(t, h.server, forwardRequest{
+		ID:        "fwd_udp_multi_controller",
+		Name:      "udp multi controller",
+		TunnelID:  tunnel.ID,
+		Protocols: []model.ForwardProtocol{model.ForwardProtocolUDP},
+		Listen:    entryListen,
+		Target:    "127.0.0.1:9",
+		Enabled:   boolPtr(true),
+	})
+
+	clientOne := newControllerUDPClient(t, entryListen)
+	defer clientOne.close()
+	if got := clientOne.roundTripEventually(t, "one-1", "a:"); got != "a:one-1" {
+		t.Fatalf("first udp session = %q, want a:one-1", got)
+	}
+	if got := clientOne.roundTrip(t, "one-2"); got != "a:one-2" {
+		t.Fatalf("same udp session moved candidates: %q", got)
+	}
+
+	clientTwo := newControllerUDPClient(t, entryListen)
+	defer clientTwo.close()
+	if got := clientTwo.roundTrip(t, "two-1"); got != "b:two-1" {
+		t.Fatalf("second udp session = %q, want b:two-1", got)
+	}
 }
 
 func TestControllerForwardTargetUpdateAppliesWithoutRestart(t *testing.T) {
@@ -1092,6 +1203,45 @@ func udpEchoServer(t *testing.T) (string, func()) {
 	}
 }
 
+func udpStageResponder(t *testing.T, addr, prefix string) func() {
+	t.Helper()
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				hello, err := protocol.ReadHello(conn)
+				if err != nil || hello.Network != "udp" {
+					return
+				}
+				frame, err := protocol.ReadUDPDatagramFrame(conn)
+				if err != nil {
+					return
+				}
+				response := protocol.UDPDatagramFrame{
+					ForwardID: frame.ForwardID,
+					SessionID: frame.SessionID,
+					Payload:   append([]byte(prefix), frame.Payload...),
+				}
+				_ = protocol.WriteUDPDatagramFrame(conn, response)
+			}(conn)
+		}
+	}()
+	return func() {
+		_ = ln.Close()
+		<-done
+	}
+}
+
 func freeTCPAddr(t *testing.T) string {
 	t.Helper()
 	portCursorMu.Lock()
@@ -1285,6 +1435,69 @@ func assertUDPRoundTrip(t *testing.T, addr, payload string) {
 	if string(buf[:n]) != payload {
 		t.Fatalf("got %q, want %q", string(buf[:n]), payload)
 	}
+}
+
+type controllerUDPClient struct {
+	conn *net.UDPConn
+}
+
+func newControllerUDPClient(t *testing.T, addr string) controllerUDPClient {
+	t.Helper()
+	remote, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := net.DialUDP("udp", nil, remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return controllerUDPClient{conn: conn}
+}
+
+func (c controllerUDPClient) close() {
+	_ = c.conn.Close()
+}
+
+func (c controllerUDPClient) roundTrip(t *testing.T, payload string) string {
+	t.Helper()
+	_ = c.conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := c.conn.Write([]byte(payload)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 1024)
+	n, err := c.conn.Read(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(buf[:n])
+}
+
+func (c controllerUDPClient) roundTripEventually(t *testing.T, payload, wantPrefix string) string {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		_ = c.conn.SetDeadline(time.Now().Add(250 * time.Millisecond))
+		if _, err := c.conn.Write([]byte(payload)); err != nil {
+			lastErr = err
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		buf := make([]byte, 1024)
+		n, err := c.conn.Read(buf)
+		if err != nil {
+			lastErr = err
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		got := string(buf[:n])
+		if !strings.HasPrefix(got, wantPrefix) {
+			t.Fatalf("udp response = %q, want prefix %q", got, wantPrefix)
+		}
+		return got
+	}
+	t.Fatalf("udp response never arrived; last error: %v", lastErr)
+	return ""
 }
 
 func assertTCPDialEventuallyFails(t *testing.T, addr string) {

@@ -86,6 +86,17 @@ UDP 多候选必须是“按会话选候选”，不是“按包选候选”。
 - TCP selector 只从支持 TCP 的 candidate 中选择。
 - UDP selector 只从支持 UDP 的 candidate 中选择。
 
+候选列表建模：
+
+- UI 可以仍然以一个 stage candidate 列表呈现，避免用户为 TCP 和 UDP 重复维护两份节点顺序、权重和配置。
+- 每一行 candidate 必须可以分别勾选 TCP、UDP；运行时按协议 mask 派生出两份逻辑候选列表：
+  - TCP effective candidates = `protocols` 为空或包含 `tcp` 的 candidate。
+  - UDP effective candidates = `protocols` 为空或包含 `udp` 的 candidate。
+- 因此“同一个 stage 选择 TCP/UDP 不同策略”不代表两种协议必须共用完全相同的节点集合。策略是 per-protocol，候选集合也是 per-protocol 派生。
+- 某个服务商节点如果 TCP 稳定但 UDP 丢包、限速或不可用，应只保留 TCP 勾选；它继续参与 TCP 转发，但不会参与 UDP 转发。
+- 如果一个 forward 启用了 TCP+UDP 并绑定到同一个 tunnel，保存或运行前应确保该 tunnel 每个必经 stage 都至少有一个 TCP candidate 和一个 UDP candidate，否则对应协议应给出明确错误。
+- 权重第一版仍挂在 candidate 行上，并作用于该 candidate 已启用的协议；后续如需要再扩展 `tcp_weight` / `udp_weight`。
+
 推荐会话键：
 
 ```text
@@ -311,7 +322,16 @@ hk-c              ✓     ✓     1
 - TCP 按连接应用策略。
 - UDP 按会话应用策略。
 - candidate 未勾选 UDP 时，不会参与 UDP 转发。
+- 同一 stage 表面上是一份候选列表，但 TCP/UDP 会按勾选状态形成不同的有效候选集合。
 - 入口多节点仍由外部 DNS/LB/客户端选择。
+
+保存和校验：
+
+- candidate 至少启用一个协议；如果用户取消 TCP 和 UDP，应阻止保存或自动恢复为 TCP+UDP。
+- 对 TCP-only forward，tunnel 每个必经 stage 至少需要一个 TCP effective candidate。
+- 对 UDP-only forward，tunnel 每个必经 stage 至少需要一个 UDP effective candidate。
+- 对 TCP+UDP forward，tunnel 每个必经 stage 同时需要 TCP 和 UDP effective candidates；二者可以是同一批节点，也可以不同。
+- 详情页和调试日志应展示每个 stage 的 TCP effective candidates / UDP effective candidates，避免排障时误以为两种协议一定共享同一候选集合。
 
 ## 测试
 
@@ -346,6 +366,7 @@ Go integration:
 - candidate 行可以勾选 TCP/UDP 支持协议。
 - 未勾选任何协议时应阻止保存，或自动恢复为 TCP+UDP。
 - 旧 tunnel 打开后默认显示候选支持 TCP+UDP。
+- TCP+UDP forward 绑定 tunnel 时，如果某个必经 stage 缺少 TCP 或 UDP 有效候选，应显示明确校验错误。
 
 ## 风险
 
@@ -378,6 +399,7 @@ Go integration:
 - UDP 多候选不再固定使用第一个候选。
 - TCP 和 UDP 可以在同一个 stage 使用不同策略。
 - TCP 和 UDP 可以在同一个 stage 使用不同 candidate 子集。
+- 同一 stage 只维护一份 candidate 配置时，运行时仍能正确派生 TCP/UDP 两份有效候选集合。
 - 同一 UDP client session 不会在候选间逐包跳动。
 - 候选失败后，新 UDP session 能切到可用候选。
 - session 超时后能被清理并允许重新选择。

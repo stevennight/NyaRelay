@@ -31,6 +31,7 @@ export interface TunnelStageNode {
   tunnel_id: string
   stage_id: string
   node_id: string
+  protocols?: ForwardProtocol[]
   listen_addr?: string
   public_addr?: string
   connect_addr?: string
@@ -46,6 +47,8 @@ export interface TunnelStage {
   index: number
   role: TunnelStageRole
   strategy: string
+  tcp_strategy?: string
+  udp_strategy?: string
   nodes: TunnelStageNode[]
   created_at: string
   updated_at: string

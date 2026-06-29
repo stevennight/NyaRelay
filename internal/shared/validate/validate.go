@@ -55,10 +55,14 @@ func Tunnel(tunnel model.Tunnel) error {
 		if stage.Role != expectedRole {
 			return fmt.Errorf("stage %d role must be %s", index, expectedRole)
 		}
-		switch strings.ToLower(strings.TrimSpace(stage.Strategy)) {
-		case "", "single", "round_robin", "random", "failover":
-		default:
-			return fmt.Errorf("unsupported stage %d strategy %q", index, stage.Strategy)
+		if err := validateStageStrategy(index, "strategy", stage.Strategy); err != nil {
+			return err
+		}
+		if err := validateStageStrategy(index, "tcp_strategy", stage.TCPStrategy); err != nil {
+			return err
+		}
+		if err := validateStageStrategy(index, "udp_strategy", stage.UDPStrategy); err != nil {
+			return err
 		}
 		if len(stage.Nodes) == 0 {
 			return fmt.Errorf("stage %d must have at least one node", index)
@@ -71,6 +75,9 @@ func Tunnel(tunnel model.Tunnel) error {
 				return fmt.Errorf("node %s appears more than once in tunnel", node.NodeID)
 			}
 			seenNodes[node.NodeID] = true
+			if err := validateStageNodeProtocols(index, node); err != nil {
+				return err
+			}
 			if tunnel.Type == model.TunnelChain && stage.Role != model.TunnelStageEntry {
 				if strings.TrimSpace(node.ListenAddr) == "" {
 					return fmt.Errorf("stage %d listen address is required", index)
@@ -92,6 +99,31 @@ func Tunnel(tunnel model.Tunnel) error {
 					}
 				}
 			}
+		}
+	}
+	return nil
+}
+
+func validateStageStrategy(index int, field, strategy string) error {
+	switch strings.ToLower(strings.TrimSpace(strategy)) {
+	case "", "single", "round_robin", "random", "failover":
+		return nil
+	default:
+		return fmt.Errorf("unsupported stage %d %s %q", index, field, strategy)
+	}
+}
+
+func validateStageNodeProtocols(index int, node model.TunnelStageNode) error {
+	seen := map[model.ForwardProtocol]bool{}
+	for _, protocol := range node.Protocols {
+		switch protocol {
+		case model.ForwardProtocolTCP, model.ForwardProtocolUDP:
+			if seen[protocol] {
+				return fmt.Errorf("stage %d node %s has duplicate protocol %q", index, node.NodeID, protocol)
+			}
+			seen[protocol] = true
+		default:
+			return fmt.Errorf("unsupported stage %d node %s protocol %q", index, node.NodeID, protocol)
 		}
 	}
 	return nil

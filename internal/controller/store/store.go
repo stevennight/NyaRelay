@@ -92,6 +92,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			stage_index INTEGER NOT NULL,
 			role TEXT NOT NULL,
 			strategy TEXT NOT NULL DEFAULT 'single',
+			tcp_strategy TEXT NOT NULL DEFAULT '',
+			udp_strategy TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		);`,
@@ -104,6 +106,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			public_addr TEXT NOT NULL DEFAULT '',
 			connect_addr TEXT NOT NULL DEFAULT '',
 			weight INTEGER NOT NULL DEFAULT 1,
+			protocols_json TEXT NOT NULL DEFAULT '[]',
 			settings_json TEXT NOT NULL DEFAULT '{}',
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL
@@ -196,6 +199,29 @@ func (s *Store) ensureTunnelColumns(ctx context.Context) error {
 	}
 	if !columns["entry_address"] {
 		if _, err := s.db.ExecContext(ctx, `ALTER TABLE tunnels ADD COLUMN entry_address TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	stageColumns, err := s.tableColumns(ctx, "tunnel_stages")
+	if err != nil {
+		return err
+	}
+	if !stageColumns["tcp_strategy"] {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE tunnel_stages ADD COLUMN tcp_strategy TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	if !stageColumns["udp_strategy"] {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE tunnel_stages ADD COLUMN udp_strategy TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	stageNodeColumns, err := s.tableColumns(ctx, "tunnel_stage_nodes")
+	if err != nil {
+		return err
+	}
+	if !stageNodeColumns["protocols_json"] {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE tunnel_stage_nodes ADD COLUMN protocols_json TEXT NOT NULL DEFAULT '[]'`); err != nil {
 			return err
 		}
 	}
@@ -497,9 +523,9 @@ func (s *Store) SaveTunnel(ctx context.Context, tunnel model.Tunnel, allocations
 			stage.Strategy = "single"
 		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO tunnel_stages (id, tunnel_id, stage_index, role, strategy, created_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			stage.ID, tunnel.ID, stage.Index, string(stage.Role), stage.Strategy,
+			`INSERT INTO tunnel_stages (id, tunnel_id, stage_index, role, strategy, tcp_strategy, udp_strategy, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			stage.ID, tunnel.ID, stage.Index, string(stage.Role), stage.Strategy, stage.TCPStrategy, stage.UDPStrategy,
 			stage.CreatedAt.UTC().Format(time.RFC3339Nano), stage.UpdatedAt.UTC().Format(time.RFC3339Nano),
 		); err != nil {
 			return 0, err
@@ -512,13 +538,14 @@ func (s *Store) SaveTunnel(ctx context.Context, tunnel model.Tunnel, allocations
 			if node.Weight <= 0 {
 				node.Weight = 1
 			}
+			protocols, _ := json.Marshal(node.Protocols)
 			nodeSettings, _ := json.Marshal(emptyMap(node.Settings))
 			if _, err := tx.ExecContext(ctx,
 				`INSERT INTO tunnel_stage_nodes
-				 (id, tunnel_id, stage_id, node_id, listen_addr, public_addr, connect_addr, weight, settings_json, created_at, updated_at)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				 (id, tunnel_id, stage_id, node_id, listen_addr, public_addr, connect_addr, weight, protocols_json, settings_json, created_at, updated_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				node.ID, tunnel.ID, stage.ID, node.NodeID, node.ListenAddr, node.PublicAddr, node.ConnectAddr,
-				node.Weight, string(nodeSettings), node.CreatedAt.UTC().Format(time.RFC3339Nano), node.UpdatedAt.UTC().Format(time.RFC3339Nano),
+				node.Weight, string(protocols), string(nodeSettings), node.CreatedAt.UTC().Format(time.RFC3339Nano), node.UpdatedAt.UTC().Format(time.RFC3339Nano),
 			); err != nil {
 				return 0, err
 			}
@@ -656,7 +683,7 @@ func (s *Store) SetTunnelEnabled(ctx context.Context, id string, enabled bool) (
 
 func (s *Store) loadTunnelStages(ctx context.Context, tunnel *model.Tunnel) error {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, tunnel_id, stage_index, role, strategy, created_at, updated_at
+		`SELECT id, tunnel_id, stage_index, role, strategy, tcp_strategy, udp_strategy, created_at, updated_at
 		 FROM tunnel_stages WHERE tunnel_id = ? ORDER BY stage_index ASC`,
 		tunnel.ID,
 	)
@@ -691,8 +718,8 @@ func (s *Store) loadTunnelStages(ctx context.Context, tunnel *model.Tunnel) erro
 
 func (s *Store) listStageNodes(ctx context.Context, stageID string) ([]model.TunnelStageNode, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, tunnel_id, stage_id, node_id, listen_addr, public_addr, connect_addr, weight, settings_json, created_at, updated_at
-		 FROM tunnel_stage_nodes WHERE stage_id = ? ORDER BY id ASC`,
+		`SELECT id, tunnel_id, stage_id, node_id, listen_addr, public_addr, connect_addr, weight, protocols_json, settings_json, created_at, updated_at
+		 FROM tunnel_stage_nodes WHERE stage_id = ? ORDER BY rowid ASC`,
 		stageID,
 	)
 	if err != nil {
@@ -1075,7 +1102,7 @@ func scanTunnel(row scanner) (model.Tunnel, error) {
 func scanTunnelStage(row scanner) (model.TunnelStage, error) {
 	var stage model.TunnelStage
 	var role, created, updated string
-	err := row.Scan(&stage.ID, &stage.TunnelID, &stage.Index, &role, &stage.Strategy, &created, &updated)
+	err := row.Scan(&stage.ID, &stage.TunnelID, &stage.Index, &role, &stage.Strategy, &stage.TCPStrategy, &stage.UDPStrategy, &created, &updated)
 	if err != nil {
 		return model.TunnelStage{}, err
 	}
@@ -1087,14 +1114,15 @@ func scanTunnelStage(row scanner) (model.TunnelStage, error) {
 
 func scanTunnelStageNode(row scanner) (model.TunnelStageNode, error) {
 	var node model.TunnelStageNode
-	var settingsJSON, created, updated string
+	var protocolsJSON, settingsJSON, created, updated string
 	err := row.Scan(&node.ID, &node.TunnelID, &node.StageID, &node.NodeID, &node.ListenAddr, &node.PublicAddr,
-		&node.ConnectAddr, &node.Weight, &settingsJSON, &created, &updated)
+		&node.ConnectAddr, &node.Weight, &protocolsJSON, &settingsJSON, &created, &updated)
 	if err != nil {
 		return model.TunnelStageNode{}, err
 	}
 	node.CreatedAt = parseTime(created)
 	node.UpdatedAt = parseTime(updated)
+	_ = json.Unmarshal([]byte(protocolsJSON), &node.Protocols)
 	_ = json.Unmarshal([]byte(settingsJSON), &node.Settings)
 	return node, nil
 }

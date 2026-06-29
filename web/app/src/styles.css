@@ -761,7 +761,7 @@ td small {
 }
 
 .candidate-row {
-  grid-template-columns: 32px minmax(180px, 2fr) minmax(110px, 1fr) auto;
+  grid-template-columns: 32px minmax(180px, 2fr) minmax(110px, 1fr) minmax(126px, auto) auto;
 }
 
 .candidate-weight {
@@ -773,6 +773,22 @@ td small {
   color: var(--muted);
   font-size: 12px;
   font-weight: 650;
+}
+
+.candidate-protocols {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.candidate-protocols label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted-strong);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
 }
 
 .detail-grid {
@@ -952,7 +968,8 @@ td small {
   .hop > select,
   .hop > input,
   .hop > button,
-  .candidate-weight {
+  .candidate-weight,
+  .candidate-protocols {
     grid-column: 2;
   }
 

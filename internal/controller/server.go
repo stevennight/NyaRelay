@@ -813,7 +813,11 @@ func (s *Server) prepareTunnel(ctx context.Context, req tunnelRequest) (model.Tu
 			} else {
 				stage.Strategy = "single"
 			}
+		} else {
+			stage.Strategy = normalizeStageStrategyValue(stage.Strategy)
 		}
+		stage.TCPStrategy = normalizeStageStrategyValue(stage.TCPStrategy)
+		stage.UDPStrategy = normalizeStageStrategyValue(stage.UDPStrategy)
 		if len(stage.Nodes) == 0 {
 			return model.Tunnel{}, nil, fmt.Errorf("stage %d must have at least one node", i)
 		}
@@ -843,6 +847,10 @@ func (s *Server) prepareTunnel(ctx context.Context, req tunnelRequest) (model.Tu
 			}
 			if node.Weight <= 0 {
 				node.Weight = 1
+			}
+			node.Protocols, err = normalizeStageNodeProtocols(node.Protocols)
+			if err != nil {
+				return model.Tunnel{}, nil, fmt.Errorf("stage %d node %s: %w", i, node.NodeID, err)
 			}
 			node.Settings = mergeSettings(existingNode.Settings, node.Settings)
 			if tunnel.Type == model.TunnelDirect || stage.Role == model.TunnelStageEntry {
@@ -956,17 +964,12 @@ func (s *Server) prepareForward(ctx context.Context, req forwardRequest) (model.
 	if !tunnel.Enabled {
 		return model.Forward{}, nil, errors.New("tunnel is disabled")
 	}
-	entryNodeIDs, err := tunnelEntryNodeIDs(tunnel)
-	if err != nil {
+	if err := validateTunnelEffectiveCandidates(tunnel, protocols); err != nil {
 		return model.Forward{}, nil, err
 	}
-	entryNodes := make([]model.Node, 0, len(entryNodeIDs))
-	for _, entryNodeID := range entryNodeIDs {
-		entryNode, err := s.store.GetNode(ctx, entryNodeID)
-		if err != nil || entryNode.Revoked {
-			return model.Forward{}, nil, errors.New("entry node not found")
-		}
-		entryNodes = append(entryNodes, entryNode)
+	entryCandidates, err := forwardEntryCandidates(ctx, s.store, tunnel, protocols)
+	if err != nil {
+		return model.Forward{}, nil, err
 	}
 	forward := model.Forward{
 		ID:        strings.TrimSpace(req.ID),
@@ -985,7 +988,7 @@ func (s *Server) prepareForward(ctx context.Context, req forwardRequest) (model.
 	used := usedPortSet(allocations, excludedOwners)
 	port := 0
 	if forward.Listen == "" {
-		port, err = allocateSharedProtocolPortAcrossNodes(entryNodes, protocols, used)
+		port, err = allocateSharedProtocolPortAcrossEntryCandidates(entryCandidates, used)
 		if err != nil {
 			return model.Forward{}, nil, err
 		}
@@ -995,16 +998,16 @@ func (s *Server) prepareForward(ctx context.Context, req forwardRequest) (model.
 		if err != nil {
 			return model.Forward{}, nil, err
 		}
-		if err := ensurePortAvailableAcrossNodes(entryNodes, protocols, port, used); err != nil {
+		if err := ensurePortAvailableAcrossEntryCandidates(entryCandidates, port, used); err != nil {
 			return model.Forward{}, nil, err
 		}
 	}
 	var outAllocations []model.PortAllocation
-	for _, entryNode := range entryNodes {
-		for _, protocol := range protocols {
+	for _, entryCandidate := range entryCandidates {
+		for _, protocol := range entryCandidate.Protocols {
 			outAllocations = append(outAllocations, model.PortAllocation{
 				ID:        ids.New("alloc"),
-				NodeID:    entryNode.ID,
+				NodeID:    entryCandidate.Node.ID,
 				OwnerKind: "forward",
 				OwnerID:   forward.ID,
 				Protocol:  string(protocol),
@@ -1130,6 +1133,140 @@ func normalizeForwardProtocols(protocols []model.ForwardProtocol) ([]model.Forwa
 	return out, nil
 }
 
+func normalizeStageStrategyValue(strategy string) string {
+	switch strings.ToLower(strings.TrimSpace(strategy)) {
+	case "":
+		return ""
+	case "single":
+		return "single"
+	case "round_robin":
+		return "round_robin"
+	case "random":
+		return "random"
+	case "failover":
+		return "failover"
+	default:
+		return strings.TrimSpace(strategy)
+	}
+}
+
+func normalizeStageNodeProtocols(protocols []model.ForwardProtocol) ([]model.ForwardProtocol, error) {
+	if len(protocols) == 0 {
+		return nil, nil
+	}
+	seen := map[model.ForwardProtocol]bool{}
+	for _, protocol := range protocols {
+		switch protocol {
+		case model.ForwardProtocolTCP, model.ForwardProtocolUDP:
+			seen[protocol] = true
+		default:
+			return nil, fmt.Errorf("unsupported protocol %q", protocol)
+		}
+	}
+	out := make([]model.ForwardProtocol, 0, 2)
+	if seen[model.ForwardProtocolTCP] {
+		out = append(out, model.ForwardProtocolTCP)
+	}
+	if seen[model.ForwardProtocolUDP] {
+		out = append(out, model.ForwardProtocolUDP)
+	}
+	return out, nil
+}
+
+func stageNodeSupportsProtocol(node model.TunnelStageNode, protocol model.ForwardProtocol) bool {
+	if len(node.Protocols) == 0 {
+		return protocol == model.ForwardProtocolTCP || protocol == model.ForwardProtocolUDP
+	}
+	for _, candidateProtocol := range node.Protocols {
+		if candidateProtocol == protocol {
+			return true
+		}
+	}
+	return false
+}
+
+func validateTunnelEffectiveCandidates(tunnel model.Tunnel, protocols []model.ForwardProtocol) error {
+	for _, stage := range tunnel.Stages {
+		for _, protocol := range protocols {
+			if !stageHasEffectiveCandidate(stage, protocol) {
+				return fmt.Errorf("stage %d has no %s candidate", stage.Index, protocol)
+			}
+		}
+	}
+	return nil
+}
+
+func stageHasEffectiveCandidate(stage model.TunnelStage, protocol model.ForwardProtocol) bool {
+	for _, node := range stage.Nodes {
+		if strings.TrimSpace(node.NodeID) != "" && stageNodeSupportsProtocol(node, protocol) {
+			return true
+		}
+	}
+	return false
+}
+
+type forwardEntryCandidate struct {
+	NodeID    string
+	Node      model.Node
+	Protocols []model.ForwardProtocol
+}
+
+type nodeStore interface {
+	GetNode(ctx context.Context, id string) (model.Node, error)
+}
+
+func forwardEntryCandidates(ctx context.Context, store nodeStore, tunnel model.Tunnel, protocols []model.ForwardProtocol) ([]forwardEntryCandidate, error) {
+	if len(tunnel.Stages) == 0 || len(tunnel.Stages[0].Nodes) == 0 {
+		return nil, errors.New("tunnel has no entry node")
+	}
+	out := make([]forwardEntryCandidate, 0, len(tunnel.Stages[0].Nodes))
+	for _, node := range tunnel.Stages[0].Nodes {
+		nodeID := strings.TrimSpace(node.NodeID)
+		if nodeID == "" {
+			continue
+		}
+		candidateProtocols := filterForwardProtocols(protocols, node.Protocols)
+		if len(candidateProtocols) == 0 {
+			continue
+		}
+		entryNode, err := store.GetNode(ctx, nodeID)
+		if err != nil || entryNode.Revoked {
+			return nil, errors.New("entry node not found")
+		}
+		out = append(out, forwardEntryCandidate{
+			NodeID:    nodeID,
+			Node:      entryNode,
+			Protocols: candidateProtocols,
+		})
+	}
+	if len(out) == 0 {
+		return nil, errors.New("tunnel has no entry node for forward protocols")
+	}
+	return out, nil
+}
+
+func filterForwardProtocols(protocols []model.ForwardProtocol, candidateProtocols []model.ForwardProtocol) []model.ForwardProtocol {
+	out := make([]model.ForwardProtocol, 0, len(protocols))
+	for _, protocol := range protocols {
+		if candidateSupportsProtocol(candidateProtocols, protocol) {
+			out = append(out, protocol)
+		}
+	}
+	return out
+}
+
+func candidateSupportsProtocol(candidateProtocols []model.ForwardProtocol, protocol model.ForwardProtocol) bool {
+	if len(candidateProtocols) == 0 {
+		return protocol == model.ForwardProtocolTCP || protocol == model.ForwardProtocolUDP
+	}
+	for _, candidateProtocol := range candidateProtocols {
+		if candidateProtocol == protocol {
+			return true
+		}
+	}
+	return false
+}
+
 func tunnelEntryNodeIDs(tunnel model.Tunnel) ([]string, error) {
 	if len(tunnel.Stages) == 0 || len(tunnel.Stages[0].Nodes) == 0 {
 		return nil, errors.New("tunnel has no entry node")
@@ -1243,6 +1380,70 @@ func ensurePortAvailableAcrossNodes(nodes []model.Node, protocols []model.Forwar
 		}
 	}
 	return nil
+}
+
+func allocateSharedProtocolPortAcrossEntryCandidates(candidates []forwardEntryCandidate, used usedPorts) (int, error) {
+	if len(candidates) == 0 {
+		return 0, errors.New("no entry nodes available")
+	}
+	min, max := normalizedPortRange(candidates[0].Node)
+	for _, candidate := range candidates[1:] {
+		nodeMin, nodeMax := normalizedPortRange(candidate.Node)
+		if nodeMin > min {
+			min = nodeMin
+		}
+		if nodeMax < max {
+			max = nodeMax
+		}
+	}
+	for port := min; port <= max; port++ {
+		if !portAvailableAcrossEntryCandidates(candidates, port, used) {
+			continue
+		}
+		for _, candidate := range candidates {
+			for _, protocol := range candidate.Protocols {
+				markPortUsed(used, candidate.Node.ID, string(protocol), port)
+			}
+		}
+		return port, nil
+	}
+	return 0, errors.New("no common forward port available across entry nodes")
+}
+
+func ensurePortAvailableAcrossEntryCandidates(candidates []forwardEntryCandidate, port int, used usedPorts) error {
+	if len(candidates) == 0 {
+		return errors.New("no entry nodes available")
+	}
+	for _, candidate := range candidates {
+		if err := ensurePortInRange(candidate.Node, port); err != nil {
+			return err
+		}
+		for _, protocol := range candidate.Protocols {
+			if isPortUsed(used, candidate.Node.ID, string(protocol), port) {
+				return fmt.Errorf("listen port %d/%s is already in use on node %s", port, protocol, candidate.Node.ID)
+			}
+		}
+	}
+	for _, candidate := range candidates {
+		for _, protocol := range candidate.Protocols {
+			markPortUsed(used, candidate.Node.ID, string(protocol), port)
+		}
+	}
+	return nil
+}
+
+func portAvailableAcrossEntryCandidates(candidates []forwardEntryCandidate, port int, used usedPorts) bool {
+	for _, candidate := range candidates {
+		if err := ensurePortInRange(candidate.Node, port); err != nil {
+			return false
+		}
+		for _, protocol := range candidate.Protocols {
+			if isPortUsed(used, candidate.Node.ID, string(protocol), port) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func portAvailableAcrossNodes(nodes []model.Node, protocols []model.ForwardProtocol, port int, used usedPorts) bool {
@@ -1568,7 +1769,9 @@ func scopeConfigForNode(nodeID string, tunnels []model.Tunnel, forwards []model.
 			continue
 		}
 		for _, forward := range forwardsByTunnel[tunnel.ID] {
-			scopedForwards = append(scopedForwards, scopeForwardRuntime(forward, tunnel, role))
+			if scopedForward, ok := scopeForwardRuntime(nodeID, forward, tunnel, role); ok {
+				scopedForwards = append(scopedForwards, scopedForward)
+			}
 		}
 	}
 	return scopedTunnels, scopedForwards
@@ -1584,13 +1787,16 @@ func scopeTunnelRuntime(nodeID string, tunnel model.Tunnel) model.TunnelRuntime 
 	}
 	for stageIndex, stage := range tunnel.Stages {
 		runtimeStage := model.TunnelRuntimeStage{
-			Index:    stage.Index,
-			Role:     stage.Role,
-			Strategy: stage.Strategy,
+			Index:       stage.Index,
+			Role:        stage.Role,
+			Strategy:    stage.Strategy,
+			TCPStrategy: stage.TCPStrategy,
+			UDPStrategy: stage.UDPStrategy,
 		}
 		for _, node := range stage.Nodes {
 			runtimeNode := model.TunnelRuntimeNode{
 				NodeID:      node.NodeID,
+				Protocols:   append([]model.ForwardProtocol(nil), node.Protocols...),
 				ListenAddr:  node.ListenAddr,
 				PublicAddr:  node.PublicAddr,
 				ConnectAddr: node.ConnectAddr,
@@ -1609,12 +1815,19 @@ func scopeTunnelRuntime(nodeID string, tunnel model.Tunnel) model.TunnelRuntime 
 	return runtime
 }
 
-func scopeForwardRuntime(forward model.Forward, tunnel model.Tunnel, role model.TunnelStageRole) model.ForwardRuntime {
+func scopeForwardRuntime(nodeID string, forward model.Forward, tunnel model.Tunnel, role model.TunnelStageRole) (model.ForwardRuntime, bool) {
+	protocols := append([]model.ForwardProtocol(nil), forward.Protocols...)
+	if candidate, ok := tunnelStageNodeForNode(tunnel, nodeID); ok {
+		protocols = filterForwardProtocols(protocols, candidate.Protocols)
+	}
+	if len(protocols) == 0 {
+		return model.ForwardRuntime{}, false
+	}
 	runtime := model.ForwardRuntime{
 		ID:        forward.ID,
 		Name:      forward.Name,
 		TunnelID:  forward.TunnelID,
-		Protocols: append([]model.ForwardProtocol(nil), forward.Protocols...),
+		Protocols: protocols,
 		Enabled:   forward.Enabled,
 	}
 	if role == model.TunnelStageEntry {
@@ -1626,7 +1839,7 @@ func scopeForwardRuntime(forward model.Forward, tunnel model.Tunnel, role model.
 	if role == model.TunnelStageExit {
 		runtime.Target = forward.Target
 	}
-	return runtime
+	return runtime, true
 }
 
 func nodeParticipatesInTunnel(nodeID string, tunnel model.Tunnel) bool {
@@ -1643,6 +1856,17 @@ func nodeTunnelRole(nodeID string, tunnel model.Tunnel) (model.TunnelStageRole, 
 		}
 	}
 	return "", false
+}
+
+func tunnelStageNodeForNode(tunnel model.Tunnel, nodeID string) (model.TunnelStageNode, bool) {
+	for _, stage := range tunnel.Stages {
+		for _, node := range stage.Nodes {
+			if node.NodeID == nodeID {
+				return node, true
+			}
+		}
+	}
+	return model.TunnelStageNode{}, false
 }
 
 func previousStageNodeID(tunnel model.Tunnel, stageIndex int) string {

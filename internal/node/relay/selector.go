@@ -45,16 +45,17 @@ func (s *candidateSelector) order(tunnelID string, stage model.TunnelRuntimeStag
 	defer s.mu.Unlock()
 
 	now := time.Now()
-	total := len(stage.Nodes)
+	candidates := stageCandidatesForNetwork(stage, network)
+	total := len(candidates)
 	if total == 0 {
 		return nil
 	}
 
-	strategy := normalizeStageStrategy(stage.Strategy)
+	strategy := strategyForNetwork(stage, network)
 	order := make([]int, 0, total)
 	switch strategy {
 	case "round_robin":
-		pool := weightedCandidatePool(stage.Nodes)
+		pool := weightedCandidatePool(candidates)
 		if len(pool) == 0 {
 			break
 		}
@@ -62,12 +63,13 @@ func (s *candidateSelector) order(tunnelID string, stage model.TunnelRuntimeStag
 		start := s.rr[key] % len(pool)
 		s.rr[key] = (start + 1) % len(pool)
 		for _, idx := range dedupeCandidatePool(pool[start:], pool[:start]) {
-			if s.candidateAvailableLocked(tunnelID, stage.Index, stage.Nodes[idx].NodeID, now) {
-				order = append(order, idx)
+			candidate := candidates[idx]
+			if s.candidateAvailableLocked(tunnelID, stage.Index, candidate.node.NodeID, network, now) {
+				order = append(order, candidate.index)
 			}
 		}
 	case "random":
-		pool := weightedCandidatePool(stage.Nodes)
+		pool := weightedCandidatePool(candidates)
 		if len(pool) == 0 {
 			break
 		}
@@ -75,40 +77,43 @@ func (s *candidateSelector) order(tunnelID string, stage model.TunnelRuntimeStag
 			pool[i], pool[j] = pool[j], pool[i]
 		})
 		for _, idx := range dedupeCandidatePool(pool) {
-			if s.candidateAvailableLocked(tunnelID, stage.Index, stage.Nodes[idx].NodeID, now) {
-				order = append(order, idx)
+			candidate := candidates[idx]
+			if s.candidateAvailableLocked(tunnelID, stage.Index, candidate.node.NodeID, network, now) {
+				order = append(order, candidate.index)
 			}
 		}
 	case "failover":
-		for idx := range stage.Nodes {
-			if s.candidateAvailableLocked(tunnelID, stage.Index, stage.Nodes[idx].NodeID, now) {
-				order = append(order, idx)
+		for _, candidate := range candidates {
+			if s.candidateAvailableLocked(tunnelID, stage.Index, candidate.node.NodeID, network, now) {
+				order = append(order, candidate.index)
 			}
 		}
 	case "single":
-		if s.candidateAvailableLocked(tunnelID, stage.Index, stage.Nodes[0].NodeID, now) {
-			order = append(order, 0)
+		candidate := candidates[0]
+		if s.candidateAvailableLocked(tunnelID, stage.Index, candidate.node.NodeID, network, now) {
+			order = append(order, candidate.index)
 		}
 	default:
-		if len(order) == 0 && s.candidateAvailableLocked(tunnelID, stage.Index, stage.Nodes[0].NodeID, now) {
-			order = append(order, 0)
+		candidate := candidates[0]
+		if len(order) == 0 && s.candidateAvailableLocked(tunnelID, stage.Index, candidate.node.NodeID, network, now) {
+			order = append(order, candidate.index)
 		}
 	}
 	return order
 }
 
-func (s *candidateSelector) recordSuccess(tunnelID string, stageIndex int, nodeID string) {
+func (s *candidateSelector) recordSuccess(tunnelID string, stageIndex int, nodeID, network string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	key := candidateSelectorKey(tunnelID, stageIndex, nodeID)
+	key := candidateSelectorKey(tunnelID, stageIndex, nodeID, network)
 	s.states[key] = &candidateState{}
 }
 
-func (s *candidateSelector) recordFailure(tunnelID string, stageIndex int, nodeID string) {
+func (s *candidateSelector) recordFailure(tunnelID string, stageIndex int, nodeID, network string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
-	key := candidateSelectorKey(tunnelID, stageIndex, nodeID)
+	key := candidateSelectorKey(tunnelID, stageIndex, nodeID, network)
 	state := s.states[key]
 	if state == nil {
 		state = &candidateState{}
@@ -124,8 +129,8 @@ func (s *candidateSelector) recordFailure(tunnelID string, stageIndex int, nodeI
 	}
 }
 
-func (s *candidateSelector) candidateAvailableLocked(tunnelID string, stageIndex int, nodeID string, now time.Time) bool {
-	key := candidateSelectorKey(tunnelID, stageIndex, nodeID)
+func (s *candidateSelector) candidateAvailableLocked(tunnelID string, stageIndex int, nodeID, network string, now time.Time) bool {
+	key := candidateSelectorKey(tunnelID, stageIndex, nodeID, network)
 	state := s.states[key]
 	if state == nil {
 		return true
@@ -142,8 +147,8 @@ func stageSelectorKey(tunnelID string, stageIndex int, network string) string {
 	return tunnelID + ":" + strconv.Itoa(stageIndex) + ":" + strings.ToLower(strings.TrimSpace(network))
 }
 
-func candidateSelectorKey(tunnelID string, stageIndex int, nodeID string) string {
-	return tunnelID + ":" + strconv.Itoa(stageIndex) + ":" + nodeID
+func candidateSelectorKey(tunnelID string, stageIndex int, nodeID, network string) string {
+	return tunnelID + ":" + strconv.Itoa(stageIndex) + ":" + strings.ToLower(strings.TrimSpace(network)) + ":" + nodeID
 }
 
 func normalizeStageStrategy(strategy string) string {
@@ -161,10 +166,55 @@ func normalizeStageStrategy(strategy string) string {
 	}
 }
 
-func weightedCandidatePool(nodes []model.TunnelRuntimeNode) []int {
-	pool := make([]int, 0, len(nodes))
-	for idx, node := range nodes {
-		weight := node.Weight
+func strategyForNetwork(stage model.TunnelRuntimeStage, network string) string {
+	switch strings.ToLower(strings.TrimSpace(network)) {
+	case "tcp":
+		if normalized := normalizeStageStrategy(stage.TCPStrategy); normalized != "single" || strings.TrimSpace(stage.TCPStrategy) != "" {
+			return normalized
+		}
+	case "udp":
+		if normalized := normalizeStageStrategy(stage.UDPStrategy); normalized != "single" || strings.TrimSpace(stage.UDPStrategy) != "" {
+			return normalized
+		}
+	}
+	return normalizeStageStrategy(stage.Strategy)
+}
+
+type stageCandidate struct {
+	index int
+	node  model.TunnelRuntimeNode
+}
+
+func stageCandidatesForNetwork(stage model.TunnelRuntimeStage, network string) []stageCandidate {
+	out := make([]stageCandidate, 0, len(stage.Nodes))
+	protocol := model.ForwardProtocol(strings.ToLower(strings.TrimSpace(network)))
+	for idx, node := range stage.Nodes {
+		if runtimeNodeSupportsProtocol(node, protocol) {
+			out = append(out, stageCandidate{index: idx, node: node})
+		}
+	}
+	return out
+}
+
+func runtimeNodeSupportsProtocol(node model.TunnelRuntimeNode, protocol model.ForwardProtocol) bool {
+	if protocol != model.ForwardProtocolTCP && protocol != model.ForwardProtocolUDP {
+		return false
+	}
+	if len(node.Protocols) == 0 {
+		return true
+	}
+	for _, candidateProtocol := range node.Protocols {
+		if candidateProtocol == protocol {
+			return true
+		}
+	}
+	return false
+}
+
+func weightedCandidatePool(candidates []stageCandidate) []int {
+	pool := make([]int, 0, len(candidates))
+	for idx, candidate := range candidates {
+		weight := candidate.node.Weight
 		if weight <= 0 {
 			weight = 1
 		}

@@ -79,14 +79,16 @@ type Tunnel struct {
 }
 
 type TunnelStage struct {
-	ID        string            `json:"id"`
-	TunnelID  string            `json:"tunnel_id"`
-	Index     int               `json:"index"`
-	Role      TunnelStageRole   `json:"role"`
-	Strategy  string            `json:"strategy"`
-	Nodes     []TunnelStageNode `json:"nodes"`
-	CreatedAt time.Time         `json:"created_at"`
-	UpdatedAt time.Time         `json:"updated_at"`
+	ID          string            `json:"id"`
+	TunnelID    string            `json:"tunnel_id"`
+	Index       int               `json:"index"`
+	Role        TunnelStageRole   `json:"role"`
+	Strategy    string            `json:"strategy"`
+	TCPStrategy string            `json:"tcp_strategy,omitempty"`
+	UDPStrategy string            `json:"udp_strategy,omitempty"`
+	Nodes       []TunnelStageNode `json:"nodes"`
+	CreatedAt   time.Time         `json:"created_at"`
+	UpdatedAt   time.Time         `json:"updated_at"`
 }
 
 type TunnelStageNode struct {
@@ -94,6 +96,7 @@ type TunnelStageNode struct {
 	TunnelID    string            `json:"tunnel_id"`
 	StageID     string            `json:"stage_id"`
 	NodeID      string            `json:"node_id"`
+	Protocols   []ForwardProtocol `json:"protocols,omitempty"`
 	ListenAddr  string            `json:"listen_addr,omitempty"`
 	PublicAddr  string            `json:"public_addr,omitempty"`
 	ConnectAddr string            `json:"connect_addr,omitempty"`
@@ -147,14 +150,17 @@ type TunnelRuntime struct {
 }
 
 type TunnelRuntimeStage struct {
-	Index    int                 `json:"index"`
-	Role     TunnelStageRole     `json:"role"`
-	Strategy string              `json:"strategy"`
-	Nodes    []TunnelRuntimeNode `json:"nodes"`
+	Index       int                 `json:"index"`
+	Role        TunnelStageRole     `json:"role"`
+	Strategy    string              `json:"strategy"`
+	TCPStrategy string              `json:"tcp_strategy,omitempty"`
+	UDPStrategy string              `json:"udp_strategy,omitempty"`
+	Nodes       []TunnelRuntimeNode `json:"nodes"`
 }
 
 type TunnelRuntimeNode struct {
 	NodeID      string            `json:"node_id"`
+	Protocols   []ForwardProtocol `json:"protocols,omitempty"`
 	ListenAddr  string            `json:"listen_addr,omitempty"`
 	PublicAddr  string            `json:"public_addr,omitempty"`
 	ConnectAddr string            `json:"connect_addr,omitempty"`

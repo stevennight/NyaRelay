@@ -196,11 +196,14 @@ describe('tunnels and forwards pages', () => {
           index: 0,
           role: 'entry',
           strategy: 'single',
+          tcp_strategy: 'single',
+          udp_strategy: 'single',
           nodes: [
             {
               id: '',
               node_id: 'cn-1',
               weight: 1,
+              protocols: ['tcp', 'udp'],
             },
           ],
         },
@@ -209,11 +212,14 @@ describe('tunnels and forwards pages', () => {
           index: 1,
           role: 'middle',
           strategy: 'single',
+          tcp_strategy: 'single',
+          udp_strategy: 'single',
           nodes: [
             {
               id: '',
               node_id: 'sg-1',
               weight: 1,
+              protocols: ['tcp', 'udp'],
             },
           ],
         },
@@ -222,13 +228,72 @@ describe('tunnels and forwards pages', () => {
           index: 2,
           role: 'exit',
           strategy: 'single',
+          tcp_strategy: 'single',
+          udp_strategy: 'single',
           nodes: [
             {
               id: '',
               node_id: 'hk-1',
               weight: 1,
+              protocols: ['tcp', 'udp'],
             },
           ],
+        },
+      ],
+    })
+  })
+
+  it('saves tunnel tcp/udp strategies and candidate protocol masks', async () => {
+    const fetchMock = installFetch([
+      {
+        path: '/api/tunnels',
+        method: 'GET',
+        response: jsonResponse([]),
+      },
+      {
+        path: '/api/nodes',
+        method: 'GET',
+        response: jsonResponse(nodes),
+      },
+      {
+        path: '/api/tunnels',
+        method: 'POST',
+        response: jsonResponse({
+          ...tunnel,
+          id: 'tun-protocols',
+          name: 'protocols',
+        }),
+      },
+    ])
+
+    renderWithClient(<TunnelNewPage />)
+
+    expect(await screen.findByRole('dialog', { name: '新建隧道' })).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('名称'), { target: { value: 'protocols' } })
+    fireEvent.change(screen.getByLabelText('候选节点 1-1'), { target: { value: 'cn-1' } })
+    fireEvent.change(screen.getByLabelText('TCP 策略'), { target: { value: 'round_robin' } })
+    fireEvent.change(screen.getByLabelText('UDP 策略'), { target: { value: 'failover' } })
+    fireEvent.click(screen.getByLabelText('UDP'))
+    fireEvent.click(screen.getByRole('button', { name: '保存隧道' }))
+
+    await waitFor(() => {
+      expect(routerMocks.navigate).toHaveBeenCalledWith({
+        to: '/tunnels/$tunnelId',
+        params: { tunnelId: 'tun-protocols' },
+        replace: true,
+      })
+    })
+
+    const createCall = fetchMock.mock.calls.find(([path, init]) => path === '/api/tunnels' && init?.method === 'POST')
+    const body = JSON.parse(String(createCall?.[1]?.body))
+    expect(body.stages[0]).toMatchObject({
+      strategy: 'single',
+      tcp_strategy: 'round_robin',
+      udp_strategy: 'failover',
+      nodes: [
+        {
+          node_id: 'cn-1',
+          protocols: ['tcp'],
         },
       ],
     })
@@ -290,8 +355,8 @@ describe('tunnels and forwards pages', () => {
     const dialog = await screen.findByRole('dialog', { name: 'cn-sg-hk' })
     expect(dialog).toBeInTheDocument()
     expect(await within(dialog).findByText('China Edge -> Hong Kong Exit')).toBeInTheDocument()
-    expect(within(dialog).getByText('China Edge')).toBeInTheDocument()
-    expect(within(dialog).getByText('Hong Kong Exit')).toBeInTheDocument()
+    expect(within(dialog).getByText('China Edge (TCP+UDP)')).toBeInTheDocument()
+    expect(within(dialog).getByText('Hong Kong Exit (TCP+UDP)')).toBeInTheDocument()
     expect(within(dialog).queryByText('cn-1')).not.toBeInTheDocument()
     expect(within(dialog).queryByText('hk-1')).not.toBeInTheDocument()
   })

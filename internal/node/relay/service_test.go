@@ -11,6 +11,7 @@ import (
 
 	sharedcrypto "nyarelay/internal/shared/crypto"
 	"nyarelay/internal/shared/model"
+	"nyarelay/internal/shared/protocol"
 )
 
 func TestSingleNodeTCPDirectOut(t *testing.T) {
@@ -232,6 +233,199 @@ func TestTwoNodeUDPChain(t *testing.T) {
 	assertUDPRoundTrip(t, entryListen, "nya-udp-hop")
 }
 
+func TestUDPMultiCandidateUsesSessionAffinityAndProtocolMask(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	targetA, closeTargetA := udpPrefixEchoServer(t, "a:")
+	defer closeTargetA()
+	targetB, closeTargetB := udpPrefixEchoServer(t, "b:")
+	defer closeTargetB()
+
+	entryListen := freeUDPAddr(t)
+	exitAListen := freeTCPAddr(t)
+	exitBListen := freeTCPAddr(t)
+	tunnel := model.TunnelRuntime{
+		ID:        "tun_udp_multi",
+		Name:      "udp-multi",
+		Type:      model.TunnelChain,
+		Transport: model.TunnelTransportDirect,
+		Stages: []model.TunnelRuntimeStage{
+			runtimeStage(0, model.TunnelStageEntry, runtimeNode("node_entry", "", "", nil)),
+			{
+				Index:       1,
+				Role:        model.TunnelStageExit,
+				Strategy:    "failover",
+				UDPStrategy: "round_robin",
+				Nodes: []model.TunnelRuntimeNode{
+					{
+						NodeID:     "node_tcp_only",
+						Protocols:  []model.ForwardProtocol{model.ForwardProtocolTCP},
+						PublicAddr: freeTCPAddr(t),
+						Weight:     1,
+						Settings:   map[string]string{},
+					},
+					runtimeNode("node_exit_a", exitAListen, exitAListen, map[string]string{}),
+					runtimeNode("node_exit_b", exitBListen, exitBListen, map[string]string{}),
+				},
+			},
+		},
+	}
+
+	exitAService := New(testLogger(), "node_exit_a")
+	forwardA := chainForward(entryListen, targetA, model.ForwardProtocolUDP)
+	forwardA.TunnelID = tunnel.ID
+	if err := exitAService.Apply(ctx, model.RelayConfig{NodeID: "node_exit_a", Revision: 1, Tunnels: []model.TunnelRuntime{tunnel}, Forwards: []model.ForwardRuntime{forwardA}}); err != nil {
+		t.Fatal(err)
+	}
+	exitBService := New(testLogger(), "node_exit_b")
+	forwardB := chainForward(entryListen, targetB, model.ForwardProtocolUDP)
+	forwardB.TunnelID = tunnel.ID
+	if err := exitBService.Apply(ctx, model.RelayConfig{NodeID: "node_exit_b", Revision: 1, Tunnels: []model.TunnelRuntime{tunnel}, Forwards: []model.ForwardRuntime{forwardB}}); err != nil {
+		t.Fatal(err)
+	}
+	entryService := New(testLogger(), "node_entry")
+	entryForward := chainForward(entryListen, "", model.ForwardProtocolUDP)
+	entryForward.TunnelID = tunnel.ID
+	if err := entryService.Apply(ctx, model.RelayConfig{NodeID: "node_entry", Revision: 1, Tunnels: []model.TunnelRuntime{tunnel}, Forwards: []model.ForwardRuntime{entryForward}}); err != nil {
+		t.Fatal(err)
+	}
+
+	clientOne := newUDPTestClient(t, entryListen)
+	defer clientOne.close()
+	clientOneFirst := clientOne.roundTrip(t, "one-1")
+	clientOneSecond := clientOne.roundTrip(t, "one-2")
+	if clientOneFirst[:2] != clientOneSecond[:2] {
+		t.Fatalf("same udp client moved candidates: first=%q second=%q", clientOneFirst, clientOneSecond)
+	}
+	if clientOneFirst[:2] != "a:" {
+		t.Fatalf("first udp session used %q, want node_exit_a after skipping tcp-only candidate", clientOneFirst)
+	}
+
+	clientTwo := udpRoundTripFromClient(t, entryListen, "two-1")
+	if clientTwo[:2] != "b:" {
+		t.Fatalf("second udp session used %q, want node_exit_b by round robin", clientTwo)
+	}
+}
+
+func TestUDPMultiCandidateExpiresSessionAffinity(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	targetA, closeTargetA := udpPrefixEchoServer(t, "a:")
+	defer closeTargetA()
+	targetB, closeTargetB := udpPrefixEchoServer(t, "b:")
+	defer closeTargetB()
+
+	entryListen := freeUDPAddr(t)
+	exitAListen := freeTCPAddr(t)
+	exitBListen := freeTCPAddr(t)
+	tunnel := model.TunnelRuntime{
+		ID:        "tun_udp_expire",
+		Name:      "udp-expire",
+		Type:      model.TunnelChain,
+		Transport: model.TunnelTransportDirect,
+		Stages: []model.TunnelRuntimeStage{
+			runtimeStage(0, model.TunnelStageEntry, runtimeNode("node_entry", "", "", nil)),
+			{
+				Index:       1,
+				Role:        model.TunnelStageExit,
+				Strategy:    "failover",
+				UDPStrategy: "round_robin",
+				Nodes: []model.TunnelRuntimeNode{
+					runtimeNode("node_exit_a", exitAListen, exitAListen, map[string]string{}),
+					runtimeNode("node_exit_b", exitBListen, exitBListen, map[string]string{}),
+				},
+			},
+		},
+	}
+
+	exitAService := New(testLogger(), "node_exit_a")
+	forwardA := chainForward(entryListen, targetA, model.ForwardProtocolUDP)
+	forwardA.TunnelID = tunnel.ID
+	if err := exitAService.Apply(ctx, model.RelayConfig{NodeID: "node_exit_a", Revision: 1, Tunnels: []model.TunnelRuntime{tunnel}, Forwards: []model.ForwardRuntime{forwardA}}); err != nil {
+		t.Fatal(err)
+	}
+	exitBService := New(testLogger(), "node_exit_b")
+	forwardB := chainForward(entryListen, targetB, model.ForwardProtocolUDP)
+	forwardB.TunnelID = tunnel.ID
+	if err := exitBService.Apply(ctx, model.RelayConfig{NodeID: "node_exit_b", Revision: 1, Tunnels: []model.TunnelRuntime{tunnel}, Forwards: []model.ForwardRuntime{forwardB}}); err != nil {
+		t.Fatal(err)
+	}
+	entryService := New(testLogger(), "node_entry")
+	entryService.udp.idleTimeout = 20 * time.Millisecond
+	entryForward := chainForward(entryListen, "", model.ForwardProtocolUDP)
+	entryForward.TunnelID = tunnel.ID
+	if err := entryService.Apply(ctx, model.RelayConfig{NodeID: "node_entry", Revision: 1, Tunnels: []model.TunnelRuntime{tunnel}, Forwards: []model.ForwardRuntime{entryForward}}); err != nil {
+		t.Fatal(err)
+	}
+
+	client := newUDPTestClient(t, entryListen)
+	defer client.close()
+	if got := client.roundTrip(t, "first"); got != "a:first" {
+		t.Fatalf("first udp packet = %q, want a:first", got)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := client.roundTrip(t, "second"); got != "b:second" {
+		t.Fatalf("expired udp session should reselect by round robin, got %q", got)
+	}
+}
+
+func TestUDPMultiCandidateReselectsOnReadFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	targetB, closeTargetB := udpPrefixEchoServer(t, "b:")
+	defer closeTargetB()
+
+	entryListen := freeUDPAddr(t)
+	exitAListen := freeTCPAddr(t)
+	exitBListen := freeTCPAddr(t)
+	closeBrokenStage := brokenUDPStageServer(t, exitAListen)
+	defer closeBrokenStage()
+	tunnel := model.TunnelRuntime{
+		ID:        "tun_udp_reselect",
+		Name:      "udp-reselect",
+		Type:      model.TunnelChain,
+		Transport: model.TunnelTransportDirect,
+		Stages: []model.TunnelRuntimeStage{
+			runtimeStage(0, model.TunnelStageEntry, runtimeNode("node_entry", "", "", nil)),
+			{
+				Index:       1,
+				Role:        model.TunnelStageExit,
+				Strategy:    "failover",
+				UDPStrategy: "failover",
+				Nodes: []model.TunnelRuntimeNode{
+					runtimeNode("node_exit_a", exitAListen, exitAListen, map[string]string{}),
+					runtimeNode("node_exit_b", exitBListen, exitBListen, map[string]string{}),
+				},
+			},
+		},
+	}
+
+	exitBService := New(testLogger(), "node_exit_b")
+	forwardB := chainForward(entryListen, targetB, model.ForwardProtocolUDP)
+	forwardB.TunnelID = tunnel.ID
+	if err := exitBService.Apply(ctx, model.RelayConfig{NodeID: "node_exit_b", Revision: 1, Tunnels: []model.TunnelRuntime{tunnel}, Forwards: []model.ForwardRuntime{forwardB}}); err != nil {
+		t.Fatal(err)
+	}
+	entryService := New(testLogger(), "node_entry")
+	entryForward := chainForward(entryListen, "", model.ForwardProtocolUDP)
+	entryForward.TunnelID = tunnel.ID
+	if err := entryService.Apply(ctx, model.RelayConfig{NodeID: "node_entry", Revision: 1, Tunnels: []model.TunnelRuntime{tunnel}, Forwards: []model.ForwardRuntime{entryForward}}); err != nil {
+		t.Fatal(err)
+	}
+
+	client := newUDPTestClient(t, entryListen)
+	defer client.close()
+	if got := client.roundTrip(t, "first"); got != "b:first" {
+		t.Fatalf("udp packet after first candidate failure = %q, want b:first", got)
+	}
+	if got := client.roundTrip(t, "second"); got != "b:second" {
+		t.Fatalf("udp session did not stay on reselected candidate: %q", got)
+	}
+}
+
 func TestApplyKeepsPreviousListenersWhenNewConfigFails(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -415,6 +609,61 @@ func udpEchoServer(t *testing.T) (string, func()) {
 	}
 }
 
+func udpPrefixEchoServer(t *testing.T, prefix string) (string, func()) {
+	t.Helper()
+	addr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buf := make([]byte, 64*1024)
+		for {
+			n, remote, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			response := append([]byte(prefix), buf[:n]...)
+			_, _ = conn.WriteToUDP(response, remote)
+		}
+	}()
+	return conn.LocalAddr().String(), func() {
+		_ = conn.Close()
+		<-done
+	}
+}
+
+func brokenUDPStageServer(t *testing.T, addr string) func() {
+	t.Helper()
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = protocol.ReadHello(conn)
+			}(conn)
+		}
+	}()
+	return func() {
+		_ = ln.Close()
+		<-done
+	}
+}
+
 func freeUDPAddr(t *testing.T) string {
 	t.Helper()
 	addr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
@@ -460,6 +709,24 @@ func assertTCPRoundTrip(t *testing.T, addr, payload string) {
 
 func assertUDPRoundTrip(t *testing.T, addr, payload string) {
 	t.Helper()
+	if got := udpRoundTripFromClient(t, addr, payload); got != payload {
+		t.Fatalf("got %q, want %q", got, payload)
+	}
+}
+
+func udpRoundTripFromClient(t *testing.T, addr, payload string) string {
+	t.Helper()
+	client := newUDPTestClient(t, addr)
+	defer client.close()
+	return client.roundTrip(t, payload)
+}
+
+type udpTestClient struct {
+	conn *net.UDPConn
+}
+
+func newUDPTestClient(t *testing.T, addr string) udpTestClient {
+	t.Helper()
 	remote, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		t.Fatal(err)
@@ -468,19 +735,25 @@ func assertUDPRoundTrip(t *testing.T, addr, payload string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	if _, err := conn.Write([]byte(payload)); err != nil {
+	return udpTestClient{conn: conn}
+}
+
+func (c udpTestClient) close() {
+	_ = c.conn.Close()
+}
+
+func (c udpTestClient) roundTrip(t *testing.T, payload string) string {
+	t.Helper()
+	_ = c.conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := c.conn.Write([]byte(payload)); err != nil {
 		t.Fatal(err)
 	}
 	buf := make([]byte, 1024)
-	n, err := conn.Read(buf)
+	n, err := c.conn.Read(buf)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(buf[:n]) != payload {
-		t.Fatalf("got %q, want %q", string(buf[:n]), payload)
-	}
+	return string(buf[:n])
 }
 
 func TestMain(m *testing.M) {
