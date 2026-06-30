@@ -98,6 +98,29 @@ const tunnel = {
   updated_at: '2026-06-25T09:00:00Z',
 }
 
+function createDataTransfer(): DataTransfer {
+  const values = new Map<string, string>()
+  return {
+    effectAllowed: '',
+    dropEffect: '',
+    files: [] as unknown as FileList,
+    items: [] as unknown as DataTransferItemList,
+    types: [],
+    clearData: (format?: string) => {
+      if (format) {
+        values.delete(format)
+      } else {
+        values.clear()
+      }
+    },
+    getData: (format: string) => values.get(format) ?? '',
+    setData: (format: string, value: string) => {
+      values.set(format, value)
+    },
+    setDragImage: () => undefined,
+  } as unknown as DataTransfer
+}
+
 describe('tunnels and forwards pages', () => {
   it('shows the empty tunnels state', async () => {
     installFetch([
@@ -299,6 +322,64 @@ describe('tunnels and forwards pages', () => {
     })
   })
 
+  it('reorders tunnel candidates by drag and drop before saving', async () => {
+    const fetchMock = installFetch([
+      {
+        path: '/api/tunnels',
+        method: 'GET',
+        response: jsonResponse([]),
+      },
+      {
+        path: '/api/nodes',
+        method: 'GET',
+        response: jsonResponse(nodes),
+      },
+      {
+        path: '/api/tunnels',
+        method: 'POST',
+        response: jsonResponse({
+          ...tunnel,
+          id: 'tun-dragged',
+          name: 'candidate-order',
+        }),
+      },
+    ])
+
+    renderWithClient(<TunnelNewPage />)
+
+    expect(await screen.findByRole('dialog', { name: '新建隧道' })).toBeInTheDocument()
+    expect(await screen.findByRole('option', { name: 'China Edge' })).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('名称'), { target: { value: 'candidate-order' } })
+    fireEvent.change(screen.getByLabelText('候选节点 1-1'), { target: { value: 'cn-1' } })
+    fireEvent.click(screen.getByRole('button', { name: '添加候选' }))
+    fireEvent.change(screen.getByLabelText('候选节点 1-2'), { target: { value: 'sg-1' } })
+
+    const dataTransfer = createDataTransfer()
+    const sourceHandle = screen.getByRole('button', { name: '拖拽排序候选 1-2' })
+    const targetRow = screen.getByRole('button', { name: '拖拽排序候选 1-1' }).closest('.candidate-row')
+    expect(targetRow).not.toBeNull()
+    fireEvent.dragStart(sourceHandle, { dataTransfer })
+    fireEvent.dragOver(targetRow as Element, { dataTransfer })
+    fireEvent.drop(targetRow as Element, { dataTransfer })
+
+    expect(screen.getByLabelText('候选节点 1-1')).toHaveValue('sg-1')
+    expect(screen.getByLabelText('候选节点 1-2')).toHaveValue('cn-1')
+
+    fireEvent.click(screen.getByRole('button', { name: '保存隧道' }))
+
+    await waitFor(() => {
+      expect(routerMocks.navigate).toHaveBeenCalledWith({
+        to: '/tunnels/$tunnelId',
+        params: { tunnelId: 'tun-dragged' },
+        replace: true,
+      })
+    })
+
+    const createCall = fetchMock.mock.calls.find(([path, init]) => path === '/api/tunnels' && init?.method === 'POST')
+    const body = JSON.parse(String(createCall?.[1]?.body))
+    expect(body.stages[0].nodes.map((node: { node_id: string }) => node.node_id)).toEqual(['sg-1', 'cn-1'])
+  })
+
   it('shows tunnel node names in the list and detail modal', async () => {
     const namedTunnel = {
       ...tunnel,
@@ -375,7 +456,7 @@ describe('tunnels and forwards pages', () => {
     expect(await screen.findByText('还没有转发')).toBeInTheDocument()
   })
 
-  it('filters forwards by name, tunnel, and entry address', async () => {
+  it('filters forwards by name, tunnel, entry address, and target address', async () => {
     const backupTunnel = {
       ...tunnel,
       id: 'tun-2',
@@ -460,6 +541,11 @@ describe('tunnels and forwards pages', () => {
     fireEvent.change(screen.getByLabelText('入口地址'), { target: { value: 'edge.example.com:9443' } })
     expect(screen.queryByText('web-public')).not.toBeInTheDocument()
     expect(screen.getByText('admin-panel')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '重置' }))
+    fireEvent.change(screen.getByLabelText('目标地址'), { target: { value: '10.0.0.8' } })
+    expect(screen.getByText('web-public')).toBeInTheDocument()
+    expect(screen.queryByText('admin-panel')).not.toBeInTheDocument()
   })
 
   it('creates a tcp+udp forward and normalizes protocols', async () => {

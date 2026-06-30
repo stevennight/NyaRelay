@@ -420,7 +420,7 @@ td small {
 .list-filters {
   width: min(960px, 100%);
   display: grid;
-  grid-template-columns: minmax(160px, 1fr) minmax(180px, 1fr) minmax(200px, 1fr) auto;
+  grid-template-columns: minmax(150px, 1fr) minmax(160px, 1fr) minmax(190px, 1fr) minmax(190px, 1fr) auto;
   gap: 12px;
   align-items: end;
 }
@@ -761,7 +761,22 @@ td small {
 }
 
 .candidate-row {
-  grid-template-columns: 32px minmax(180px, 2fr) minmax(110px, 1fr) minmax(126px, auto) auto;
+  grid-template-columns: 32px 40px minmax(180px, 2fr) minmax(110px, 1fr) minmax(126px, auto) auto;
+}
+
+.candidate-row.dragging {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.10);
+  opacity: 0.72;
+}
+
+.candidate-drag-handle {
+  color: var(--muted-strong);
+  cursor: grab;
+}
+
+.candidate-drag-handle:active {
+  cursor: grabbing;
 }
 
 .candidate-weight {
@@ -967,14 +982,20 @@ td small {
 
   .hop > select,
   .hop > input,
-  .hop > button,
+  .hop > button:not(.candidate-drag-handle),
   .candidate-weight,
   .candidate-protocols {
     grid-column: 2;
   }
 
-  .candidate-row > button {
+  .candidate-row > button:not(.candidate-drag-handle) {
     width: 100%;
+  }
+
+  .candidate-drag-handle {
+    grid-column: 2;
+    grid-row: 1;
+    justify-self: start;
   }
 }
 

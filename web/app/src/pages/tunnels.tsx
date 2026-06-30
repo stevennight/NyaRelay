@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate } from '@tanstack/react-router'
-import { Pause, Play, Plus, Settings, Trash2 } from 'lucide-react'
+import { GripVertical, Pause, Play, Plus, Settings, Trash2 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { api, post } from '../api'
 import type { ForwardProtocol, NodeInfo, TunnelInfo, TunnelStageRole, TunnelTransport, TunnelType } from '../types'
@@ -343,6 +343,7 @@ function TunnelEditor({
   }, [allNodes, initialTunnel])
   const [form, setForm] = useState<TunnelForm>(emptyTunnelForm())
   const [error, setError] = useState('')
+  const [draggingCandidate, setDraggingCandidate] = useState<{ stageIndex: number; nodeIndex: number } | null>(null)
 
   useEffect(() => {
     if (!initialTunnel) return
@@ -564,8 +565,49 @@ function TunnelEditor({
                 </FieldGrid>
                 <div className="hop-list">
                   {stage.nodes.map((nodeForm, nodeIndex) => (
-                    <div className="hop candidate-row" key={nodeForm.id || `${stageIndex}-${nodeIndex}`}>
+                    <div
+                      className={`hop candidate-row${draggingCandidate?.stageIndex === stageIndex && draggingCandidate.nodeIndex === nodeIndex ? ' dragging' : ''}`}
+                      key={nodeForm.id || `${stageIndex}-${nodeIndex}`}
+                      onDragOver={(event) => {
+                        if (!draggingCandidate || draggingCandidate.stageIndex !== stageIndex) return
+                        event.preventDefault()
+                        event.dataTransfer.dropEffect = 'move'
+                      }}
+                      onDrop={(event) => {
+                        event.preventDefault()
+                        const source = parseCandidateDragData(event.dataTransfer.getData('text/plain'))
+                        if (!source || source.stageIndex !== stageIndex || source.nodeIndex === nodeIndex) {
+                          setDraggingCandidate(null)
+                          return
+                        }
+                        setForm((current) => ({
+                          ...current,
+                          stages: current.stages.map((item, idx) => (
+                            idx === stageIndex
+                              ? { ...item, nodes: moveArrayItem(item.nodes, source.nodeIndex, nodeIndex) }
+                              : item
+                          )),
+                        }))
+                        setDraggingCandidate(null)
+                      }}
+                    >
                       <span>{nodeIndex + 1}</span>
+                      <button
+                        type="button"
+                        className="ghost icon-button candidate-drag-handle"
+                        aria-label={`拖拽排序候选 ${stageIndex + 1}-${nodeIndex + 1}`}
+                        disabled={stage.nodes.length === 1}
+                        draggable={stage.nodes.length > 1}
+                        onDragStart={(event) => {
+                          if (stage.nodes.length === 1) return
+                          event.dataTransfer.effectAllowed = 'move'
+                          event.dataTransfer.setData('text/plain', `${stageIndex}:${nodeIndex}`)
+                          setDraggingCandidate({ stageIndex, nodeIndex })
+                        }}
+                        onDragEnd={() => setDraggingCandidate(null)}
+                      >
+                        <GripVertical size={16} />
+                      </button>
                       <select
                         aria-label={`候选节点 ${stageIndex + 1}-${nodeIndex + 1}`}
                         value={nodeForm.node_id}
@@ -762,6 +804,30 @@ function insertMiddleStage(stages: TunnelStageForm[]): TunnelStageForm[] {
     return [...stages, emptyStageForm()]
   }
   return [...stages.slice(0, stages.length - 1), emptyStageForm(), stages[stages.length - 1]]
+}
+
+function parseCandidateDragData(value: string): { stageIndex: number; nodeIndex: number } | null {
+  const [stageIndex, nodeIndex] = value.split(':').map((part) => Number(part))
+  if (!Number.isInteger(stageIndex) || !Number.isInteger(nodeIndex)) {
+    return null
+  }
+  return { stageIndex, nodeIndex }
+}
+
+function moveArrayItem<T>(items: T[], fromIndex: number, toIndex: number): T[] {
+  if (
+    fromIndex === toIndex ||
+    fromIndex < 0 ||
+    toIndex < 0 ||
+    fromIndex >= items.length ||
+    toIndex >= items.length
+  ) {
+    return items
+  }
+  const next = [...items]
+  const [moved] = next.splice(fromIndex, 1)
+  next.splice(toIndex, 0, moved)
+  return next
 }
 
 function normalizeNodeProtocols(protocols?: ForwardProtocol[]): ForwardProtocol[] {

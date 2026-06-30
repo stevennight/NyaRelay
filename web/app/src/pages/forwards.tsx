@@ -36,6 +36,7 @@ type ForwardFilters = {
   name: string
   tunnelID: string
   entryAddress: string
+  targetAddress: string
 }
 
 const emptyForwardForm = (): ForwardForm => ({
@@ -52,6 +53,7 @@ const emptyForwardFilters = (): ForwardFilters => ({
   name: '',
   tunnelID: '',
   entryAddress: '',
+  targetAddress: '',
 })
 
 export function ForwardsPage() {
@@ -122,6 +124,7 @@ function ForwardsListView({
   const filteredForwards = useMemo(() => {
     const nameNeedle = filters.name.trim().toLowerCase()
     const entryNeedle = filters.entryAddress.trim().toLowerCase()
+    const targetNeedle = filters.targetAddress.trim().toLowerCase()
 
     return forwards.filter((forward) => {
       const tunnel = tunnelMap.get(forward.tunnel_id)
@@ -140,10 +143,15 @@ function ForwardsListView({
           return false
         }
       }
+      if (targetNeedle && !forward.target.toLowerCase().includes(targetNeedle)) {
+        return false
+      }
       return true
     })
   }, [filters, forwards, nodeMap, tunnelMap])
-  const hasActiveFilters = Boolean(filters.name.trim() || filters.tunnelID || filters.entryAddress.trim())
+  const hasActiveFilters = Boolean(
+    filters.name.trim() || filters.tunnelID || filters.entryAddress.trim() || filters.targetAddress.trim(),
+  )
 
   return (
     <PageFrame
@@ -196,6 +204,13 @@ function ForwardsListView({
                 placeholder="入口节点域名或 IP"
               />
             </Field>
+            <Field label="目标地址">
+              <input
+                value={filters.targetAddress}
+                onChange={(event) => setFilters((current) => ({ ...current, targetAddress: event.target.value }))}
+                placeholder="最终目标地址或端口"
+              />
+            </Field>
             <button
               className="ghost"
               type="button"
@@ -207,7 +222,7 @@ function ForwardsListView({
             </button>
           </div>
           {filteredForwards.length === 0 ? (
-            <EmptyState title="没有匹配的转发" text="调整名称、隧道或入口地址筛选后再查看。" />
+            <EmptyState title="没有匹配的转发" text="调整名称、隧道、入口地址或目标地址筛选后再查看。" />
           ) : (
             <Table headers={['名称', '协议', '隧道', '入口地址', '目标', '状态']}>
               {filteredForwards.map((forward) => {
