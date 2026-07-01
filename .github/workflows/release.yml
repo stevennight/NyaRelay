@@ -14,7 +14,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       build_date: ${{ steps.release-meta.outputs.build_date }}
-      public_key: ${{ steps.node-release.outputs.public_key }}
 
     steps:
       - name: Check out repository
@@ -108,8 +107,8 @@ jobs:
             NYARELAY_VERSION=${{ github.ref_name }}
             NYARELAY_COMMIT=${{ github.sha }}
             NYARELAY_BUILD_DATE=${{ needs.release-assets.outputs.build_date }}
-            NYARELAY_UPDATE_PUBLIC_KEY=${{ needs.release-assets.outputs.public_key }}
           secrets: |
             nyarelay_update_signing_key=${{ secrets.NYARELAY_UPDATE_SIGNING_KEY }}
+            nyarelay_update_public_key=${{ secrets.NYARELAY_UPDATE_PUBLIC_KEY }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

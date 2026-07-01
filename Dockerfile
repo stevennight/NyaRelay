@@ -18,24 +18,49 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN UPDATE_PUBLIC_KEY="$(printf '%s' "$NYARELAY_UPDATE_PUBLIC_KEY" | tr -d '[:space:]')" \
+RUN --mount=type=secret,id=nyarelay_update_public_key,required=false \
+    if [ -s /run/secrets/nyarelay_update_public_key ]; then \
+      UPDATE_PUBLIC_KEY="$(tr -d '[:space:]' < /run/secrets/nyarelay_update_public_key)"; \
+    else \
+      UPDATE_PUBLIC_KEY="$(printf '%s' "$NYARELAY_UPDATE_PUBLIC_KEY" | tr -d '[:space:]')"; \
+    fi \
     && LDFLAGS="-X nyarelay/internal/shared/version.Version=${NYARELAY_VERSION} -X nyarelay/internal/shared/version.Commit=${NYARELAY_COMMIT} -X nyarelay/internal/shared/version.BuildDate=${NYARELAY_BUILD_DATE} -X nyarelay/internal/shared/version.UpdatePublicKey=${UPDATE_PUBLIC_KEY}" \
     && CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" go build -trimpath -buildvcs=false -ldflags "$LDFLAGS" -o /out/nyarelay-controller ./cmd/controller
-RUN UPDATE_PUBLIC_KEY="$(printf '%s' "$NYARELAY_UPDATE_PUBLIC_KEY" | tr -d '[:space:]')" \
+RUN --mount=type=secret,id=nyarelay_update_public_key,required=false \
+    if [ -s /run/secrets/nyarelay_update_public_key ]; then \
+      UPDATE_PUBLIC_KEY="$(tr -d '[:space:]' < /run/secrets/nyarelay_update_public_key)"; \
+    else \
+      UPDATE_PUBLIC_KEY="$(printf '%s' "$NYARELAY_UPDATE_PUBLIC_KEY" | tr -d '[:space:]')"; \
+    fi \
     && LDFLAGS="-X nyarelay/internal/shared/version.Version=${NYARELAY_VERSION} -X nyarelay/internal/shared/version.Commit=${NYARELAY_COMMIT} -X nyarelay/internal/shared/version.BuildDate=${NYARELAY_BUILD_DATE} -X nyarelay/internal/shared/version.UpdatePublicKey=${UPDATE_PUBLIC_KEY}" \
     && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags "$LDFLAGS" -o /out/nodes/nyarelay-node-linux-amd64 ./cmd/node
-RUN UPDATE_PUBLIC_KEY="$(printf '%s' "$NYARELAY_UPDATE_PUBLIC_KEY" | tr -d '[:space:]')" \
+RUN --mount=type=secret,id=nyarelay_update_public_key,required=false \
+    if [ -s /run/secrets/nyarelay_update_public_key ]; then \
+      UPDATE_PUBLIC_KEY="$(tr -d '[:space:]' < /run/secrets/nyarelay_update_public_key)"; \
+    else \
+      UPDATE_PUBLIC_KEY="$(printf '%s' "$NYARELAY_UPDATE_PUBLIC_KEY" | tr -d '[:space:]')"; \
+    fi \
     && LDFLAGS="-X nyarelay/internal/shared/version.Version=${NYARELAY_VERSION} -X nyarelay/internal/shared/version.Commit=${NYARELAY_COMMIT} -X nyarelay/internal/shared/version.BuildDate=${NYARELAY_BUILD_DATE} -X nyarelay/internal/shared/version.UpdatePublicKey=${UPDATE_PUBLIC_KEY}" \
     && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=false -ldflags "$LDFLAGS" -o /out/nodes/nyarelay-node-linux-arm64 ./cmd/node
 RUN --mount=type=secret,id=nyarelay_update_signing_key,required=false \
+    --mount=type=secret,id=nyarelay_update_public_key,required=false \
+    if [ -s /run/secrets/nyarelay_update_public_key ]; then \
+      UPDATE_PUBLIC_KEY="$(tr -d '[:space:]' < /run/secrets/nyarelay_update_public_key)"; \
+    else \
+      UPDATE_PUBLIC_KEY="$(printf '%s' "$NYARELAY_UPDATE_PUBLIC_KEY" | tr -d '[:space:]')"; \
+    fi; \
     if [ -s /run/secrets/nyarelay_update_signing_key ]; then \
+      if [ -z "$UPDATE_PUBLIC_KEY" ]; then \
+        echo "NYARELAY_UPDATE_PUBLIC_KEY is required when NYARELAY_UPDATE_SIGNING_KEY is configured" >&2; \
+        exit 1; \
+      fi; \
       go run ./cmd/release-manifest \
         --node-dir /out/nodes \
         --version "${NYARELAY_VERSION}" \
         --commit "${NYARELAY_COMMIT}" \
         --build-date "${NYARELAY_BUILD_DATE}" \
         --private-key-file /run/secrets/nyarelay_update_signing_key \
-        --expected-public-key "${NYARELAY_UPDATE_PUBLIC_KEY}" \
+        --expected-public-key "${UPDATE_PUBLIC_KEY}" \
         --manifest /out/nodes/node-release-manifest.json \
         --signature /out/nodes/node-release-manifest.sig \
         --public-key /out/nodes/node-release-public.key; \
