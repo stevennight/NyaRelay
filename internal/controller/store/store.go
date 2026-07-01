@@ -11,6 +11,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"nyarelay/internal/shared/model"
+	sharedversion "nyarelay/internal/shared/version"
 )
 
 type Store struct {
@@ -485,24 +486,46 @@ func (s *Store) GetNode(ctx context.Context, id string) (model.Node, error) {
 func (s *Store) MarkNodeSeen(ctx context.Context, id string, system model.NodeSystem, version string) error {
 	now := time.Now().UTC()
 	systemJSON, _ := json.Marshal(system)
-	_, err := s.db.ExecContext(ctx,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer rollbackTx(tx)
+
+	var desiredVersion string
+	err = tx.QueryRowContext(ctx, `SELECT desired_version FROM nodes WHERE id = ? AND revoked = 0`, id).Scan(&desiredVersion)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	updateReached := desiredVersion != "" && !sharedversion.NeedsUpdate(version, desiredVersion)
+	reached := boolInt(updateReached)
+	_, err = tx.ExecContext(ctx,
 		`UPDATE nodes
 		    SET status = ?,
 		        version = ?,
 		        last_seen = ?,
 		        updated_at = ?,
 		        system_json = ?,
-		        update_status = CASE WHEN desired_version != '' AND desired_version = ? THEN ? ELSE update_status END,
-		        update_error = CASE WHEN desired_version != '' AND desired_version = ? THEN '' ELSE update_error END,
-		        update_finished_at = CASE WHEN desired_version != '' AND desired_version = ? THEN ? ELSE update_finished_at END
+		        desired_version = CASE WHEN ? != 0 THEN ? ELSE desired_version END,
+		        update_status = CASE WHEN ? != 0 THEN ? ELSE update_status END,
+		        update_error = CASE WHEN ? != 0 THEN '' ELSE update_error END,
+		        update_finished_at = CASE WHEN ? != 0 THEN ? ELSE update_finished_at END
 		  WHERE id = ? AND revoked = 0`,
 		string(model.NodeOnline), version, now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), string(systemJSON),
-		version, string(model.NodeUpdateSucceeded),
-		version,
-		version, now.Format(time.RFC3339Nano),
+		reached, version,
+		reached, string(model.NodeUpdateSucceeded),
+		reached,
+		reached, now.Format(time.RFC3339Nano),
 		id,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) RequestNodeUpdate(ctx context.Context, id, version string) (model.Node, error) {
