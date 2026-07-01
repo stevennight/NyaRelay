@@ -18,11 +18,14 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN LDFLAGS="-X nyarelay/internal/shared/version.Version=${NYARELAY_VERSION} -X nyarelay/internal/shared/version.Commit=${NYARELAY_COMMIT} -X nyarelay/internal/shared/version.BuildDate=${NYARELAY_BUILD_DATE} -X nyarelay/internal/shared/version.UpdatePublicKey=${NYARELAY_UPDATE_PUBLIC_KEY}" \
+RUN UPDATE_PUBLIC_KEY="$(printf '%s' "$NYARELAY_UPDATE_PUBLIC_KEY" | tr -d '[:space:]')" \
+    && LDFLAGS="-X nyarelay/internal/shared/version.Version=${NYARELAY_VERSION} -X nyarelay/internal/shared/version.Commit=${NYARELAY_COMMIT} -X nyarelay/internal/shared/version.BuildDate=${NYARELAY_BUILD_DATE} -X nyarelay/internal/shared/version.UpdatePublicKey=${UPDATE_PUBLIC_KEY}" \
     && CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" go build -trimpath -buildvcs=false -ldflags "$LDFLAGS" -o /out/nyarelay-controller ./cmd/controller
-RUN LDFLAGS="-X nyarelay/internal/shared/version.Version=${NYARELAY_VERSION} -X nyarelay/internal/shared/version.Commit=${NYARELAY_COMMIT} -X nyarelay/internal/shared/version.BuildDate=${NYARELAY_BUILD_DATE} -X nyarelay/internal/shared/version.UpdatePublicKey=${NYARELAY_UPDATE_PUBLIC_KEY}" \
+RUN UPDATE_PUBLIC_KEY="$(printf '%s' "$NYARELAY_UPDATE_PUBLIC_KEY" | tr -d '[:space:]')" \
+    && LDFLAGS="-X nyarelay/internal/shared/version.Version=${NYARELAY_VERSION} -X nyarelay/internal/shared/version.Commit=${NYARELAY_COMMIT} -X nyarelay/internal/shared/version.BuildDate=${NYARELAY_BUILD_DATE} -X nyarelay/internal/shared/version.UpdatePublicKey=${UPDATE_PUBLIC_KEY}" \
     && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags "$LDFLAGS" -o /out/nodes/nyarelay-node-linux-amd64 ./cmd/node
-RUN LDFLAGS="-X nyarelay/internal/shared/version.Version=${NYARELAY_VERSION} -X nyarelay/internal/shared/version.Commit=${NYARELAY_COMMIT} -X nyarelay/internal/shared/version.BuildDate=${NYARELAY_BUILD_DATE} -X nyarelay/internal/shared/version.UpdatePublicKey=${NYARELAY_UPDATE_PUBLIC_KEY}" \
+RUN UPDATE_PUBLIC_KEY="$(printf '%s' "$NYARELAY_UPDATE_PUBLIC_KEY" | tr -d '[:space:]')" \
+    && LDFLAGS="-X nyarelay/internal/shared/version.Version=${NYARELAY_VERSION} -X nyarelay/internal/shared/version.Commit=${NYARELAY_COMMIT} -X nyarelay/internal/shared/version.BuildDate=${NYARELAY_BUILD_DATE} -X nyarelay/internal/shared/version.UpdatePublicKey=${UPDATE_PUBLIC_KEY}" \
     && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=false -ldflags "$LDFLAGS" -o /out/nodes/nyarelay-node-linux-arm64 ./cmd/node
 RUN --mount=type=secret,id=nyarelay_update_signing_key,required=false \
     if [ -s /run/secrets/nyarelay_update_signing_key ]; then \

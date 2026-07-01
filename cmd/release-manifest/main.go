@@ -70,8 +70,8 @@ func main() {
 		}
 		privateKey = string(payload)
 	}
-	privateKey = strings.TrimSpace(privateKey)
-	expectedPublicKey = strings.TrimSpace(expectedPublicKey)
+	privateKey = compactToken(privateKey)
+	expectedPublicKey = compactToken(expectedPublicKey)
 	if (privateKey == "") != (expectedPublicKey == "") {
 		fatal("update signing private key and public key must be configured together")
 	}
@@ -129,6 +129,10 @@ func appendText(path, value string) {
 	if _, err := file.WriteString(value); err != nil {
 		fatal(err.Error())
 	}
+}
+
+func compactToken(value string) string {
+	return strings.Join(strings.Fields(value), "")
 }
 
 func fatal(message string) {
