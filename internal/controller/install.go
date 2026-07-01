@@ -179,7 +179,8 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now nyarelay-node
+systemctl enable nyarelay-node
+systemctl restart nyarelay-node
 systemctl enable --now nyarelay-node-update.path
 echo "nyarelay node installed"
 `, "\n")
