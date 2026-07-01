@@ -51,12 +51,14 @@ Run controller:
 
 ```powershell
 go run ./cmd/controller --listen :8080 --data ./data
+go run ./cmd/controller --version
 ```
 
 Run node:
 
 ```powershell
 go run ./cmd/node --controller http://127.0.0.1:8080 --id <node-id> --token <node-token> --signing-key <controller-public-key>
+go run ./cmd/node --version
 ```
 
 The node caches the last valid signed configuration under its data directory. Existing routes continue to run when the controller is temporarily unavailable.
@@ -75,7 +77,7 @@ Edit `deploy/docker/.env` on each server:
 
 ```dotenv
 NYARELAY_IMAGE=ghcr.io/<owner>/nyarelay
-NYARELAY_VERSION=v0.1.0
+NYARELAY_VERSION=v0.1.3
 NYARELAY_PUBLIC_URL=https://relay.example.com
 NYARELAY_BIND_ADDR=127.0.0.1
 NYARELAY_HOST_PORT=8080
@@ -98,9 +100,18 @@ For local source builds, add the build override:
 docker compose --env-file deploy/docker/.env -f deploy/docker/docker-compose.yml -f deploy/docker/docker-compose.build.yml up -d --build
 ```
 
-Release a version by pushing a tag such as `v0.1.0`. The release workflow publishes `ghcr.io/<owner>/nyarelay:v0.1.0` and Linux node binaries for amd64 and arm64. Deploying a version is just changing `NYARELAY_VERSION` in the server `.env` and running the compose commands above.
+Release a version by pushing a tag such as `v0.1.3`. The release workflow publishes `ghcr.io/<owner>/nyarelay:v0.1.3` and Linux node binaries for amd64 and arm64. Deploying a version is just changing `NYARELAY_VERSION` in the server `.env` and running the compose commands above.
+
+The release workflow should be configured with these repository secrets when node update approval is needed from the panel:
+
+```text
+NYARELAY_UPDATE_SIGNING_KEY=<base64url Ed25519 private key>
+NYARELAY_UPDATE_PUBLIC_KEY=<matching base64url Ed25519 public key>
+```
 
 Node installation is one command from the panel. Create a node, copy the generated install command, and run it on the node machine as a sudo-capable user. The script downloads itself from the controller, detects the node machine architecture, downloads the matching `nyarelay-node` binary from `/downloads/nyarelay-node` with gzip compression, prints each install stage, writes `/etc/nyarelay/node.env`, installs the systemd unit, and starts `nyarelay-node`. You do not need to manually download or copy the node binary.
+
+Node binary updates are panel-approved and controller-bundled. The controller only offers the node binaries packaged inside its own image, with a signed release manifest and SHA-256 digest for each target. A node verifies the Ed25519 manifest signature against its embedded trusted update public key, downloads the matching gzip binary from the controller, checks the digest, replaces `/usr/local/bin/nyarelay-node`, and restarts the systemd service. Local or development images without the update signing key still run normally, but node auto update is shown as disabled.
 
 ## Database Choice
 

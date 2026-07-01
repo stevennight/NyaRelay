@@ -8,15 +8,17 @@ import (
 )
 
 type Config struct {
-	ControllerURL string
-	NodeID        string
-	NodeToken     string
-	SigningKey    string
-	DataDir       string
-	CachePath     string
-	LogLevel      string
-	PollInterval  time.Duration
-	MetricsEvery  time.Duration
+	ControllerURL     string
+	NodeID            string
+	NodeToken         string
+	SigningKey        string
+	DataDir           string
+	CachePath         string
+	UpdateRequestPath string
+	UpdateStatusPath  string
+	LogLevel          string
+	PollInterval      time.Duration
+	MetricsEvery      time.Duration
 }
 
 func parseConfig(args []string) Config {
@@ -40,6 +42,8 @@ func parseConfig(args []string) Config {
 	_ = fs.Parse(args)
 	cfg.DataDir = filepath.Clean(cfg.DataDir)
 	cfg.CachePath = filepath.Join(cfg.DataDir, "last-config.json")
+	cfg.UpdateRequestPath = filepath.Join(cfg.DataDir, "update", "request.json")
+	cfg.UpdateStatusPath = filepath.Join(cfg.DataDir, "update", "status.json")
 	return cfg
 }
 

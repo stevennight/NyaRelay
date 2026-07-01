@@ -151,8 +151,36 @@ PrivateTmp=true
 WantedBy=multi-user.target
 EOF
 
+cat > /etc/systemd/system/nyarelay-node-update.service <<'EOF'
+[Unit]
+Description=NyaRelay node updater
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/nyarelay/node.env
+ExecStart=/usr/local/bin/nyarelay-node update
+ReadWritePaths=/var/lib/nyarelay /usr/local/bin
+PrivateTmp=true
+
+EOF
+
+cat > /etc/systemd/system/nyarelay-node-update.path <<'EOF'
+[Unit]
+Description=Watch NyaRelay node update requests
+
+[Path]
+PathExists=/var/lib/nyarelay/update/request.json
+Unit=nyarelay-node-update.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 systemctl daemon-reload
 systemctl enable --now nyarelay-node
+systemctl enable --now nyarelay-node-update.path
 echo "nyarelay node installed"
 `, "\n")
 }

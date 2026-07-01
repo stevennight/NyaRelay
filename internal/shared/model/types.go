@@ -41,21 +41,36 @@ const (
 	NodeRevoked NodeStatus = "revoked"
 )
 
+type NodeUpdateStatus string
+
+const (
+	NodeUpdateIdle      NodeUpdateStatus = ""
+	NodeUpdateRequested NodeUpdateStatus = "requested"
+	NodeUpdateRunning   NodeUpdateStatus = "running"
+	NodeUpdateSucceeded NodeUpdateStatus = "succeeded"
+	NodeUpdateFailed    NodeUpdateStatus = "failed"
+)
+
 type Node struct {
-	ID         string            `json:"id"`
-	Name       string            `json:"name"`
-	Status     NodeStatus        `json:"status"`
-	Version    string            `json:"version"`
-	Labels     map[string]string `json:"labels,omitempty"`
-	PublicHost string            `json:"public_host,omitempty"`
-	PortMin    int               `json:"port_min,omitempty"`
-	PortMax    int               `json:"port_max,omitempty"`
-	Approved   bool              `json:"approved"`
-	Revoked    bool              `json:"revoked"`
-	LastSeen   time.Time         `json:"last_seen,omitempty"`
-	CreatedAt  time.Time         `json:"created_at"`
-	UpdatedAt  time.Time         `json:"updated_at"`
-	System     NodeSystem        `json:"system,omitempty"`
+	ID                string            `json:"id"`
+	Name              string            `json:"name"`
+	Status            NodeStatus        `json:"status"`
+	Version           string            `json:"version"`
+	DesiredVersion    string            `json:"desired_version,omitempty"`
+	UpdateStatus      NodeUpdateStatus  `json:"update_status,omitempty"`
+	UpdateError       string            `json:"update_error,omitempty"`
+	UpdateRequestedAt time.Time         `json:"update_requested_at,omitempty"`
+	UpdateFinishedAt  time.Time         `json:"update_finished_at,omitempty"`
+	Labels            map[string]string `json:"labels,omitempty"`
+	PublicHost        string            `json:"public_host,omitempty"`
+	PortMin           int               `json:"port_min,omitempty"`
+	PortMax           int               `json:"port_max,omitempty"`
+	Approved          bool              `json:"approved"`
+	Revoked           bool              `json:"revoked"`
+	LastSeen          time.Time         `json:"last_seen,omitempty"`
+	CreatedAt         time.Time         `json:"created_at"`
+	UpdatedAt         time.Time         `json:"updated_at"`
+	System            NodeSystem        `json:"system,omitempty"`
 }
 
 type NodeSystem struct {
@@ -209,6 +224,59 @@ type AgentError struct {
 	At      time.Time `json:"at"`
 	Scope   string    `json:"scope"`
 	Message string    `json:"message"`
+}
+
+type BuildInfo struct {
+	Version   string `json:"version"`
+	Commit    string `json:"commit,omitempty"`
+	BuildDate string `json:"build_date,omitempty"`
+}
+
+type NodeReleaseManifest struct {
+	Version   string                `json:"version"`
+	Commit    string                `json:"commit,omitempty"`
+	BuildDate string                `json:"build_date,omitempty"`
+	Artifacts []NodeReleaseArtifact `json:"artifacts"`
+}
+
+type NodeReleaseArtifact struct {
+	OS     string `json:"os"`
+	Arch   string `json:"arch"`
+	SHA256 string `json:"sha256"`
+	Size   int64  `json:"size"`
+}
+
+type SignedNodeRelease struct {
+	Manifest       NodeReleaseManifest `json:"manifest"`
+	Signature      string              `json:"signature,omitempty"`
+	SigningKeyID   string              `json:"signing_key_id,omitempty"`
+	UpdateEnabled  bool                `json:"update_enabled"`
+	DisabledReason string              `json:"disabled_reason,omitempty"`
+}
+
+type NodeUpdateCommand struct {
+	Version      string              `json:"version"`
+	Manifest     NodeReleaseManifest `json:"manifest"`
+	Signature    string              `json:"signature"`
+	SigningKeyID string              `json:"signing_key_id"`
+}
+
+type NodeUpdateReport struct {
+	Status      NodeUpdateStatus `json:"status"`
+	Version     string           `json:"version,omitempty"`
+	Error       string           `json:"error,omitempty"`
+	CompletedAt time.Time        `json:"completed_at,omitempty"`
+}
+
+type NodeUpdateRequest struct {
+	ControllerURL string    `json:"controller_url"`
+	NodeID        string    `json:"node_id"`
+	NodeToken     string    `json:"node_token"`
+	TargetVersion string    `json:"target_version"`
+	OS            string    `json:"os"`
+	Arch          string    `json:"arch"`
+	SHA256        string    `json:"sha256"`
+	RequestedAt   time.Time `json:"requested_at"`
 }
 
 type AuditEvent struct {

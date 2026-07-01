@@ -64,6 +64,11 @@ func (s *Store) migrate(ctx context.Context) error {
 			token TEXT NOT NULL,
 			status TEXT NOT NULL,
 			version TEXT NOT NULL DEFAULT '',
+			desired_version TEXT NOT NULL DEFAULT '',
+			update_status TEXT NOT NULL DEFAULT '',
+			update_error TEXT NOT NULL DEFAULT '',
+			update_requested_at TEXT NOT NULL DEFAULT '',
+			update_finished_at TEXT NOT NULL DEFAULT '',
 			labels_json TEXT NOT NULL DEFAULT '{}',
 			public_host TEXT NOT NULL DEFAULT '',
 			port_min INTEGER NOT NULL DEFAULT 10000,
@@ -187,6 +192,22 @@ func (s *Store) ensureNodeColumns(ctx context.Context) error {
 	if !columns["port_max"] {
 		if _, err := s.db.ExecContext(ctx, `ALTER TABLE nodes ADD COLUMN port_max INTEGER NOT NULL DEFAULT 65535`); err != nil {
 			return err
+		}
+	}
+	for _, column := range []struct {
+		name string
+		sql  string
+	}{
+		{name: "desired_version", sql: `ALTER TABLE nodes ADD COLUMN desired_version TEXT NOT NULL DEFAULT ''`},
+		{name: "update_status", sql: `ALTER TABLE nodes ADD COLUMN update_status TEXT NOT NULL DEFAULT ''`},
+		{name: "update_error", sql: `ALTER TABLE nodes ADD COLUMN update_error TEXT NOT NULL DEFAULT ''`},
+		{name: "update_requested_at", sql: `ALTER TABLE nodes ADD COLUMN update_requested_at TEXT NOT NULL DEFAULT ''`},
+		{name: "update_finished_at", sql: `ALTER TABLE nodes ADD COLUMN update_finished_at TEXT NOT NULL DEFAULT ''`},
+	} {
+		if !columns[column.name] {
+			if _, err := s.db.ExecContext(ctx, column.sql); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -353,14 +374,28 @@ func (s *Store) UpsertNode(ctx context.Context, node model.Node, token string) e
 	if !node.LastSeen.IsZero() {
 		lastSeen = node.LastSeen.UTC().Format(time.RFC3339Nano)
 	}
+	updateRequestedAt := ""
+	if !node.UpdateRequestedAt.IsZero() {
+		updateRequestedAt = node.UpdateRequestedAt.UTC().Format(time.RFC3339Nano)
+	}
+	updateFinishedAt := ""
+	if !node.UpdateFinishedAt.IsZero() {
+		updateFinishedAt = node.UpdateFinishedAt.UTC().Format(time.RFC3339Nano)
+	}
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO nodes
-		 (id, name, token, status, version, labels_json, public_host, port_min, port_max, approved, revoked, last_seen, created_at, updated_at, system_json)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 (id, name, token, status, version, desired_version, update_status, update_error, update_requested_at, update_finished_at,
+		  labels_json, public_host, port_min, port_max, approved, revoked, last_seen, created_at, updated_at, system_json)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET
 		   name = excluded.name,
 		   status = excluded.status,
 		   version = excluded.version,
+		   desired_version = excluded.desired_version,
+		   update_status = excluded.update_status,
+		   update_error = excluded.update_error,
+		   update_requested_at = excluded.update_requested_at,
+		   update_finished_at = excluded.update_finished_at,
 		   labels_json = excluded.labels_json,
 		   public_host = excluded.public_host,
 		   port_min = excluded.port_min,
@@ -370,7 +405,8 @@ func (s *Store) UpsertNode(ctx context.Context, node model.Node, token string) e
 		   last_seen = excluded.last_seen,
 		   updated_at = excluded.updated_at,
 		   system_json = excluded.system_json`,
-		node.ID, node.Name, token, string(node.Status), node.Version, string(labels), node.PublicHost, node.PortMin, node.PortMax,
+		node.ID, node.Name, token, string(node.Status), node.Version, node.DesiredVersion, string(node.UpdateStatus), node.UpdateError,
+		updateRequestedAt, updateFinishedAt, string(labels), node.PublicHost, node.PortMin, node.PortMax,
 		boolInt(node.Approved), boolInt(node.Revoked), lastSeen,
 		node.CreatedAt.UTC().Format(time.RFC3339Nano), node.UpdatedAt.UTC().Format(time.RFC3339Nano), string(system),
 	)
@@ -408,7 +444,8 @@ func (s *Store) AuthenticateNode(ctx context.Context, id, token string) (model.N
 
 func (s *Store) GetNodeWithToken(ctx context.Context, id string) (model.Node, string, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, name, token, status, version, labels_json, public_host, port_min, port_max, approved, revoked, last_seen, created_at, updated_at, system_json
+		`SELECT id, name, token, status, version, desired_version, update_status, update_error, update_requested_at, update_finished_at,
+		        labels_json, public_host, port_min, port_max, approved, revoked, last_seen, created_at, updated_at, system_json
 		 FROM nodes WHERE id = ?`, id,
 	)
 	return scanNode(row)
@@ -416,7 +453,8 @@ func (s *Store) GetNodeWithToken(ctx context.Context, id string) (model.Node, st
 
 func (s *Store) ListNodes(ctx context.Context) ([]model.Node, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, name, token, status, version, labels_json, public_host, port_min, port_max, approved, revoked, last_seen, created_at, updated_at, system_json
+		`SELECT id, name, token, status, version, desired_version, update_status, update_error, update_requested_at, update_finished_at,
+		        labels_json, public_host, port_min, port_max, approved, revoked, last_seen, created_at, updated_at, system_json
 		 FROM nodes WHERE revoked = 0 ORDER BY created_at DESC`,
 	)
 	if err != nil {
@@ -436,7 +474,8 @@ func (s *Store) ListNodes(ctx context.Context) ([]model.Node, error) {
 
 func (s *Store) GetNode(ctx context.Context, id string) (model.Node, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, name, token, status, version, labels_json, public_host, port_min, port_max, approved, revoked, last_seen, created_at, updated_at, system_json
+		`SELECT id, name, token, status, version, desired_version, update_status, update_error, update_requested_at, update_finished_at,
+		        labels_json, public_host, port_min, port_max, approved, revoked, last_seen, created_at, updated_at, system_json
 		 FROM nodes WHERE id = ?`, id,
 	)
 	node, _, err := scanNode(row)
@@ -447,8 +486,63 @@ func (s *Store) MarkNodeSeen(ctx context.Context, id string, system model.NodeSy
 	now := time.Now().UTC()
 	systemJSON, _ := json.Marshal(system)
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE nodes SET status = ?, version = ?, last_seen = ?, updated_at = ?, system_json = ? WHERE id = ? AND revoked = 0`,
-		string(model.NodeOnline), version, now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), string(systemJSON), id,
+		`UPDATE nodes
+		    SET status = ?,
+		        version = ?,
+		        last_seen = ?,
+		        updated_at = ?,
+		        system_json = ?,
+		        update_status = CASE WHEN desired_version != '' AND desired_version = ? THEN ? ELSE update_status END,
+		        update_error = CASE WHEN desired_version != '' AND desired_version = ? THEN '' ELSE update_error END,
+		        update_finished_at = CASE WHEN desired_version != '' AND desired_version = ? THEN ? ELSE update_finished_at END
+		  WHERE id = ? AND revoked = 0`,
+		string(model.NodeOnline), version, now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), string(systemJSON),
+		version, string(model.NodeUpdateSucceeded),
+		version,
+		version, now.Format(time.RFC3339Nano),
+		id,
+	)
+	return err
+}
+
+func (s *Store) RequestNodeUpdate(ctx context.Context, id, version string) (model.Node, error) {
+	now := time.Now().UTC()
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE nodes
+		    SET desired_version = ?,
+		        update_status = ?,
+		        update_error = '',
+		        update_requested_at = ?,
+		        update_finished_at = '',
+		        updated_at = ?
+		  WHERE id = ? AND revoked = 0`,
+		version, string(model.NodeUpdateRequested), now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), id,
+	)
+	if err != nil {
+		return model.Node{}, err
+	}
+	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
+		return model.Node{}, errors.New("node not found")
+	}
+	return s.GetNode(ctx, id)
+}
+
+func (s *Store) UpdateNodeReport(ctx context.Context, id string, report model.NodeUpdateReport) error {
+	now := time.Now().UTC()
+	finished := ""
+	if !report.CompletedAt.IsZero() {
+		finished = report.CompletedAt.UTC().Format(time.RFC3339Nano)
+	} else if report.Status == model.NodeUpdateSucceeded || report.Status == model.NodeUpdateFailed {
+		finished = now.Format(time.RFC3339Nano)
+	}
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE nodes
+		    SET update_status = ?,
+		        update_error = ?,
+		        update_finished_at = CASE WHEN ? != '' THEN ? ELSE update_finished_at END,
+		        updated_at = ?
+		  WHERE id = ? AND revoked = 0`,
+		string(report.Status), report.Error, finished, finished, now.Format(time.RFC3339Nano), id,
 	)
 	return err
 }
@@ -1061,20 +1155,28 @@ type scanner interface {
 
 func scanNode(row scanner) (model.Node, string, error) {
 	var node model.Node
-	var token, status, labelsJSON, publicHost, lastSeen, created, updated, systemJSON string
+	var token, status, updateStatus, labelsJSON, publicHost, lastSeen, created, updated, systemJSON string
+	var updateRequestedAt, updateFinishedAt string
 	var portMin, portMax int
 	var approved, revoked int
-	err := row.Scan(&node.ID, &node.Name, &token, &status, &node.Version, &labelsJSON, &publicHost, &portMin, &portMax, &approved, &revoked, &lastSeen, &created, &updated, &systemJSON)
+	err := row.Scan(
+		&node.ID, &node.Name, &token, &status, &node.Version, &node.DesiredVersion, &updateStatus, &node.UpdateError,
+		&updateRequestedAt, &updateFinishedAt, &labelsJSON, &publicHost, &portMin, &portMax, &approved, &revoked,
+		&lastSeen, &created, &updated, &systemJSON,
+	)
 	if err != nil {
 		return model.Node{}, "", err
 	}
 	node.Status = model.NodeStatus(status)
+	node.UpdateStatus = model.NodeUpdateStatus(updateStatus)
 	node.PublicHost = publicHost
 	node.PortMin = portMin
 	node.PortMax = portMax
 	node.Approved = approved == 1
 	node.Revoked = revoked == 1
 	node.LastSeen = parseTime(lastSeen)
+	node.UpdateRequestedAt = parseTime(updateRequestedAt)
+	node.UpdateFinishedAt = parseTime(updateFinishedAt)
 	node.CreatedAt = parseTime(created)
 	node.UpdatedAt = parseTime(updated)
 	_ = json.Unmarshal([]byte(labelsJSON), &node.Labels)

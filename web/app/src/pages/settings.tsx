@@ -103,6 +103,9 @@ export function ControllerSettingsPage() {
             items={[
               { label: '公开地址', value: info.data.public_url || '-' },
               { label: '配置版本', value: String(info.data.revision) },
+              { label: '应用版本', value: formatBuild(info.data.build) },
+              { label: '内置 Node 版本', value: info.data.node_release?.manifest.version || '-' },
+              { label: 'Node 自动更新', value: info.data.node_release?.update_enabled ? '已启用' : (info.data.node_release?.disabled_reason || '未启用') },
               { label: '签名公钥', value: <code>{info.data.signing_key}</code> },
             ]}
           />
@@ -139,6 +142,12 @@ export function ControllerSettingsPage() {
       </Panel>
     </PageFrame>
   )
+}
+
+function formatBuild(build?: { version: string; commit?: string; build_date?: string }) {
+  if (!build) return '-'
+  const suffix = [build.commit, build.build_date].filter(Boolean).join(' / ')
+  return suffix ? `${build.version} (${suffix})` : build.version
 }
 
 function SettingsTabs() {

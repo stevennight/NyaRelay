@@ -12,6 +12,9 @@ permissions:
 jobs:
   release-assets:
     runs-on: ubuntu-latest
+    outputs:
+      build_date: ${{ steps.release-meta.outputs.build_date }}
+      public_key: ${{ steps.node-release.outputs.public_key }}
 
     steps:
       - name: Check out repository
@@ -23,12 +26,38 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Prepare release metadata
+        id: release-meta
+        run: echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - name: Build node binaries
         run: |
           mkdir -p dist
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false -o dist/nyarelay-node-linux-amd64 ./cmd/node
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -buildvcs=false -o dist/nyarelay-node-linux-arm64 ./cmd/node
+          LDFLAGS="-X nyarelay/internal/shared/version.Version=${GITHUB_REF_NAME} -X nyarelay/internal/shared/version.Commit=${GITHUB_SHA} -X nyarelay/internal/shared/version.BuildDate=${{ steps.release-meta.outputs.build_date }} -X nyarelay/internal/shared/version.UpdatePublicKey=${{ secrets.NYARELAY_UPDATE_PUBLIC_KEY }}"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags "$LDFLAGS" -o dist/nyarelay-node-linux-amd64 ./cmd/node
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=false -ldflags "$LDFLAGS" -o dist/nyarelay-node-linux-arm64 ./cmd/node
           sha256sum dist/* > dist/SHA256SUMS
+
+      - name: Sign node release manifest
+        id: node-release
+        env:
+          NYARELAY_UPDATE_SIGNING_KEY: ${{ secrets.NYARELAY_UPDATE_SIGNING_KEY }}
+          NYARELAY_UPDATE_PUBLIC_KEY: ${{ secrets.NYARELAY_UPDATE_PUBLIC_KEY }}
+        run: |
+          signing_key_file="$RUNNER_TEMP/nyarelay-update-signing.key"
+          trap 'rm -f "$signing_key_file"' EXIT
+          printf '%s' "$NYARELAY_UPDATE_SIGNING_KEY" > "$signing_key_file"
+          go run ./cmd/release-manifest \
+            --node-dir dist \
+            --version "${GITHUB_REF_NAME}" \
+            --commit "${GITHUB_SHA}" \
+            --build-date "${{ steps.release-meta.outputs.build_date }}" \
+            --private-key-file "$signing_key_file" \
+            --expected-public-key "$NYARELAY_UPDATE_PUBLIC_KEY" \
+            --manifest dist/node-release-manifest.json \
+            --signature dist/node-release-manifest.sig \
+            --public-key dist/node-release-public.key \
+            --github-output "$GITHUB_OUTPUT"
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
@@ -37,6 +66,7 @@ jobs:
 
   docker-image:
     runs-on: ubuntu-latest
+    needs: release-assets
 
     steps:
       - name: Check out repository
@@ -70,5 +100,12 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: |
+            NYARELAY_VERSION=${{ github.ref_name }}
+            NYARELAY_COMMIT=${{ github.sha }}
+            NYARELAY_BUILD_DATE=${{ needs.release-assets.outputs.build_date }}
+            NYARELAY_UPDATE_PUBLIC_KEY=${{ needs.release-assets.outputs.public_key }}
+          secrets: |
+            nyarelay_update_signing_key=${{ secrets.NYARELAY_UPDATE_SIGNING_KEY }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

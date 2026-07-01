@@ -1,9 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate } from '@tanstack/react-router'
-import { ClipboardCopy, Download, Plus, Settings, Trash2 } from 'lucide-react'
+import { ClipboardCopy, Download, Plus, RefreshCw, Settings, Trash2 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { api, post } from '../api'
-import type { NodeInfo, NodeInstallInfo } from '../types'
+import type { ControllerInfo, NodeInfo, NodeInstallInfo, SignedNodeRelease } from '../types'
 import {
   Banner,
   DetailGrid,
@@ -75,20 +75,51 @@ function NodesListView({
     queryKey: ['nodes'],
     queryFn: () => api<NodeInfo[]>('/api/nodes'),
   })
+  const controllerInfo = useQuery({
+    queryKey: ['controller-info'],
+    queryFn: () => api<ControllerInfo>('/api/controller/info'),
+  })
+  const queryClient = useQueryClient()
+  const updateNode = useMutation({
+    mutationFn: (id: string) => post<NodeInfo>(`/api/nodes/${id}/update`, {}),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ['nodes'] })
+    },
+  })
+  const updateAll = useMutation({
+    mutationFn: () => post('/api/nodes/update', {}),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ['nodes'] })
+    },
+  })
   const nodes = (query.data ?? []).filter((node) => !node.revoked)
+  const release = controllerInfo.data?.node_release
 
   return (
     <PageFrame
       title="节点"
       subtitle="节点只接收结构化配置，不提供远程 shell。"
       action={
-        <Link to="/nodes/new" className="button-link">
-          <Plus size={16} />
-          添加节点
-        </Link>
+        <InlineActions>
+          <button
+            className="ghost"
+            type="button"
+            onClick={() => updateAll.mutate()}
+            disabled={!release?.update_enabled || updateAll.isPending}
+          >
+            <RefreshCw size={16} />
+            批量更新
+          </button>
+          <Link to="/nodes/new" className="button-link">
+            <Plus size={16} />
+            添加节点
+          </Link>
+        </InlineActions>
       }
     >
       {query.error && <Banner text={query.error instanceof Error ? query.error.message : '加载失败'} />}
+      {updateNode.error && <Banner text={updateNode.error instanceof Error ? updateNode.error.message : '更新下发失败'} />}
+      {updateAll.error && <Banner text={updateAll.error instanceof Error ? updateAll.error.message : '批量更新失败'} />}
       {nodes.length === 0 ? (
         <EmptyState
           title="还没有节点"
@@ -113,13 +144,30 @@ function NodesListView({
                 <small>{node.id}</small>
               </td>
               <td><StatusPill value={node.revoked ? 'revoked' : node.status} /></td>
-              <td>{node.version || '-'}</td>
+              <td>
+                {node.version || '-'}
+                {nodeUpdateSummary(node)}
+                {release?.update_enabled && canUpdateNode(node, release) ? <small>可更新到 {release.manifest.version}</small> : null}
+              </td>
               <td>{[node.system?.os, node.system?.arch].filter(Boolean).join('/') || '-'}</td>
               <td>{formatTime(node.last_seen)}</td>
               <td>
-                <Link to="/nodes/$nodeId" params={{ nodeId: node.id }} className="button-link ghost">
-                  详情
-                </Link>
+                <InlineActions>
+                  {release?.update_enabled && canUpdateNode(node, release) ? (
+                    <button
+                      className="ghost"
+                      type="button"
+                      onClick={() => updateNode.mutate(node.id)}
+                      disabled={updateNode.isPending}
+                    >
+                      <RefreshCw size={16} />
+                      更新
+                    </button>
+                  ) : null}
+                  <Link to="/nodes/$nodeId" params={{ nodeId: node.id }} className="button-link ghost">
+                    详情
+                  </Link>
+                </InlineActions>
               </td>
             </tr>
           ))}
@@ -186,6 +234,10 @@ function NodeDetailModal({ nodeId, onClose }: { nodeId: string; onClose: () => v
     queryKey: ['node', nodeId],
     queryFn: () => api<NodeInfo>(`/api/nodes/${nodeId}`),
   })
+  const controllerInfo = useQuery({
+    queryKey: ['controller-info'],
+    queryFn: () => api<ControllerInfo>('/api/controller/info'),
+  })
   const installQuery = useQuery({
     queryKey: ['node-install', nodeId],
     queryFn: () => api<NodeInstallInfo>(`/api/nodes/${nodeId}/install`),
@@ -214,8 +266,18 @@ function NodeDetailModal({ nodeId, onClose }: { nodeId: string; onClose: () => v
     },
     onError: (err) => setMessage(err instanceof Error ? err.message : '保存失败'),
   })
+  const updateBinary = useMutation({
+    mutationFn: () => post<NodeInfo>(`/api/nodes/${nodeId}/update`, {}),
+    onSuccess: async () => {
+      setMessage('已下发更新请求')
+      await queryClient.invalidateQueries({ queryKey: ['nodes'] })
+      await queryClient.invalidateQueries({ queryKey: ['node', nodeId] })
+    },
+    onError: (err) => setMessage(err instanceof Error ? err.message : '更新下发失败'),
+  })
 
   const node = nodeQuery.data
+  const release = controllerInfo.data?.node_release
 
   useEffect(() => {
     if (!node) return
@@ -252,6 +314,12 @@ function NodeDetailModal({ nodeId, onClose }: { nodeId: string; onClose: () => v
             <Download size={16} />
             安装命令
           </button>
+          {release?.update_enabled && canUpdateNode(node, release) ? (
+            <button className="ghost" type="button" onClick={() => updateBinary.mutate()} disabled={updateBinary.isPending}>
+              <RefreshCw size={16} />
+              更新版本
+            </button>
+          ) : null}
           <button className="ghost danger" type="button" onClick={() => revoke.mutate()} disabled={revoke.isPending}>
             <Trash2 size={16} />
             吊销
@@ -397,6 +465,9 @@ function NodeDetailsContent({ node }: { node: NodeInfo }) {
             { label: 'ID', value: node.id },
             { label: '状态', value: <StatusPill value={node.revoked ? 'revoked' : node.status} /> },
             { label: '版本', value: node.version || '-' },
+            { label: '目标版本', value: node.desired_version || '-' },
+            { label: '更新状态', value: updateStatusLabel(node) },
+            { label: '更新错误', value: node.update_error || '-' },
             { label: '节点入口', value: publicEndpoint(node) },
             { label: '可用端口范围', value: `${node.port_min ?? 10000}-${node.port_max ?? 65535}` },
             { label: '最近心跳', value: formatTime(node.last_seen) },
@@ -532,6 +603,52 @@ function nodePayload(form: NodeForm) {
 function parsePort(value: string, fallback: number) {
   const parsed = Number.parseInt(value, 10)
   return Number.isFinite(parsed) ? parsed : fallback
+}
+
+function canUpdateNode(node: NodeInfo, release?: SignedNodeRelease) {
+  return Boolean(release?.update_enabled && versionCompare(node.version || '', release.manifest.version) < 0)
+}
+
+function nodeUpdateSummary(node: NodeInfo) {
+  const label = updateStatusLabel(node)
+  return label === '-' ? null : <small>{label}</small>
+}
+
+function updateStatusLabel(node: NodeInfo) {
+  switch (node.update_status) {
+    case 'requested':
+      return `等待更新到 ${node.desired_version || '-'}`
+    case 'running':
+      return `正在更新到 ${node.desired_version || '-'}`
+    case 'succeeded':
+      return `已更新到 ${node.desired_version || node.version || '-'}`
+    case 'failed':
+      return node.update_error ? `更新失败：${node.update_error}` : '更新失败'
+    default:
+      return '-'
+  }
+}
+
+function versionCompare(left: string, right: string) {
+  const a = versionParts(left)
+  const b = versionParts(right)
+  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+    const av = a[index] ?? 0
+    const bv = b[index] ?? 0
+    if (av < bv) return -1
+    if (av > bv) return 1
+  }
+  return 0
+}
+
+function versionParts(value: string) {
+  const core = value
+    .trim()
+    .replace(/^v/, '')
+    .split(/[+-]/)[0]
+  return core
+    .split('.')
+    .map((part) => Number.parseInt(part, 10) || 0)
 }
 
 function publicEndpoint(node: NodeInfo) {

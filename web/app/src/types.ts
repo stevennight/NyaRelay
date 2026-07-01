@@ -1,4 +1,5 @@
 export type NodeStatus = 'offline' | 'online' | 'revoked'
+export type NodeUpdateStatus = '' | 'requested' | 'running' | 'succeeded' | 'failed'
 export type TunnelType = 'direct' | 'chain'
 export type TunnelTransport = 'direct' | 'tls' | 'mtls' | 'ws-tls'
 export type TunnelStageRole = 'entry' | 'middle' | 'exit'
@@ -9,6 +10,11 @@ export interface NodeInfo {
   name: string
   status: NodeStatus
   version: string
+  desired_version?: string
+  update_status?: NodeUpdateStatus
+  update_error?: string
+  update_requested_at?: string
+  update_finished_at?: string
   labels?: Record<string, string>
   public_host?: string
   port_min?: number
@@ -101,6 +107,36 @@ export interface ControllerInfo {
   signing_key: string
   public_url: string
   revision: number
+  build?: BuildInfo
+  node_release?: SignedNodeRelease
+}
+
+export interface BuildInfo {
+  version: string
+  commit?: string
+  build_date?: string
+}
+
+export interface NodeReleaseArtifact {
+  os: string
+  arch: string
+  sha256: string
+  size: number
+}
+
+export interface NodeReleaseManifest {
+  version: string
+  commit?: string
+  build_date?: string
+  artifacts: NodeReleaseArtifact[]
+}
+
+export interface SignedNodeRelease {
+  manifest: NodeReleaseManifest
+  signature?: string
+  signing_key_id?: string
+  update_enabled: boolean
+  disabled_reason?: string
 }
 
 export interface NodeInstallInfo {

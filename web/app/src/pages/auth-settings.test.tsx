@@ -129,4 +129,35 @@ describe('auth and security flows', () => {
     const saveCall = fetchMock.mock.calls.find(([path, init]) => path === '/api/controller/info' && init?.method === 'POST')
     expect(JSON.parse(String(saveCall?.[1]?.body))).toEqual({ public_url: 'https://new.example.com' })
   })
+
+  it('shows controller build and bundled node release information', async () => {
+    installFetch([
+      {
+        path: '/api/controller/info',
+        method: 'GET',
+        response: jsonResponse({
+          signing_key: 'pub-key',
+          public_url: 'https://relay.example.com',
+          revision: 7,
+          build: {
+            version: 'v0.1.3',
+            commit: 'abc123',
+            build_date: '2026-07-01T00:00:00Z',
+          },
+          node_release: {
+            manifest: {
+              version: 'v0.1.3',
+              artifacts: [],
+            },
+            update_enabled: true,
+          },
+        }),
+      },
+    ])
+
+    renderWithClient(<ControllerSettingsPage />)
+
+    expect(await screen.findByText('v0.1.3 (abc123 / 2026-07-01T00:00:00Z)')).toBeInTheDocument()
+    expect(screen.getByText('已启用')).toBeInTheDocument()
+  })
 })

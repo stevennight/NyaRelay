@@ -26,6 +26,36 @@ const node = {
   },
 }
 
+const controllerInfo = {
+  signing_key: 'pub-key',
+  public_url: 'https://relay.example.com',
+  revision: 7,
+  build: {
+    version: 'v0.1.3',
+  },
+  node_release: {
+    manifest: {
+      version: 'v0.1.3',
+      artifacts: [],
+    },
+    update_enabled: false,
+    disabled_reason: 'node release manifest signature is not configured',
+  },
+}
+
+const updateEnabledControllerInfo = {
+  ...controllerInfo,
+  node_release: {
+    manifest: {
+      version: '1.2.4',
+      artifacts: [],
+    },
+    signature: 'sig',
+    signing_key_id: 'update-pub-key',
+    update_enabled: true,
+  },
+}
+
 describe('node pages', () => {
   it('shows the empty state when no nodes exist', async () => {
     installFetch([
@@ -33,6 +63,11 @@ describe('node pages', () => {
         path: '/api/nodes',
         method: 'GET',
         response: jsonResponse([]),
+      },
+      {
+        path: '/api/controller/info',
+        method: 'GET',
+        response: jsonResponse(controllerInfo),
       },
     ])
 
@@ -57,6 +92,11 @@ describe('node pages', () => {
             status: 'revoked',
           },
         ]),
+      },
+      {
+        path: '/api/controller/info',
+        method: 'GET',
+        response: jsonResponse(controllerInfo),
       },
     ])
 
@@ -87,6 +127,11 @@ describe('node pages', () => {
         path: '/api/nodes',
         method: 'GET',
         response: jsonResponse([]),
+      },
+      {
+        path: '/api/controller/info',
+        method: 'GET',
+        response: jsonResponse(controllerInfo),
       },
     ])
 
@@ -141,6 +186,11 @@ describe('node pages', () => {
         path: '/api/nodes',
         method: 'GET',
         response: jsonResponse([]),
+      },
+      {
+        path: '/api/controller/info',
+        method: 'GET',
+        response: jsonResponse(controllerInfo),
       },
     ])
 
@@ -198,6 +248,11 @@ describe('node pages', () => {
         method: 'GET',
         response: jsonResponse([node]),
       },
+      {
+        path: '/api/controller/info',
+        method: 'GET',
+        response: jsonResponse(controllerInfo),
+      },
     ])
 
     renderWithClient(<NodeDetailPage nodeId="node-1" />)
@@ -233,10 +288,48 @@ describe('node pages', () => {
         method: 'GET',
         response: errorResponse('节点加载失败', 500),
       },
+      {
+        path: '/api/controller/info',
+        method: 'GET',
+        response: jsonResponse(controllerInfo),
+      },
     ])
 
     renderWithClient(<NodesPage />)
 
     expect(await screen.findByText('节点加载失败')).toBeInTheDocument()
+  })
+
+  it('requests a node binary update when a newer bundled release exists', async () => {
+    const fetchMock = installFetch([
+      {
+        path: '/api/nodes',
+        method: 'GET',
+        response: jsonResponse([node]),
+      },
+      {
+        path: '/api/controller/info',
+        method: 'GET',
+        response: jsonResponse(updateEnabledControllerInfo),
+      },
+      {
+        path: '/api/nodes/node-1/update',
+        method: 'POST',
+        response: jsonResponse({
+          ...node,
+          desired_version: '1.2.4',
+          update_status: 'requested',
+        }),
+      },
+    ])
+
+    renderWithClient(<NodesPage />)
+
+    expect(await screen.findByText('可更新到 1.2.4')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '更新' }))
+
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([path, init]) => path === '/api/nodes/node-1/update' && init?.method === 'POST')).toBe(true)
+    })
   })
 })

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -20,15 +21,31 @@ import (
 	"nyarelay/internal/shared/logging"
 	"nyarelay/internal/shared/model"
 	sharedprotocol "nyarelay/internal/shared/protocol"
+	sharedversion "nyarelay/internal/shared/version"
 )
 
-const Version = "0.1.0-dev"
+var Version = sharedversion.Version
 
 type configProvider interface {
 	config(context.Context) (model.SignedConfig, error)
 }
 
 func Run(ctx context.Context, args []string) error {
+	if sharedversion.IsVersionCommand(args) {
+		fmt.Println(sharedversion.Print("nyarelay-node"))
+		return nil
+	}
+	if len(args) > 0 && args[0] == "update" {
+		cfg := parseConfig(nil)
+		opts := parseUpdateOptions(args[1:], cfg)
+		if err := runUpdate(ctx, cfg, opts.requestPath, opts.statusPath, opts.binaryPath); err != nil {
+			return err
+		}
+		if opts.skipRestart || os.Getenv("NYARELAY_SKIP_RESTART") == "1" {
+			return nil
+		}
+		return restartNodeService()
+	}
 	cfg := parseConfig(args)
 	if cfg.NodeID == "" || cfg.NodeToken == "" {
 		return errors.New("node id and token are required")
@@ -162,6 +179,7 @@ func controlLoop(ctx context.Context, client *client, cfg Config, log *slog.Logg
 			_ = conn.Close(websocket.StatusNormalClosure, "hello failed")
 			continue
 		}
+		reportUpdateStatus(ctx, cfg, write, log)
 
 		hbDone := make(chan struct{})
 		go func() {
@@ -173,12 +191,16 @@ func controlLoop(ctx context.Context, client *client, cfg Config, log *slog.Logg
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					if err := write(sharedprotocol.ControlMessage{
+					msg := sharedprotocol.ControlMessage{
 						Type:    "heartbeat",
 						NodeID:  cfg.NodeID,
 						Version: Version,
 						System:  nodeSystem(),
-					}); err != nil {
+					}
+					if report, err := loadUpdateStatus(cfg.UpdateStatusPath); err == nil {
+						msg.UpdateReport = &report
+					}
+					if err := write(msg); err != nil {
 						return
 					}
 				}
@@ -199,6 +221,28 @@ func controlLoop(ctx context.Context, client *client, cfg Config, log *slog.Logg
 						log.Debug("config apply failed", "error", err)
 					}
 				}
+			case "update":
+				if msg.Update != nil {
+					if err := handleUpdateCommand(cfg, *msg.Update); err != nil {
+						log.Warn("update request failed", "error", err)
+						_ = write(sharedprotocol.ControlMessage{
+							Type: "update_status",
+							UpdateReport: &model.NodeUpdateReport{
+								Status:  model.NodeUpdateFailed,
+								Version: msg.Update.Version,
+								Error:   err.Error(),
+							},
+						})
+						continue
+					}
+					_ = write(sharedprotocol.ControlMessage{
+						Type: "update_status",
+						UpdateReport: &model.NodeUpdateReport{
+							Status:  model.NodeUpdateRequested,
+							Version: msg.Update.Version,
+						},
+					})
+				}
 			case "error":
 				if msg.Error != "" {
 					log.Warn("controller error", "error", msg.Error)
@@ -213,6 +257,20 @@ func controlLoop(ctx context.Context, client *client, cfg Config, log *slog.Logg
 			backoff *= 2
 		}
 	}
+}
+
+func reportUpdateStatus(ctx context.Context, cfg Config, write func(sharedprotocol.ControlMessage) error, log *slog.Logger) {
+	report, err := loadUpdateStatus(cfg.UpdateStatusPath)
+	if err != nil {
+		return
+	}
+	if err := write(sharedprotocol.ControlMessage{Type: "update_status", UpdateReport: &report}); err != nil {
+		log.Debug("update status report failed", "error", err)
+	}
+}
+
+func restartNodeService() error {
+	return exec.Command("systemctl", "restart", "nyarelay-node").Run()
 }
 
 func verifySignedConfig(nodeID string, signingKey string, signed model.SignedConfig) error {

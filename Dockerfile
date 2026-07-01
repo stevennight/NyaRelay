@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.7
+
 FROM --platform=$BUILDPLATFORM node:24-alpine AS web
 WORKDIR /src/web/app
 COPY web/app/package.json web/app/package-lock.json* ./
@@ -8,13 +10,40 @@ RUN npm run build
 FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS go-build
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
+ARG NYARELAY_VERSION=0.1.3-dev
+ARG NYARELAY_COMMIT=
+ARG NYARELAY_BUILD_DATE=
+ARG NYARELAY_UPDATE_PUBLIC_KEY=
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" go build -buildvcs=false -o /out/nyarelay-controller ./cmd/controller
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false -o /out/nodes/nyarelay-node-linux-amd64 ./cmd/node
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -buildvcs=false -o /out/nodes/nyarelay-node-linux-arm64 ./cmd/node
+RUN LDFLAGS="-X nyarelay/internal/shared/version.Version=${NYARELAY_VERSION} -X nyarelay/internal/shared/version.Commit=${NYARELAY_COMMIT} -X nyarelay/internal/shared/version.BuildDate=${NYARELAY_BUILD_DATE} -X nyarelay/internal/shared/version.UpdatePublicKey=${NYARELAY_UPDATE_PUBLIC_KEY}" \
+    && CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" go build -trimpath -buildvcs=false -ldflags "$LDFLAGS" -o /out/nyarelay-controller ./cmd/controller
+RUN LDFLAGS="-X nyarelay/internal/shared/version.Version=${NYARELAY_VERSION} -X nyarelay/internal/shared/version.Commit=${NYARELAY_COMMIT} -X nyarelay/internal/shared/version.BuildDate=${NYARELAY_BUILD_DATE} -X nyarelay/internal/shared/version.UpdatePublicKey=${NYARELAY_UPDATE_PUBLIC_KEY}" \
+    && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags "$LDFLAGS" -o /out/nodes/nyarelay-node-linux-amd64 ./cmd/node
+RUN LDFLAGS="-X nyarelay/internal/shared/version.Version=${NYARELAY_VERSION} -X nyarelay/internal/shared/version.Commit=${NYARELAY_COMMIT} -X nyarelay/internal/shared/version.BuildDate=${NYARELAY_BUILD_DATE} -X nyarelay/internal/shared/version.UpdatePublicKey=${NYARELAY_UPDATE_PUBLIC_KEY}" \
+    && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=false -ldflags "$LDFLAGS" -o /out/nodes/nyarelay-node-linux-arm64 ./cmd/node
+RUN --mount=type=secret,id=nyarelay_update_signing_key,required=false \
+    if [ -s /run/secrets/nyarelay_update_signing_key ]; then \
+      go run ./cmd/release-manifest \
+        --node-dir /out/nodes \
+        --version "${NYARELAY_VERSION}" \
+        --commit "${NYARELAY_COMMIT}" \
+        --build-date "${NYARELAY_BUILD_DATE}" \
+        --private-key-file /run/secrets/nyarelay_update_signing_key \
+        --expected-public-key "${NYARELAY_UPDATE_PUBLIC_KEY}" \
+        --manifest /out/nodes/node-release-manifest.json \
+        --signature /out/nodes/node-release-manifest.sig \
+        --public-key /out/nodes/node-release-public.key; \
+    else \
+      go run ./cmd/release-manifest \
+        --node-dir /out/nodes \
+        --version "${NYARELAY_VERSION}" \
+        --commit "${NYARELAY_COMMIT}" \
+        --build-date "${NYARELAY_BUILD_DATE}" \
+        --manifest /out/nodes/node-release-manifest.json; \
+    fi
 RUN gzip -k -9 /out/nodes/nyarelay-node-linux-amd64 /out/nodes/nyarelay-node-linux-arm64
 RUN cp "/out/nodes/nyarelay-node-${TARGETOS}-${TARGETARCH}" /out/nyarelay-node
 

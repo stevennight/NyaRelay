@@ -29,6 +29,7 @@ import (
 	"nyarelay/internal/shared/model"
 	sharedprotocol "nyarelay/internal/shared/protocol"
 	"nyarelay/internal/shared/validate"
+	sharedversion "nyarelay/internal/shared/version"
 )
 
 const (
@@ -49,6 +50,10 @@ type Server struct {
 }
 
 func Run(ctx context.Context, args []string) error {
+	if sharedversion.IsVersionCommand(args) {
+		fmt.Println(sharedversion.Print("nyarelay-controller"))
+		return nil
+	}
 	cfg := parseConfig(args)
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return err
@@ -117,6 +122,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/nodes/{id}/install", s.withAuth(s.handleGetNodeInstall))
 	s.mux.HandleFunc("POST /api/nodes", s.withAuth(s.handleCreateNode))
 	s.mux.HandleFunc("PATCH /api/nodes/{id}", s.withAuth(s.handleUpdateNode))
+	s.mux.HandleFunc("POST /api/nodes/{id}/update", s.withAuth(s.handleUpdateNodeBinary))
+	s.mux.HandleFunc("POST /api/nodes/update", s.withAuth(s.handleUpdateAllNodeBinaries))
 	s.mux.HandleFunc("POST /api/nodes/revoke", s.withAuth(s.handleRevokeNode))
 	s.mux.HandleFunc("GET /api/tunnels", s.withAuth(s.handleListTunnels))
 	s.mux.HandleFunc("GET /api/tunnels/{id}", s.withAuth(s.handleGetTunnel))
@@ -142,6 +149,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/node/metrics", s.withNode(s.handleNodeMetrics))
 
 	s.mux.HandleFunc("GET /install.sh", s.handleInstallScript)
+	s.mux.HandleFunc("GET /downloads/nyarelay-node/manifest", s.handleDownloadNodeReleaseManifest)
 	s.mux.HandleFunc("GET /downloads/nyarelay-node", s.handleDownloadNodeBinary)
 	s.mux.HandleFunc("/", s.handleWeb)
 }
@@ -360,9 +368,11 @@ func (s *Server) handleControllerInfo(w http.ResponseWriter, r *http.Request, _ 
 		return
 	}
 	writeJSON(w, map[string]any{
-		"signing_key": pub,
-		"public_url":  s.controllerPublicURL(r.Context()),
-		"revision":    s.hub.Revision(),
+		"signing_key":  pub,
+		"public_url":   s.controllerPublicURL(r.Context()),
+		"revision":     s.hub.Revision(),
+		"build":        sharedversion.Info(),
+		"node_release": s.nodeRelease(),
 	})
 }
 
@@ -534,6 +544,62 @@ func (s *Server) handleRevokeNode(w http.ResponseWriter, r *http.Request, sessio
 	s.pushConfigs(r.Context())
 	_ = s.store.AddAudit(r.Context(), session.Username, "node.revoke", req.ID, map[string]string{"id": req.ID})
 	writeJSON(w, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleUpdateNodeBinary(w http.ResponseWriter, r *http.Request, session auth.Session) {
+	release := s.nodeRelease()
+	if !release.UpdateEnabled {
+		writeError(w, errors.New(release.DisabledReason), http.StatusConflict)
+		return
+	}
+	node, err := s.store.GetNode(r.Context(), r.PathValue("id"))
+	if err != nil || node.Revoked {
+		writeError(w, errors.New("node not found"), http.StatusNotFound)
+		return
+	}
+	if !nodeNeedsUpdate(node.Version, release.Manifest.Version) {
+		writeJSON(w, node)
+		return
+	}
+	updated, err := s.store.RequestNodeUpdate(r.Context(), node.ID, release.Manifest.Version)
+	if err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
+	_ = s.store.AddAudit(r.Context(), session.Username, "node.update.request", node.ID, map[string]string{"version": release.Manifest.Version})
+	if err := s.pushNodeUpdate(r.Context(), node.ID); err != nil {
+		s.log.Debug("push node update failed", "node", node.ID, "error", err)
+	}
+	writeJSON(w, updated)
+}
+
+func (s *Server) handleUpdateAllNodeBinaries(w http.ResponseWriter, r *http.Request, session auth.Session) {
+	release := s.nodeRelease()
+	if !release.UpdateEnabled {
+		writeError(w, errors.New(release.DisabledReason), http.StatusConflict)
+		return
+	}
+	nodes, err := s.store.ListNodes(r.Context())
+	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	var requested int
+	for _, node := range nodes {
+		if node.Revoked || !nodeNeedsUpdate(node.Version, release.Manifest.Version) {
+			continue
+		}
+		if _, err := s.store.RequestNodeUpdate(r.Context(), node.ID, release.Manifest.Version); err != nil {
+			writeError(w, err, http.StatusBadRequest)
+			return
+		}
+		requested++
+		if err := s.pushNodeUpdate(r.Context(), node.ID); err != nil {
+			s.log.Debug("push node update failed", "node", node.ID, "error", err)
+		}
+	}
+	_ = s.store.AddAudit(r.Context(), session.Username, "node.update.request_all", "nodes", map[string]any{"version": release.Manifest.Version, "count": requested})
+	writeJSON(w, map[string]any{"version": release.Manifest.Version, "requested": requested})
 }
 
 func (s *Server) handleListTunnels(w http.ResponseWriter, r *http.Request, _ auth.Session) {
@@ -1540,6 +1606,11 @@ func (s *Server) handleNodeWS(w http.ResponseWriter, r *http.Request, node model
 		_ = s.store.MarkNodeOffline(r.Context(), node.ID)
 		return
 	}
+	if err := s.sendNodeUpdateIfNeeded(r.Context(), node.ID, func(msg sharedprotocol.ControlMessage) error {
+		return wsjson.Write(r.Context(), conn, msg)
+	}); err != nil {
+		s.log.Debug("send node update failed", "node", node.ID, "error", err)
+	}
 
 	for {
 		var msg sharedprotocol.ControlMessage
@@ -1550,8 +1621,18 @@ func (s *Server) handleNodeWS(w http.ResponseWriter, r *http.Request, node model
 		switch msg.Type {
 		case "heartbeat":
 			_ = s.store.MarkNodeSeen(r.Context(), node.ID, msg.System, msg.Version)
+			if msg.UpdateReport != nil {
+				_ = s.store.UpdateNodeReport(r.Context(), node.ID, *msg.UpdateReport)
+			}
+			if err := s.pushNodeUpdate(r.Context(), node.ID); err != nil {
+				s.log.Debug("push node update failed", "node", node.ID, "error", err)
+			}
 		case "pull_config":
 			_ = s.sendNodeConfig(r.Context(), node.ID, conn)
+		case "update_status":
+			if msg.UpdateReport != nil {
+				_ = s.store.UpdateNodeReport(r.Context(), node.ID, *msg.UpdateReport)
+			}
 		}
 	}
 }
@@ -1613,6 +1694,41 @@ func (s *Server) pushConfig(ctx context.Context, nodeID string) error {
 		return err
 	}
 	return s.hub.Send(nodeID, sharedprotocol.ControlMessage{Type: "config", Config: &signed})
+}
+
+func (s *Server) pushNodeUpdate(ctx context.Context, nodeID string) error {
+	return s.sendNodeUpdateIfNeeded(ctx, nodeID, func(msg sharedprotocol.ControlMessage) error {
+		return s.hub.Send(nodeID, msg)
+	})
+}
+
+func (s *Server) sendNodeUpdateIfNeeded(ctx context.Context, nodeID string, send func(sharedprotocol.ControlMessage) error) error {
+	node, err := s.store.GetNode(ctx, nodeID)
+	if err != nil || node.Revoked {
+		return err
+	}
+	if node.UpdateStatus != model.NodeUpdateRequested || node.DesiredVersion == "" {
+		return nil
+	}
+	if !nodeNeedsUpdate(node.Version, node.DesiredVersion) {
+		return nil
+	}
+	release := s.nodeRelease()
+	if !release.UpdateEnabled {
+		return errors.New(release.DisabledReason)
+	}
+	if release.Manifest.Version != node.DesiredVersion {
+		return nil
+	}
+	return send(sharedprotocol.ControlMessage{
+		Type: "update",
+		Update: &model.NodeUpdateCommand{
+			Version:      release.Manifest.Version,
+			Manifest:     release.Manifest,
+			Signature:    release.Signature,
+			SigningKeyID: release.SigningKeyID,
+		},
+	})
 }
 
 func (s *Server) compileConfig(ctx context.Context, nodeID string) (model.SignedConfig, error) {
@@ -2035,6 +2151,11 @@ func (s *Server) handleInstallScript(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Disposition", `attachment; filename="install.sh"`)
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write([]byte(installScript()))
+}
+
+func (s *Server) handleDownloadNodeReleaseManifest(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, s.nodeRelease())
 }
 
 func closeStore(st *store.Store) {
