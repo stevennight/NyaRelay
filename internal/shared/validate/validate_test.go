@@ -60,6 +60,46 @@ func TestForwardAllowsTCPUDP(t *testing.T) {
 	}
 }
 
+func TestForwardAllowsProtocolSpecificTargetPool(t *testing.T) {
+	err := Forward(model.Forward{
+		ID:          "fwd_pool",
+		Name:        "pool",
+		TunnelID:    "tun_1",
+		Protocols:   []model.ForwardProtocol{model.ForwardProtocolTCP, model.ForwardProtocolUDP},
+		Listen:      "127.0.0.1:8443",
+		Strategy:    "failover",
+		TCPStrategy: "round_robin",
+		UDPStrategy: "failover",
+		Targets: []model.ForwardTarget{
+			{ID: "tcp", Address: "127.0.0.1:443", Protocols: []model.ForwardProtocol{model.ForwardProtocolTCP}, Enabled: true},
+			{ID: "udp", Address: "127.0.0.1:5353", Protocols: []model.ForwardProtocol{model.ForwardProtocolUDP}, Enabled: true},
+		},
+		Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestForwardRejectsTargetPoolWithoutEnabledProtocolTarget(t *testing.T) {
+	err := Forward(model.Forward{
+		ID:        "fwd_pool",
+		Name:      "pool",
+		TunnelID:  "tun_1",
+		Protocols: []model.ForwardProtocol{model.ForwardProtocolTCP},
+		Listen:    "127.0.0.1:8443",
+		Targets: []model.ForwardTarget{{
+			ID:      "disabled",
+			Address: "127.0.0.1:443",
+			Enabled: false,
+		}},
+		Enabled: true,
+	})
+	if err == nil {
+		t.Fatal("expected missing enabled target to fail")
+	}
+}
+
 func TestTunnelAllowsPerProtocolStrategiesAndProtocols(t *testing.T) {
 	err := Tunnel(model.Tunnel{
 		ID:        "tun_1",

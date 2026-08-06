@@ -79,10 +79,24 @@ export interface ForwardInfo {
   tunnel_id: string
   protocols: ForwardProtocol[]
   listen: string
-  target: string
+  target?: string
+  targets: ForwardTargetInfo[]
+  strategy?: string
+  tcp_strategy?: string
+  udp_strategy?: string
   enabled: boolean
   created_at: string
   updated_at: string
+}
+
+export interface ForwardTargetInfo {
+  id: string
+  forward_id?: string
+  address: string
+  protocols?: ForwardProtocol[]
+  weight?: number
+  enabled: boolean
+  position?: number
 }
 
 export interface AuditEvent {

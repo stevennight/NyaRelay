@@ -150,8 +150,89 @@ func Forward(forward model.Forward) error {
 	if _, _, err := net.SplitHostPort(forward.Listen); err != nil {
 		return fmt.Errorf("invalid listen address: %w", err)
 	}
-	if _, _, err := net.SplitHostPort(forward.Target); err != nil {
-		return fmt.Errorf("invalid target address: %w", err)
+	if err := validateForwardStrategy("strategy", forward.Strategy); err != nil {
+		return err
+	}
+	if err := validateForwardStrategy("tcp_strategy", forward.TCPStrategy); err != nil {
+		return err
+	}
+	if err := validateForwardStrategy("udp_strategy", forward.UDPStrategy); err != nil {
+		return err
+	}
+	targets := forward.Targets
+	if len(targets) == 0 && strings.TrimSpace(forward.Target) != "" {
+		targets = []model.ForwardTarget{{Address: forward.Target, Enabled: true}}
+	}
+	if len(targets) == 0 {
+		return errors.New("forward target is required")
+	}
+	seenIDs := map[string]bool{}
+	protocolTargets := map[model.ForwardProtocol]bool{}
+	for index, target := range targets {
+		if strings.TrimSpace(target.ID) != "" {
+			if seenIDs[target.ID] {
+				return fmt.Errorf("duplicate forward target id %q", target.ID)
+			}
+			seenIDs[target.ID] = true
+		}
+		if strings.TrimSpace(target.Address) == "" {
+			return fmt.Errorf("forward target %d address is required", index+1)
+		}
+		if _, _, err := net.SplitHostPort(target.Address); err != nil {
+			return fmt.Errorf("invalid target %d address: %w", index+1, err)
+		}
+		if err := validateForwardTargetProtocols(index, target); err != nil {
+			return err
+		}
+		if target.Enabled {
+			for _, protocol := range forward.Protocols {
+				if targetSupportsProtocol(target.Protocols, protocol) {
+					protocolTargets[protocol] = true
+				}
+			}
+		}
+	}
+	for _, protocol := range forward.Protocols {
+		if !protocolTargets[protocol] {
+			return fmt.Errorf("forward has no enabled %s target", protocol)
+		}
 	}
 	return nil
+}
+
+func validateForwardStrategy(field, strategy string) error {
+	switch strings.ToLower(strings.TrimSpace(strategy)) {
+	case "", "single", "round_robin", "random", "failover":
+		return nil
+	default:
+		return fmt.Errorf("unsupported forward %s %q", field, strategy)
+	}
+}
+
+func validateForwardTargetProtocols(index int, target model.ForwardTarget) error {
+	seen := map[model.ForwardProtocol]bool{}
+	for _, protocol := range target.Protocols {
+		switch protocol {
+		case model.ForwardProtocolTCP, model.ForwardProtocolUDP:
+			if seen[protocol] {
+				return fmt.Errorf("forward target %d has duplicate protocol %q", index+1, protocol)
+			}
+			seen[protocol] = true
+		default:
+			return fmt.Errorf("unsupported forward target %d protocol %q", index+1, protocol)
+		}
+	}
+	return nil
+}
+
+func targetSupportsProtocol(protocols []model.ForwardProtocol, protocol model.ForwardProtocol) bool {
+	if len(protocols) == 0 {
+		return true
+	}
+	for _, candidate := range protocols {
+		if candidate == protocol {
+			return true
+		}
+	}
+	return false
 }

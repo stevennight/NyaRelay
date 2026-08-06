@@ -792,13 +792,17 @@ type tunnelRequest struct {
 }
 
 type forwardRequest struct {
-	ID        string                  `json:"id"`
-	Name      string                  `json:"name"`
-	TunnelID  string                  `json:"tunnel_id"`
-	Protocols []model.ForwardProtocol `json:"protocols"`
-	Listen    string                  `json:"listen"`
-	Target    string                  `json:"target"`
-	Enabled   *bool                   `json:"enabled"`
+	ID          string                  `json:"id"`
+	Name        string                  `json:"name"`
+	TunnelID    string                  `json:"tunnel_id"`
+	Protocols   []model.ForwardProtocol `json:"protocols"`
+	Listen      string                  `json:"listen"`
+	Target      string                  `json:"target"`
+	Targets     []model.ForwardTarget   `json:"targets"`
+	Strategy    string                  `json:"strategy"`
+	TCPStrategy string                  `json:"tcp_strategy"`
+	UDPStrategy string                  `json:"udp_strategy"`
+	Enabled     *bool                   `json:"enabled"`
 }
 
 func (s *Server) prepareTunnel(ctx context.Context, req tunnelRequest) (model.Tunnel, []model.PortAllocation, error) {
@@ -1014,8 +1018,20 @@ func (s *Server) prepareForward(ctx context.Context, req forwardRequest) (model.
 		if req.Listen == "" {
 			req.Listen = existing.Listen
 		}
-		if req.Target == "" {
-			req.Target = existing.Target
+		if req.Targets == nil && req.Target == "" {
+			req.Targets = existing.Targets
+			if req.Targets == nil {
+				req.Target = existing.Target
+			}
+		}
+		if req.Strategy == "" {
+			req.Strategy = existing.Strategy
+		}
+		if req.TCPStrategy == "" {
+			req.TCPStrategy = existing.TCPStrategy
+		}
+		if req.UDPStrategy == "" {
+			req.UDPStrategy = existing.UDPStrategy
 		}
 	}
 	if req.Enabled != nil {
@@ -1035,18 +1051,36 @@ func (s *Server) prepareForward(ctx context.Context, req forwardRequest) (model.
 	if err := validateTunnelEffectiveCandidates(tunnel, protocols); err != nil {
 		return model.Forward{}, nil, err
 	}
+	targets, err := normalizeForwardTargets(req.ID, req.Target, req.Targets)
+	if err != nil {
+		return model.Forward{}, nil, err
+	}
+	strategy := normalizeStageStrategyValue(req.Strategy)
+	if strategy == "" {
+		if len(targets) > 1 {
+			strategy = "failover"
+		} else {
+			strategy = "single"
+		}
+	}
+	tcpStrategy := normalizeStageStrategyValue(req.TCPStrategy)
+	udpStrategy := normalizeStageStrategyValue(req.UDPStrategy)
 	entryCandidates, err := forwardEntryCandidates(ctx, s.store, tunnel, protocols)
 	if err != nil {
 		return model.Forward{}, nil, err
 	}
 	forward := model.Forward{
-		ID:        strings.TrimSpace(req.ID),
-		Name:      strings.TrimSpace(req.Name),
-		TunnelID:  strings.TrimSpace(req.TunnelID),
-		Protocols: protocols,
-		Listen:    strings.TrimSpace(req.Listen),
-		Target:    strings.TrimSpace(req.Target),
-		Enabled:   enabled,
+		ID:          strings.TrimSpace(req.ID),
+		Name:        strings.TrimSpace(req.Name),
+		TunnelID:    strings.TrimSpace(req.TunnelID),
+		Protocols:   protocols,
+		Listen:      strings.TrimSpace(req.Listen),
+		Target:      targets[0].Address,
+		Targets:     targets,
+		Strategy:    strategy,
+		TCPStrategy: tcpStrategy,
+		UDPStrategy: udpStrategy,
+		Enabled:     enabled,
 	}
 	excludedOwners := map[string]bool{forward.ID: true}
 	allocations, err := s.store.ListPortAllocations(ctx)
@@ -1197,6 +1231,52 @@ func normalizeForwardProtocols(protocols []model.ForwardProtocol) ([]model.Forwa
 	}
 	if len(out) == 0 {
 		return nil, errors.New("forward protocol is required")
+	}
+	return out, nil
+}
+
+func normalizeForwardTargets(forwardID, legacyTarget string, requested []model.ForwardTarget) ([]model.ForwardTarget, error) {
+	if requested != nil && strings.TrimSpace(legacyTarget) != "" {
+		return nil, errors.New("target and targets cannot both be set")
+	}
+	targets := requested
+	if targets == nil {
+		if strings.TrimSpace(legacyTarget) == "" {
+			return nil, errors.New("forward target is required")
+		}
+		targets = []model.ForwardTarget{{
+			ID:      "legacy:" + strings.TrimSpace(forwardID),
+			Address: strings.TrimSpace(legacyTarget),
+			Weight:  1,
+			Enabled: true,
+		}}
+	}
+	if len(targets) == 0 {
+		return nil, errors.New("forward target is required")
+	}
+	out := make([]model.ForwardTarget, 0, len(targets))
+	seenIDs := map[string]bool{}
+	for index, target := range targets {
+		target.ForwardID = strings.TrimSpace(forwardID)
+		target.ID = strings.TrimSpace(target.ID)
+		if target.ID == "" {
+			target.ID = ids.New("target")
+		}
+		if seenIDs[target.ID] {
+			return nil, fmt.Errorf("duplicate forward target id %q", target.ID)
+		}
+		seenIDs[target.ID] = true
+		target.Address = strings.TrimSpace(target.Address)
+		target.Position = index
+		if target.Weight <= 0 {
+			target.Weight = 1
+		}
+		normalizedProtocols, err := normalizeStageNodeProtocols(target.Protocols)
+		if err != nil {
+			return nil, fmt.Errorf("forward target %d: %w", index+1, err)
+		}
+		target.Protocols = normalizedProtocols
+		out = append(out, target)
 	}
 	return out, nil
 }
@@ -1857,22 +1937,45 @@ func scopeForwardRuntime(nodeID string, forward model.Forward, tunnel model.Tunn
 		return model.ForwardRuntime{}, false
 	}
 	runtime := model.ForwardRuntime{
-		ID:        forward.ID,
-		Name:      forward.Name,
-		TunnelID:  forward.TunnelID,
-		Protocols: protocols,
-		Enabled:   forward.Enabled,
+		ID:          forward.ID,
+		Name:        forward.Name,
+		TunnelID:    forward.TunnelID,
+		Protocols:   protocols,
+		Strategy:    forward.Strategy,
+		TCPStrategy: forward.TCPStrategy,
+		UDPStrategy: forward.UDPStrategy,
+		Enabled:     forward.Enabled,
 	}
 	if role == model.TunnelStageEntry {
 		runtime.Listen = forward.Listen
 		if tunnel.Type == model.TunnelDirect {
 			runtime.Target = forward.Target
+			runtime.Targets = copyForwardTargets(forward.Targets, forward.Target)
 		}
 	}
 	if role == model.TunnelStageExit {
 		runtime.Target = forward.Target
+		runtime.Targets = copyForwardTargets(forward.Targets, forward.Target)
 	}
 	return runtime, true
+}
+
+func copyForwardTargets(targets []model.ForwardTarget, legacyTarget string) []model.ForwardTarget {
+	if len(targets) == 0 && strings.TrimSpace(legacyTarget) != "" {
+		targets = []model.ForwardTarget{{
+			ID:      "legacy-target",
+			Address: strings.TrimSpace(legacyTarget),
+			Weight:  1,
+			Enabled: true,
+		}}
+	}
+	out := make([]model.ForwardTarget, len(targets))
+	copy(out, targets)
+	for i := range out {
+		out[i].Protocols = append([]model.ForwardProtocol(nil), out[i].Protocols...)
+		out[i].Position = i
+	}
+	return out
 }
 
 func nodeParticipatesInTunnel(nodeID string, tunnel model.Tunnel) bool {

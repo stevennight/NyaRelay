@@ -19,27 +19,31 @@ import (
 )
 
 type Service struct {
-	log      *slog.Logger
-	nodeID   string
-	forwards *metrics.Counters
-	tunnels  *metrics.Counters
-	selector *candidateSelector
-	udp      *udpCandidateSessions
-	mu       sync.Mutex
-	cancel   context.CancelFunc
-	revision int64
-	config   model.RelayConfig
-	servers  []io.Closer
+	log        *slog.Logger
+	nodeID     string
+	forwards   *metrics.Counters
+	tunnels    *metrics.Counters
+	selector   *candidateSelector
+	targets    *targetSelector
+	udp        *udpCandidateSessions
+	udpTargets *udpCandidateSessions
+	mu         sync.Mutex
+	cancel     context.CancelFunc
+	revision   int64
+	config     model.RelayConfig
+	servers    []io.Closer
 }
 
 func New(log *slog.Logger, nodeID string) *Service {
 	return &Service{
-		log:      log,
-		nodeID:   nodeID,
-		forwards: metrics.New(),
-		tunnels:  metrics.New(),
-		selector: newCandidateSelector(),
-		udp:      newUDPCandidateSessions(),
+		log:        log,
+		nodeID:     nodeID,
+		forwards:   metrics.New(),
+		tunnels:    metrics.New(),
+		selector:   newCandidateSelector(),
+		targets:    newTargetSelector(),
+		udp:        newUDPCandidateSessions(),
+		udpTargets: newUDPCandidateSessions(),
 	}
 }
 
@@ -58,6 +62,8 @@ func (s *Service) Apply(ctx context.Context, cfg model.RelayConfig) error {
 		_ = closer.Close()
 	}
 	s.udp.clear()
+	s.udpTargets.clear()
+	s.targets.reset()
 	runCtx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
 	s.servers = nil
@@ -78,6 +84,8 @@ func (s *Service) restorePreviousConfig(ctx context.Context, previousConfig mode
 		_ = closer.Close()
 	}
 	s.udp.clear()
+	s.udpTargets.clear()
+	s.targets.reset()
 	s.cancel = nil
 	s.servers = nil
 	s.config = previousConfig
@@ -100,6 +108,7 @@ func (s *Service) restorePreviousConfig(ctx context.Context, previousConfig mode
 
 func (s *Service) startConfigLocked(ctx context.Context, cfg model.RelayConfig) error {
 	go s.udp.gcLoop(ctx)
+	go s.udpTargets.gcLoop(ctx)
 	for _, tunnel := range cfg.Tunnels {
 		for _, stage := range tunnel.Stages {
 			if stage.Role == model.TunnelStageEntry {
@@ -290,13 +299,13 @@ func (s *Service) handleStageConn(ctx context.Context, tunnel model.TunnelRuntim
 			s.handleUDPStageExit(ctx, forward, inbound, counter)
 			return
 		}
-		outbound, err := (&net.Dialer{}).DialContext(ctx, "tcp", forward.Target)
+		outbound, statID, _, err := s.dialForwardTarget(ctx, forward, "tcp", "")
 		if err != nil {
 			s.log.Warn("target dial failed", "forward", forward.Name, "error", err)
 			return
 		}
 		defer s.closeConn(outbound, "stage target outbound")
-		s.pipe(inbound, outbound, counter, s.tunnels.Get("target:"+forward.ID))
+		s.pipe(inbound, outbound, counter, s.tunnels.Get(statID))
 		return
 	}
 	if hello.Network == "udp" {
@@ -340,13 +349,13 @@ func (s *Service) validateHello(tunnel model.TunnelRuntime, stage model.TunnelRu
 
 func (s *Service) dialForwardNext(ctx context.Context, tunnel model.TunnelRuntime, forward model.ForwardRuntime, fromStageIndex int, network, sessionID string) (net.Conn, string, error) {
 	if tunnel.Type == model.TunnelDirect {
-		conn, err := (&net.Dialer{}).DialContext(ctx, network, forward.Target)
-		return conn, "target:" + forward.ID, err
+		conn, statID, _, err := s.dialForwardTarget(ctx, forward, network, sessionID)
+		return conn, statID, err
 	}
 	nextIndex := fromStageIndex + 1
 	if nextIndex >= len(tunnel.Stages) {
-		conn, err := (&net.Dialer{}).DialContext(ctx, network, forward.Target)
-		return conn, "target:" + forward.ID, err
+		conn, statID, _, err := s.dialForwardTarget(ctx, forward, network, sessionID)
+		return conn, statID, err
 	}
 	nextStage := tunnel.Stages[nextIndex]
 	if len(nextStage.Nodes) == 0 {
@@ -371,6 +380,67 @@ func (s *Service) dialForwardNext(ctx context.Context, tunnel model.TunnelRuntim
 		lastErr = fmt.Errorf("no available candidate in stage %d", nextIndex)
 	}
 	return nil, stageStatID(tunnel.ID, nextIndex), lastErr
+}
+
+func (s *Service) dialForwardTarget(ctx context.Context, forward model.ForwardRuntime, network, sessionID string) (net.Conn, string, string, error) {
+	var sessionKey string
+	if network == "udp" && sessionID != "" {
+		sessionKey = udpTargetSessionKey(forward.ID, sessionID)
+		if session, ok := s.udpTargets.get(sessionKey, time.Now()); ok {
+			if target, ok := forwardTargetAt(forward, session.candidateIndex); ok {
+				if target.ID == session.candidateNodeID && target.Enabled && targetSupportsProtocol(target.Protocols, model.ForwardProtocolUDP) {
+					conn, err := (&net.Dialer{}).DialContext(ctx, network, target.Address)
+					if err == nil {
+						s.targets.recordSuccess(forward.ID, target.ID, network)
+						return conn, targetStatID(forward.ID, target.ID), target.ID, nil
+					}
+					s.targets.recordFailure(forward.ID, target.ID, network)
+					s.udpTargets.delete(sessionKey)
+				} else {
+					s.udpTargets.delete(sessionKey)
+				}
+			} else {
+				s.udpTargets.delete(sessionKey)
+			}
+		}
+	}
+	order := s.targets.order(forward, network)
+	if len(order) == 0 {
+		return nil, "target:" + forward.ID, "", fmt.Errorf("no available %s target for forward %s", network, forward.Name)
+	}
+	var lastErr error
+	for _, idx := range order {
+		target, ok := forwardTargetAt(forward, idx)
+		if !ok {
+			continue
+		}
+		conn, err := (&net.Dialer{}).DialContext(ctx, network, target.Address)
+		if err != nil {
+			s.targets.recordFailure(forward.ID, target.ID, network)
+			lastErr = err
+			continue
+		}
+		s.targets.recordSuccess(forward.ID, target.ID, network)
+		if sessionKey != "" {
+			s.udpTargets.bind(sessionKey, idx, target.ID, time.Now())
+		}
+		return conn, targetStatID(forward.ID, target.ID), target.ID, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no available %s target for forward %s", network, forward.Name)
+	}
+	return nil, "target:" + forward.ID, "", lastErr
+}
+
+func udpTargetSessionKey(forwardID, sessionID string) string {
+	return "target:" + forwardID + ":udp:" + sessionID
+}
+
+func targetStatID(forwardID, targetID string) string {
+	if targetID == "" {
+		return "target:" + forwardID
+	}
+	return "target:" + forwardID + ":" + targetID
 }
 
 func (s *Service) dialStageCandidate(ctx context.Context, tunnel model.TunnelRuntime, forward model.ForwardRuntime, fromStageIndex, nextIndex, candidateIndex int, network string) (net.Conn, string, error) {

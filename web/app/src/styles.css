@@ -623,6 +623,24 @@ td small {
   font-size: 18px;
 }
 
+.section-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.section-heading h3,
+.section-heading p {
+  margin: 0;
+}
+
+.section-heading p {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
 .toggle-field {
   position: relative;
   min-height: 72px;
@@ -729,6 +747,37 @@ td small {
 .hop-list {
   display: grid;
   gap: 10px;
+}
+
+.forward-target-list {
+  display: grid;
+  gap: 10px;
+}
+
+.forward-target-row {
+  grid-template-columns: 32px minmax(180px, 2fr) minmax(90px, 110px) minmax(126px, auto) minmax(110px, auto) auto;
+}
+
+.forward-target-row .toggle-field {
+  min-height: 0;
+  grid-template-columns: auto 1fr;
+  padding: 6px 8px;
+  background: transparent;
+  border: 0;
+}
+
+.detail-target-list {
+  display: grid;
+  gap: 8px;
+}
+
+.detail-target-list > div {
+  display: grid;
+  gap: 2px;
+}
+
+.detail-target-list small {
+  color: var(--muted);
 }
 
 .stage-editor {
@@ -984,7 +1033,9 @@ td small {
   .hop > input,
   .hop > button:not(.candidate-drag-handle),
   .candidate-weight,
-  .candidate-protocols {
+  .candidate-protocols,
+  .forward-target-row > .toggle-field,
+  .forward-target-row > .actions {
     grid-column: 2;
   }
 

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -124,7 +125,21 @@ func (s *Store) migrate(ctx context.Context) error {
 			protocols_json TEXT NOT NULL,
 			listen TEXT NOT NULL,
 			target TEXT NOT NULL,
+			strategy TEXT NOT NULL DEFAULT '',
+			tcp_strategy TEXT NOT NULL DEFAULT '',
+			udp_strategy TEXT NOT NULL DEFAULT '',
 			enabled INTEGER NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);`,
+		`CREATE TABLE IF NOT EXISTS forward_targets (
+			id TEXT PRIMARY KEY,
+			forward_id TEXT NOT NULL,
+			position INTEGER NOT NULL,
+			address TEXT NOT NULL,
+			protocols_json TEXT NOT NULL DEFAULT '[]',
+			weight INTEGER NOT NULL DEFAULT 1,
+			enabled INTEGER NOT NULL DEFAULT 1,
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		);`,
@@ -144,6 +159,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_tunnel_stage_nodes_tunnel ON tunnel_stage_nodes(tunnel_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_tunnel_stage_nodes_stage ON tunnel_stage_nodes(stage_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_forwards_tunnel ON forwards(tunnel_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_forward_targets_forward ON forward_targets(forward_id, position);`,
 		`CREATE INDEX IF NOT EXISTS idx_port_allocations_owner ON port_allocations(owner_kind, owner_id);`,
 		`CREATE TABLE IF NOT EXISTS metrics (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -172,7 +188,10 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := s.ensureNodeColumns(ctx); err != nil {
 		return err
 	}
-	return s.ensureTunnelColumns(ctx)
+	if err := s.ensureTunnelColumns(ctx); err != nil {
+		return err
+	}
+	return s.ensureForwardColumns(ctx)
 }
 
 func (s *Store) ensureNodeColumns(ctx context.Context) error {
@@ -248,6 +267,51 @@ func (s *Store) ensureTunnelColumns(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (s *Store) ensureForwardColumns(ctx context.Context) error {
+	columns, err := s.tableColumns(ctx, "forwards")
+	if err != nil {
+		return err
+	}
+	for _, column := range []struct {
+		name string
+		sql  string
+	}{
+		{name: "strategy", sql: `ALTER TABLE forwards ADD COLUMN strategy TEXT NOT NULL DEFAULT ''`},
+		{name: "tcp_strategy", sql: `ALTER TABLE forwards ADD COLUMN tcp_strategy TEXT NOT NULL DEFAULT ''`},
+		{name: "udp_strategy", sql: `ALTER TABLE forwards ADD COLUMN udp_strategy TEXT NOT NULL DEFAULT ''`},
+	} {
+		if !columns[column.name] {
+			if _, err := s.db.ExecContext(ctx, column.sql); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS forward_targets (
+		id TEXT PRIMARY KEY,
+		forward_id TEXT NOT NULL,
+		position INTEGER NOT NULL,
+		address TEXT NOT NULL,
+		protocols_json TEXT NOT NULL DEFAULT '[]',
+		weight INTEGER NOT NULL DEFAULT 1,
+		enabled INTEGER NOT NULL DEFAULT 1,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL
+	)`); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_forward_targets_forward ON forward_targets(forward_id, position)`); err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO forward_targets
+			(id, forward_id, position, address, protocols_json, weight, enabled, created_at, updated_at)
+		SELECT 'legacy:' || f.id, f.id, 0, f.target, '[]', 1, f.enabled, f.created_at, f.updated_at
+		FROM forwards f
+		WHERE TRIM(f.target) <> ''
+		  AND NOT EXISTS (SELECT 1 FROM forward_targets t WHERE t.forward_id = f.id)`)
+	return err
 }
 
 func (s *Store) tableColumns(ctx context.Context, table string) (map[string]bool, error) {
@@ -745,6 +809,9 @@ func (s *Store) DeleteTunnel(ctx context.Context, id string, force bool) (int64,
 	); err != nil {
 		return 0, err
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM forward_targets WHERE forward_id IN (SELECT id FROM forwards WHERE tunnel_id = ?)`, id); err != nil {
+		return 0, err
+	}
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM port_allocations
 		 WHERE owner_kind = 'tunnel_stage_node'
@@ -866,18 +933,26 @@ func (s *Store) SaveForward(ctx context.Context, forward model.Forward, allocati
 	}
 	forward.UpdatedAt = now
 	protocols, _ := json.Marshal(forward.Protocols)
+	legacyTarget := strings.TrimSpace(forward.Target)
+	if len(forward.Targets) > 0 {
+		legacyTarget = strings.TrimSpace(forward.Targets[0].Address)
+	}
 	_, err = tx.ExecContext(ctx,
-		`INSERT INTO forwards (id, name, tunnel_id, protocols_json, listen, target, enabled, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO forwards (id, name, tunnel_id, protocols_json, listen, target, strategy, tcp_strategy, udp_strategy, enabled, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET
 		   name = excluded.name,
 		   tunnel_id = excluded.tunnel_id,
 		   protocols_json = excluded.protocols_json,
 		   listen = excluded.listen,
 		   target = excluded.target,
+		   strategy = excluded.strategy,
+		   tcp_strategy = excluded.tcp_strategy,
+		   udp_strategy = excluded.udp_strategy,
 		   enabled = excluded.enabled,
 		   updated_at = excluded.updated_at`,
-		forward.ID, forward.Name, forward.TunnelID, string(protocols), forward.Listen, forward.Target, boolInt(forward.Enabled),
+		forward.ID, forward.Name, forward.TunnelID, string(protocols), forward.Listen, legacyTarget,
+		forward.Strategy, forward.TCPStrategy, forward.UDPStrategy, boolInt(forward.Enabled),
 		forward.CreatedAt.UTC().Format(time.RFC3339Nano), forward.UpdatedAt.UTC().Format(time.RFC3339Nano),
 	)
 	if err != nil {
@@ -885,6 +960,27 @@ func (s *Store) SaveForward(ctx context.Context, forward model.Forward, allocati
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM port_allocations WHERE owner_kind = 'forward' AND owner_id = ?`, forward.ID); err != nil {
 		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM forward_targets WHERE forward_id = ?`, forward.ID); err != nil {
+		return 0, err
+	}
+	for index, target := range forward.Targets {
+		if target.Weight <= 0 {
+			target.Weight = 1
+		}
+		if target.ID == "" {
+			target.ID = fmt.Sprintf("%s:%d", forward.ID, index)
+		}
+		targetProtocols, _ := json.Marshal(target.Protocols)
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO forward_targets
+			 (id, forward_id, position, address, protocols_json, weight, enabled, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			target.ID, forward.ID, index, target.Address, string(targetProtocols), target.Weight, boolInt(target.Enabled),
+			now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano),
+		); err != nil {
+			return 0, err
+		}
 	}
 	if err := insertAllocations(ctx, tx, allocations); err != nil {
 		return 0, err
@@ -898,7 +994,7 @@ func (s *Store) SaveForward(ctx context.Context, forward model.Forward, allocati
 
 func (s *Store) ListForwards(ctx context.Context) ([]model.Forward, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, name, tunnel_id, protocols_json, listen, target, enabled, created_at, updated_at
+		`SELECT id, name, tunnel_id, protocols_json, listen, target, strategy, tcp_strategy, udp_strategy, enabled, created_at, updated_at
 		 FROM forwards ORDER BY created_at DESC`,
 	)
 	if err != nil {
@@ -913,12 +1009,20 @@ func (s *Store) ListForwards(ctx context.Context) ([]model.Forward, error) {
 		}
 		out = append(out, forward)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		if err := s.loadForwardTargets(ctx, &out[i]); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 func (s *Store) ListForwardsByTunnel(ctx context.Context, tunnelID string) ([]model.Forward, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, name, tunnel_id, protocols_json, listen, target, enabled, created_at, updated_at
+		`SELECT id, name, tunnel_id, protocols_json, listen, target, strategy, tcp_strategy, udp_strategy, enabled, created_at, updated_at
 		 FROM forwards WHERE tunnel_id = ? ORDER BY created_at DESC`,
 		tunnelID,
 	)
@@ -934,15 +1038,30 @@ func (s *Store) ListForwardsByTunnel(ctx context.Context, tunnelID string) ([]mo
 		}
 		out = append(out, forward)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		if err := s.loadForwardTargets(ctx, &out[i]); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 func (s *Store) GetForward(ctx context.Context, id string) (model.Forward, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, name, tunnel_id, protocols_json, listen, target, enabled, created_at, updated_at
+		`SELECT id, name, tunnel_id, protocols_json, listen, target, strategy, tcp_strategy, udp_strategy, enabled, created_at, updated_at
 		 FROM forwards WHERE id = ?`, id,
 	)
-	return scanForward(row)
+	forward, err := scanForward(row)
+	if err != nil {
+		return model.Forward{}, err
+	}
+	if err := s.loadForwardTargets(ctx, &forward); err != nil {
+		return model.Forward{}, err
+	}
+	return forward, nil
 }
 
 func (s *Store) DeleteForward(ctx context.Context, id string) (int64, error) {
@@ -952,6 +1071,9 @@ func (s *Store) DeleteForward(ctx context.Context, id string) (int64, error) {
 	}
 	defer rollbackTx(tx)
 	if _, err := tx.ExecContext(ctx, `DELETE FROM port_allocations WHERE owner_kind = 'forward' AND owner_id = ?`, id); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM forward_targets WHERE forward_id = ?`, id); err != nil {
 		return 0, err
 	}
 	res, err := tx.ExecContext(ctx, `DELETE FROM forwards WHERE id = ?`, id)
@@ -1256,7 +1378,8 @@ func scanForward(row scanner) (model.Forward, error) {
 	var forward model.Forward
 	var protocolsJSON, created, updated string
 	var enabled int
-	err := row.Scan(&forward.ID, &forward.Name, &forward.TunnelID, &protocolsJSON, &forward.Listen, &forward.Target, &enabled, &created, &updated)
+	err := row.Scan(&forward.ID, &forward.Name, &forward.TunnelID, &protocolsJSON, &forward.Listen, &forward.Target,
+		&forward.Strategy, &forward.TCPStrategy, &forward.UDPStrategy, &enabled, &created, &updated)
 	if err != nil {
 		return model.Forward{}, err
 	}
@@ -1265,6 +1388,47 @@ func scanForward(row scanner) (model.Forward, error) {
 	forward.UpdatedAt = parseTime(updated)
 	_ = json.Unmarshal([]byte(protocolsJSON), &forward.Protocols)
 	return forward, nil
+}
+
+func (s *Store) loadForwardTargets(ctx context.Context, forward *model.Forward) error {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, forward_id, position, address, protocols_json, weight, enabled
+		 FROM forward_targets WHERE forward_id = ? ORDER BY position ASC, rowid ASC`,
+		forward.ID,
+	)
+	if err != nil {
+		return err
+	}
+	defer closeRows(rows)
+	var targets []model.ForwardTarget
+	for rows.Next() {
+		var target model.ForwardTarget
+		var protocolsJSON string
+		var enabled int
+		if err := rows.Scan(&target.ID, &target.ForwardID, &target.Position, &target.Address, &protocolsJSON, &target.Weight, &enabled); err != nil {
+			return err
+		}
+		target.Enabled = enabled == 1
+		_ = json.Unmarshal([]byte(protocolsJSON), &target.Protocols)
+		targets = append(targets, target)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(targets) == 0 && strings.TrimSpace(forward.Target) != "" {
+		targets = []model.ForwardTarget{{
+			ID:        "legacy:" + forward.ID,
+			ForwardID: forward.ID,
+			Address:   forward.Target,
+			Enabled:   true,
+			Position:  0,
+		}}
+	}
+	for i := range targets {
+		targets[i].Position = i
+	}
+	forward.Targets = targets
+	return nil
 }
 
 func scanPortAllocation(row scanner) (model.PortAllocation, error) {

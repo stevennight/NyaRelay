@@ -165,3 +165,49 @@ func TestCandidateSelectorRoundRobinCursorsArePerNetwork(t *testing.T) {
 		t.Fatalf("second udp order = %v", got)
 	}
 }
+
+func TestTargetSelectorRoundRobinAndProtocolMask(t *testing.T) {
+	sel := newTargetSelector()
+	forward := model.ForwardRuntime{
+		ID:          "fwd",
+		Strategy:    "failover",
+		TCPStrategy: "round_robin",
+		Targets: []model.ForwardTarget{
+			{ID: "tcp-a", Address: "127.0.0.1:1", Protocols: []model.ForwardProtocol{model.ForwardProtocolTCP}, Weight: 1, Enabled: true},
+			{ID: "udp-only", Address: "127.0.0.1:2", Protocols: []model.ForwardProtocol{model.ForwardProtocolUDP}, Weight: 1, Enabled: true},
+			{ID: "tcp-b", Address: "127.0.0.1:3", Protocols: []model.ForwardProtocol{model.ForwardProtocolTCP}, Weight: 1, Enabled: true},
+		},
+	}
+
+	if got := sel.order(forward, "tcp"); !reflect.DeepEqual(got, []int{0, 2}) {
+		t.Fatalf("first target order = %v, want [0 2]", got)
+	}
+	if got := sel.order(forward, "tcp"); !reflect.DeepEqual(got, []int{2, 0}) {
+		t.Fatalf("second target order = %v, want [2 0]", got)
+	}
+	if got := sel.order(forward, "udp"); !reflect.DeepEqual(got, []int{1}) {
+		t.Fatalf("udp target order = %v, want [1]", got)
+	}
+}
+
+func TestTargetSelectorFailoverRecovers(t *testing.T) {
+	sel := newTargetSelector()
+	sel.failTimeout = 10 * time.Millisecond
+	forward := model.ForwardRuntime{
+		ID:       "fwd",
+		Strategy: "failover",
+		Targets: []model.ForwardTarget{
+			{ID: "primary", Address: "127.0.0.1:1", Weight: 1, Enabled: true},
+			{ID: "backup", Address: "127.0.0.1:2", Weight: 1, Enabled: true},
+		},
+	}
+
+	sel.recordFailure("fwd", "primary", "tcp")
+	if got := sel.order(forward, "tcp"); !reflect.DeepEqual(got, []int{1}) {
+		t.Fatalf("target failover order = %v, want [1]", got)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if got := sel.order(forward, "tcp"); !reflect.DeepEqual(got, []int{0, 1}) {
+		t.Fatalf("target recovery order = %v, want [0 1]", got)
+	}
+}

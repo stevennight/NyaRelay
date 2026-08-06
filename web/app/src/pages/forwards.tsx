@@ -1,9 +1,10 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate } from '@tanstack/react-router'
-import { Pause, Play, Plus, RotateCcw, Settings, Trash2 } from 'lucide-react'
+import { ArrowDown, ArrowUp, Pause, Play, Plus, RotateCcw, Settings, Trash2 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
+import type { Dispatch, SetStateAction } from 'react'
 import { api, post } from '../api'
-import type { Dashboard, ForwardInfo, ForwardProtocol, NodeInfo, TunnelInfo } from '../types'
+import type { Dashboard, ForwardInfo, ForwardProtocol, ForwardTargetInfo, NodeInfo, TunnelInfo } from '../types'
 import {
   Banner,
   DetailGrid,
@@ -21,6 +22,15 @@ import {
 } from '../components/ui'
 
 type ProtocolMode = 'tcp' | 'udp' | 'tcp_udp'
+type SelectionStrategy = 'single' | 'failover' | 'round_robin' | 'random'
+
+type ForwardTargetForm = {
+  id: string
+  address: string
+  protocols: ForwardProtocol[]
+  weight: number
+  enabled: boolean
+}
 
 type ForwardForm = {
   id: string
@@ -28,7 +38,10 @@ type ForwardForm = {
   tunnel_id: string
   protocol_mode: ProtocolMode
   listen: string
-  target: string
+  strategy: SelectionStrategy
+  tcp_strategy: SelectionStrategy
+  udp_strategy: SelectionStrategy
+  targets: ForwardTargetForm[]
   enabled: boolean
 }
 
@@ -45,9 +58,22 @@ const emptyForwardForm = (): ForwardForm => ({
   tunnel_id: '',
   protocol_mode: 'tcp_udp',
   listen: '',
-  target: '',
+  strategy: 'failover',
+  tcp_strategy: 'failover',
+  udp_strategy: 'failover',
+  targets: [emptyTargetForm()],
   enabled: true,
 })
+
+function emptyTargetForm(): ForwardTargetForm {
+  return {
+    id: '',
+    address: '',
+    protocols: [],
+    weight: 1,
+    enabled: true,
+  }
+}
 
 const emptyForwardFilters = (): ForwardFilters => ({
   name: '',
@@ -143,7 +169,7 @@ function ForwardsListView({
           return false
         }
       }
-      if (targetNeedle && !forward.target.toLowerCase().includes(targetNeedle)) {
+      if (targetNeedle && !forwardTargets(forward).some((target) => target.address.toLowerCase().includes(targetNeedle))) {
         return false
       }
       return true
@@ -156,7 +182,7 @@ function ForwardsListView({
   return (
     <PageFrame
       title="转发"
-      subtitle="转发选择一个隧道，设置入口端口和最终目标。"
+      subtitle="转发选择一个隧道，设置入口端口、目标池和选择策略。"
       action={
         <Link to="/forwards/new" className="button-link">
           <Plus size={16} />
@@ -243,7 +269,7 @@ function ForwardsListView({
                       {formatForwardEndpoint(forward, tunnel, nodeMap)}
                       <small>{listenPortSummary(forward.listen)}</small>
                     </td>
-                    <td>{forward.target}</td>
+                    <td>{formatTargetSummary(forward)}</td>
                     <td><StatusPill value={forward.enabled ? 'enabled' : 'disabled'} /></td>
                   </tr>
                 )
@@ -415,7 +441,8 @@ function ForwardDetailsContent({
           { label: '隧道', value: tunnel?.name ?? forward.tunnel_id },
           { label: '入口地址', value: formatForwardEndpoint(forward, tunnel, nodes) },
           { label: '监听端口', value: listenPortLabel(forward.listen) },
-          { label: '目标地址', value: forward.target },
+          { label: '目标地址', value: <TargetDetails targets={forwardTargets(forward)} /> },
+          { label: '目标策略', value: formatStrategy(forward.strategy, forward.tcp_strategy, forward.udp_strategy) },
           { label: '配置版本', value: String(revision ?? '-') },
           { label: '创建时间', value: formatTime(forward.created_at) },
           { label: '更新时间', value: formatTime(forward.updated_at) },
@@ -459,7 +486,16 @@ function ForwardEditor({
       tunnel_id: initialForward.tunnel_id,
       protocol_mode: modeFromProtocols(initialForward.protocols),
       listen: listenInputValue(initialForward.listen),
-      target: initialForward.target,
+      strategy: strategyValue(initialForward.strategy, initialForward.targets?.length ?? 1),
+      tcp_strategy: strategyValue(initialForward.tcp_strategy, initialForward.targets?.length ?? 1),
+      udp_strategy: strategyValue(initialForward.udp_strategy, initialForward.targets?.length ?? 1),
+      targets: forwardTargets(initialForward).map((target) => ({
+        id: target.id,
+        address: target.address,
+        protocols: target.protocols ?? [],
+        weight: Math.max(1, target.weight ?? 1),
+        enabled: target.enabled,
+      })),
       enabled: initialForward.enabled,
     })
   }, [initialForward])
@@ -472,7 +508,13 @@ function ForwardEditor({
         tunnel_id: form.tunnel_id,
         protocols: protocolsFromMode(form.protocol_mode),
         listen: normalizeListenInput(form.listen),
-        target: form.target,
+        strategy: form.strategy,
+        tcp_strategy: form.tcp_strategy,
+        udp_strategy: form.udp_strategy,
+        targets: form.targets.map((target, position) => ({
+          ...target,
+          position,
+        })),
         enabled: form.enabled,
       }
       if (initialForward) {
@@ -522,12 +564,29 @@ function ForwardEditor({
             placeholder="8443"
           />
         </Field>
-        <Field label="目标地址" hint="最终目标地址，例如 10.0.0.8:443。">
-          <input
-            value={form.target}
-            onChange={(event) => setForm((current) => ({ ...current, target: event.target.value }))}
-            placeholder="10.0.0.8:443"
-          />
+        <Field label="默认策略">
+          <select
+            value={form.strategy}
+            onChange={(event) => setForm((current) => ({ ...current, strategy: event.target.value as SelectionStrategy }))}
+          >
+            {strategyOptions()}
+          </select>
+        </Field>
+        <Field label="TCP 策略">
+          <select
+            value={form.tcp_strategy}
+            onChange={(event) => setForm((current) => ({ ...current, tcp_strategy: event.target.value as SelectionStrategy }))}
+          >
+            {strategyOptions()}
+          </select>
+        </Field>
+        <Field label="UDP 策略">
+          <select
+            value={form.udp_strategy}
+            onChange={(event) => setForm((current) => ({ ...current, udp_strategy: event.target.value as SelectionStrategy }))}
+          >
+            {strategyOptions()}
+          </select>
         </Field>
         <ToggleField
           label="启用"
@@ -536,12 +595,199 @@ function ForwardEditor({
           onChange={(checked) => setForm((current) => ({ ...current, enabled: checked }))}
         />
       </FieldGrid>
+      <section className="form-section">
+        <div className="section-heading">
+          <div>
+            <h3>目标池</h3>
+            <p>TCP 按连接选择，UDP 按会话保持目标粘滞。</p>
+          </div>
+          <button
+            type="button"
+            className="ghost"
+            onClick={() => setForm((current) => ({ ...current, targets: [...current.targets, emptyTargetForm()] }))}
+          >
+            <Plus size={16} />
+            添加目标
+          </button>
+        </div>
+        <div className="forward-target-list">
+          {form.targets.map((target, index) => (
+            <div className="hop forward-target-row" key={target.id || `target-${index}`}>
+              <span>{index + 1}</span>
+              <input
+                aria-label={index === 0 ? '目标地址' : `目标地址 ${index + 1}`}
+                value={target.address}
+                onChange={(event) => updateTarget(setForm, index, { address: event.target.value })}
+                placeholder="10.0.0.8:443"
+              />
+              <label className="candidate-weight">
+                <span>权重</span>
+                <input
+                  aria-label={`目标权重 ${index + 1}`}
+                  type="number"
+                  min={1}
+                  value={String(target.weight)}
+                  onChange={(event) => updateTarget(setForm, index, { weight: Math.max(1, Number(event.target.value) || 1) })}
+                />
+              </label>
+              <div className="candidate-protocols">
+                {(['tcp', 'udp'] as const).map((protocol) => (
+                  <label key={protocol}>
+                    <input
+                      type="checkbox"
+                      checked={target.protocols.length === 0 || target.protocols.includes(protocol)}
+                      onChange={(event) => updateTarget(setForm, index, {
+                        protocols: toggleTargetProtocol(target.protocols, protocol, event.target.checked),
+                      })}
+                    />
+                    {protocol.toUpperCase()}
+                  </label>
+                ))}
+              </div>
+              <ToggleField
+                label="启用"
+                checked={target.enabled}
+                onChange={(checked) => updateTarget(setForm, index, { enabled: checked })}
+              />
+              <InlineActions>
+                <button
+                  type="button"
+                  className="ghost icon-button"
+                  aria-label={`上移目标 ${index + 1}`}
+                  title="上移目标"
+                  disabled={index === 0}
+                  onClick={() => moveTarget(setForm, index, index - 1)}
+                >
+                  <ArrowUp size={16} />
+                </button>
+                <button
+                  type="button"
+                  className="ghost icon-button"
+                  aria-label={`下移目标 ${index + 1}`}
+                  title="下移目标"
+                  disabled={index === form.targets.length - 1}
+                  onClick={() => moveTarget(setForm, index, index + 1)}
+                >
+                  <ArrowDown size={16} />
+                </button>
+                <button
+                  type="button"
+                  className="ghost danger"
+                  disabled={form.targets.length === 1}
+                  onClick={() => setForm((current) => ({
+                    ...current,
+                    targets: current.targets.filter((_, targetIndex) => targetIndex !== index),
+                  }))}
+                >
+                  <Trash2 size={16} />
+                  移除
+                </button>
+              </InlineActions>
+            </div>
+          ))}
+        </div>
+      </section>
       {error && <p className="error">{error}</p>}
       <FormActions>
         <button type="submit" disabled={save.isPending}>保存转发</button>
       </FormActions>
     </form>
   )
+}
+
+function strategyOptions() {
+  return [
+    <option key="single" value="single">单候选</option>,
+    <option key="failover" value="failover">故障切换</option>,
+    <option key="round_robin" value="round_robin">轮询</option>,
+    <option key="random" value="random">随机</option>,
+  ]
+}
+
+function strategyValue(strategy: string | undefined, targetCount: number): SelectionStrategy {
+  const value = strategy as SelectionStrategy | undefined
+  if (value === 'single' || value === 'failover' || value === 'round_robin' || value === 'random') {
+    return value
+  }
+  return targetCount > 1 ? 'failover' : 'single'
+}
+
+function forwardTargets(forward: ForwardInfo): ForwardTargetInfo[] {
+  if (forward.targets?.length) return forward.targets
+  if (forward.target) {
+    return [{
+      id: `legacy:${forward.id}`,
+      address: forward.target,
+      enabled: true,
+      weight: 1,
+    }]
+  }
+  return []
+}
+
+function formatTargetSummary(forward: ForwardInfo) {
+  const targets = forwardTargets(forward)
+  if (targets.length === 0) return '-'
+  if (targets.length === 1) return targets[0].address
+  return `${targets[0].address} 等 ${targets.length} 个目标`
+}
+
+function formatStrategy(strategy?: string, tcpStrategy?: string, udpStrategy?: string) {
+  const base = strategy || 'single'
+  const tcp = tcpStrategy || base
+  const udp = udpStrategy || base
+  return `默认 ${base} / TCP ${tcp} / UDP ${udp}`
+}
+
+function TargetDetails({ targets }: { targets: ForwardTargetInfo[] }) {
+  if (targets.length === 0) return <span>-</span>
+  return (
+    <div className="detail-target-list">
+      {targets.map((target) => (
+        <div key={target.id || target.address}>
+          <strong>{target.address}</strong>
+          <small>
+            {target.enabled ? '启用' : '停用'} · 权重 {target.weight ?? 1}
+          </small>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function updateTarget(
+  setForm: Dispatch<SetStateAction<ForwardForm>>,
+  index: number,
+  patch: Partial<ForwardTargetForm>,
+) {
+  setForm((current) => ({
+    ...current,
+    targets: current.targets.map((target, targetIndex) => (
+      targetIndex === index ? { ...target, ...patch } : target
+    )),
+  }))
+}
+
+function moveTarget(
+  setForm: Dispatch<SetStateAction<ForwardForm>>,
+  from: number,
+  to: number,
+) {
+  setForm((current) => {
+    if (to < 0 || to >= current.targets.length) return current
+    const targets = [...current.targets]
+    const [target] = targets.splice(from, 1)
+    targets.splice(to, 0, target)
+    return { ...current, targets }
+  })
+}
+
+function toggleTargetProtocol(protocols: ForwardProtocol[], protocol: ForwardProtocol, enabled: boolean) {
+  const next = new Set<ForwardProtocol>(protocols.length === 0 ? ['tcp', 'udp'] : protocols)
+  if (enabled) next.add(protocol)
+  else next.delete(protocol)
+  if (next.size === 2) return []
+  return Array.from(next).filter((item): item is ForwardProtocol => item === 'tcp' || item === 'udp')
 }
 
 function indexByID<T extends { id: string }>(items: T[]) {

@@ -44,6 +44,40 @@ func TestSingleNodeTCPDirectOut(t *testing.T) {
 	assertTCPRoundTrip(t, listenAddr, "nya-single")
 }
 
+func TestSingleNodeTCPForwardTargetFailover(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	backupAddr, closeBackup := tcpEchoServer(t)
+	defer closeBackup()
+
+	listenAddr := freeTCPAddr(t)
+	service := New(testLogger(), "node_entry")
+	err := service.Apply(ctx, model.RelayConfig{
+		NodeID:   "node_entry",
+		Revision: 1,
+		Tunnels:  []model.TunnelRuntime{directTunnel()},
+		Forwards: []model.ForwardRuntime{{
+			ID:        "fwd_failover",
+			Name:      "target-failover",
+			TunnelID:  "tun_direct",
+			Protocols: []model.ForwardProtocol{model.ForwardProtocolTCP},
+			Listen:    listenAddr,
+			Strategy:  "failover",
+			Targets: []model.ForwardTarget{
+				{ID: "unavailable", Address: "127.0.0.1:1", Enabled: true, Weight: 1},
+				{ID: "backup", Address: backupAddr, Enabled: true, Weight: 1},
+			},
+			Enabled: true,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assertTCPRoundTrip(t, listenAddr, "nya-target-failover")
+}
+
 func TestTwoNodeTCPChain(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

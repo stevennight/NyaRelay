@@ -59,7 +59,12 @@ func TestScopeConfigForNodeLimitsTunnelSecrets(t *testing.T) {
 		Protocols: []model.ForwardProtocol{model.ForwardProtocolTCP},
 		Listen:    "127.0.0.1:8443",
 		Target:    "127.0.0.1:443",
-		Enabled:   true,
+		Targets: []model.ForwardTarget{
+			{ID: "target-a", Address: "127.0.0.1:443", Enabled: true, Weight: 1},
+			{ID: "target-b", Address: "127.0.0.1:444", Enabled: true, Weight: 1},
+		},
+		Strategy: "failover",
+		Enabled:  true,
 	}
 
 	entryTunnels, entryForwards := scopeConfigForNode("entry", []model.Tunnel{tunnel}, []model.Forward{forward})
@@ -76,6 +81,9 @@ func TestScopeConfigForNodeLimitsTunnelSecrets(t *testing.T) {
 	if entryForwards[0].Target != "" {
 		t.Fatal("chain entry node must not receive target")
 	}
+	if len(entryForwards[0].Targets) != 0 {
+		t.Fatal("chain entry node must not receive target pool")
+	}
 
 	exitTunnels, exitForwards := scopeConfigForNode("exit", []model.Tunnel{tunnel}, []model.Forward{forward})
 	if len(exitTunnels) != 1 || len(exitForwards) != 1 {
@@ -90,5 +98,8 @@ func TestScopeConfigForNodeLimitsTunnelSecrets(t *testing.T) {
 	}
 	if exitForwards[0].Target == "" {
 		t.Fatal("exit node must receive target")
+	}
+	if len(exitForwards[0].Targets) != 2 || exitForwards[0].Strategy != "failover" {
+		t.Fatalf("exit target runtime = %#v strategy=%q", exitForwards[0].Targets, exitForwards[0].Strategy)
 	}
 }

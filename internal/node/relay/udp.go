@@ -54,8 +54,8 @@ func (s *Service) handleUDPPacket(ctx context.Context, forward model.ForwardRunt
 	var statID string
 	var err error
 	if tunnel.Type == model.TunnelDirect {
-		response, err = udpRoundTrip(ctx, forward.Target, payload)
-		statID = "target:" + forward.ID
+		sessionID := forward.ID + ":" + clientAddr.String()
+		response, statID, err = s.udpTargetRoundTrip(ctx, forward, sessionID, payload)
 	} else {
 		sessionID := forward.ID + ":" + clientAddr.String()
 		response, statID, err = s.forwardUDPOverTunnel(ctx, tunnel, forward, sessionID, payload)
@@ -187,13 +187,18 @@ func (s *Service) handleUDPStageExit(ctx context.Context, forward model.ForwardR
 		if frame.ForwardID != forward.ID {
 			return
 		}
-		response, err := udpRoundTrip(ctx, forward.Target, frame.Payload)
+		response, statID, err := s.udpTargetRoundTrip(ctx, forward, frame.SessionID, frame.Payload)
 		if err != nil {
 			s.log.Debug("udp target round trip failed", "forward", forward.Name, "error", err)
 			return
 		}
 		counter.AddIn(int64(len(frame.Payload)))
 		counter.AddOut(int64(len(response)))
+		if statID != "" {
+			tunnelCounter := s.tunnels.Get(statID)
+			tunnelCounter.AddIn(int64(len(frame.Payload)))
+			tunnelCounter.AddOut(int64(len(response)))
+		}
 		if err := protocol.WriteUDPDatagramFrame(inbound, protocol.UDPDatagramFrame{
 			ForwardID: forward.ID,
 			SessionID: frame.SessionID,
@@ -201,6 +206,63 @@ func (s *Service) handleUDPStageExit(ctx context.Context, forward model.ForwardR
 		}); err != nil {
 			return
 		}
+	}
+}
+
+func (s *Service) udpTargetRoundTrip(ctx context.Context, forward model.ForwardRuntime, sessionID string, payload []byte) (response []byte, statID string, err error) {
+	attempts := len(forward.Targets)
+	if attempts <= 0 {
+		attempts = 1
+	}
+	var lastErr error
+	var lastStatID string
+	for attempt := 0; attempt < attempts; attempt++ {
+		response, statID, err = s.udpTargetRoundTripOnce(ctx, forward, sessionID, payload)
+		lastStatID = statID
+		if err == nil {
+			return response, statID, nil
+		}
+		lastErr = err
+	}
+	return nil, lastStatID, lastErr
+}
+
+func (s *Service) udpTargetRoundTripOnce(ctx context.Context, forward model.ForwardRuntime, sessionID string, payload []byte) (response []byte, statID string, err error) {
+	out, statID, targetID, err := s.dialForwardTarget(ctx, forward, "udp", sessionID)
+	if err != nil {
+		return nil, statID, err
+	}
+	defer func() {
+		if closeErr := out.Close(); err == nil {
+			err = closeErr
+		}
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	_ = out.SetDeadline(deadline)
+	if _, err := out.Write(payload); err != nil {
+		s.markUDPTargetFailure(forward.ID, sessionID, targetID)
+		return nil, statID, err
+	}
+	buf := make([]byte, protocol.MaxUDPPacket)
+	n, err := out.Read(buf)
+	if err != nil {
+		s.markUDPTargetFailure(forward.ID, sessionID, targetID)
+		return nil, statID, err
+	}
+	s.targets.recordSuccess(forward.ID, targetID, "udp")
+	return append([]byte(nil), buf[:n]...), statID, nil
+}
+
+func (s *Service) markUDPTargetFailure(forwardID, sessionID, targetID string) {
+	if targetID == "" {
+		return
+	}
+	s.targets.recordFailure(forwardID, targetID, "udp")
+	if sessionID != "" {
+		s.udpTargets.delete(udpTargetSessionKey(forwardID, sessionID))
 	}
 }
 

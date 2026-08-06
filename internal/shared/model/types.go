@@ -122,15 +122,19 @@ type TunnelStageNode struct {
 }
 
 type Forward struct {
-	ID        string            `json:"id"`
-	Name      string            `json:"name"`
-	TunnelID  string            `json:"tunnel_id"`
-	Protocols []ForwardProtocol `json:"protocols"`
-	Listen    string            `json:"listen"`
-	Target    string            `json:"target"`
-	Enabled   bool              `json:"enabled"`
-	CreatedAt time.Time         `json:"created_at"`
-	UpdatedAt time.Time         `json:"updated_at"`
+	ID          string            `json:"id"`
+	Name        string            `json:"name"`
+	TunnelID    string            `json:"tunnel_id"`
+	Protocols   []ForwardProtocol `json:"protocols"`
+	Listen      string            `json:"listen"`
+	Target      string            `json:"target,omitempty"`
+	Targets     []ForwardTarget   `json:"targets"`
+	Strategy    string            `json:"strategy,omitempty"`
+	TCPStrategy string            `json:"tcp_strategy,omitempty"`
+	UDPStrategy string            `json:"udp_strategy,omitempty"`
+	Enabled     bool              `json:"enabled"`
+	CreatedAt   time.Time         `json:"created_at"`
+	UpdatedAt   time.Time         `json:"updated_at"`
 }
 
 type PortAllocation struct {
@@ -183,14 +187,28 @@ type TunnelRuntimeNode struct {
 	Settings    map[string]string `json:"settings,omitempty"`
 }
 
-type ForwardRuntime struct {
+type ForwardTarget struct {
 	ID        string            `json:"id"`
-	Name      string            `json:"name"`
-	TunnelID  string            `json:"tunnel_id"`
-	Protocols []ForwardProtocol `json:"protocols"`
-	Listen    string            `json:"listen,omitempty"`
-	Target    string            `json:"target,omitempty"`
+	ForwardID string            `json:"forward_id,omitempty"`
+	Address   string            `json:"address"`
+	Protocols []ForwardProtocol `json:"protocols,omitempty"`
+	Weight    int               `json:"weight,omitempty"`
 	Enabled   bool              `json:"enabled"`
+	Position  int               `json:"position,omitempty"`
+}
+
+type ForwardRuntime struct {
+	ID          string            `json:"id"`
+	Name        string            `json:"name"`
+	TunnelID    string            `json:"tunnel_id"`
+	Protocols   []ForwardProtocol `json:"protocols"`
+	Listen      string            `json:"listen,omitempty"`
+	Target      string            `json:"target,omitempty"`
+	Targets     []ForwardTarget   `json:"targets,omitempty"`
+	Strategy    string            `json:"strategy,omitempty"`
+	TCPStrategy string            `json:"tcp_strategy,omitempty"`
+	UDPStrategy string            `json:"udp_strategy,omitempty"`
+	Enabled     bool              `json:"enabled"`
 }
 
 type SignedConfig struct {
