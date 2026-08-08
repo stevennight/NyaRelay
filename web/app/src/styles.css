@@ -728,7 +728,7 @@ td small {
   background: var(--surface);
 }
 
-.hop span {
+.hop > span:first-child {
   width: 28px;
   height: 28px;
   display: grid;

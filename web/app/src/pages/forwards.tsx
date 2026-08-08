@@ -22,7 +22,7 @@ import {
 } from '../components/ui'
 
 type ProtocolMode = 'tcp' | 'udp' | 'tcp_udp'
-type SelectionStrategy = 'single' | 'failover' | 'round_robin' | 'random'
+type SelectionStrategy = 'failover' | 'round_robin' | 'random'
 
 type ForwardTargetForm = {
   id: string
@@ -38,7 +38,6 @@ type ForwardForm = {
   tunnel_id: string
   protocol_mode: ProtocolMode
   listen: string
-  strategy: SelectionStrategy
   tcp_strategy: SelectionStrategy
   udp_strategy: SelectionStrategy
   targets: ForwardTargetForm[]
@@ -58,7 +57,6 @@ const emptyForwardForm = (): ForwardForm => ({
   tunnel_id: '',
   protocol_mode: 'tcp_udp',
   listen: '',
-  strategy: 'failover',
   tcp_strategy: 'failover',
   udp_strategy: 'failover',
   targets: [emptyTargetForm()],
@@ -442,7 +440,7 @@ function ForwardDetailsContent({
           { label: '入口地址', value: formatForwardEndpoint(forward, tunnel, nodes) },
           { label: '监听端口', value: listenPortLabel(forward.listen) },
           { label: '目标地址', value: <TargetDetails targets={forwardTargets(forward)} /> },
-          { label: '目标策略', value: formatStrategy(forward.strategy, forward.tcp_strategy, forward.udp_strategy) },
+          { label: '目标策略', value: formatStrategy(forward.tcp_strategy, forward.udp_strategy, forward.strategy) },
           { label: '配置版本', value: String(revision ?? '-') },
           { label: '创建时间', value: formatTime(forward.created_at) },
           { label: '更新时间', value: formatTime(forward.updated_at) },
@@ -486,9 +484,8 @@ function ForwardEditor({
       tunnel_id: initialForward.tunnel_id,
       protocol_mode: modeFromProtocols(initialForward.protocols),
       listen: listenInputValue(initialForward.listen),
-      strategy: strategyValue(initialForward.strategy, initialForward.targets?.length ?? 1),
-      tcp_strategy: strategyValue(initialForward.tcp_strategy, initialForward.targets?.length ?? 1),
-      udp_strategy: strategyValue(initialForward.udp_strategy, initialForward.targets?.length ?? 1),
+      tcp_strategy: strategyValue(initialForward.tcp_strategy, initialForward.strategy),
+      udp_strategy: strategyValue(initialForward.udp_strategy, initialForward.strategy),
       targets: forwardTargets(initialForward).map((target) => ({
         id: target.id,
         address: target.address,
@@ -508,7 +505,6 @@ function ForwardEditor({
         tunnel_id: form.tunnel_id,
         protocols: protocolsFromMode(form.protocol_mode),
         listen: normalizeListenInput(form.listen),
-        strategy: form.strategy,
         tcp_strategy: form.tcp_strategy,
         udp_strategy: form.udp_strategy,
         targets: form.targets.map((target, position) => ({
@@ -563,14 +559,6 @@ function ForwardEditor({
             onChange={(event) => setForm((current) => ({ ...current, listen: event.target.value }))}
             placeholder="8443"
           />
-        </Field>
-        <Field label="默认策略">
-          <select
-            value={form.strategy}
-            onChange={(event) => setForm((current) => ({ ...current, strategy: event.target.value as SelectionStrategy }))}
-          >
-            {strategyOptions()}
-          </select>
         </Field>
         <Field label="TCP 策略">
           <select
@@ -697,19 +685,25 @@ function ForwardEditor({
 
 function strategyOptions() {
   return [
-    <option key="single" value="single">单候选</option>,
     <option key="failover" value="failover">故障切换</option>,
     <option key="round_robin" value="round_robin">轮询</option>,
     <option key="random" value="random">随机</option>,
   ]
 }
 
-function strategyValue(strategy: string | undefined, targetCount: number): SelectionStrategy {
-  const value = strategy as SelectionStrategy | undefined
-  if (value === 'single' || value === 'failover' || value === 'round_robin' || value === 'random') {
-    return value
+function strategyValue(strategy: string | undefined, fallback?: string): SelectionStrategy {
+  switch (strategy?.trim().toLowerCase()) {
+    case 'failover':
+      return 'failover'
+    case 'round_robin':
+      return 'round_robin'
+    case 'random':
+      return 'random'
+    case 'single':
+      return strategyValue(fallback)
+    default:
+      return fallback ? strategyValue(fallback) : 'failover'
   }
-  return targetCount > 1 ? 'failover' : 'single'
 }
 
 function forwardTargets(forward: ForwardInfo): ForwardTargetInfo[] {
@@ -732,11 +726,11 @@ function formatTargetSummary(forward: ForwardInfo) {
   return `${targets[0].address} 等 ${targets.length} 个目标`
 }
 
-function formatStrategy(strategy?: string, tcpStrategy?: string, udpStrategy?: string) {
-  const base = strategy || 'single'
-  const tcp = tcpStrategy || base
-  const udp = udpStrategy || base
-  return `默认 ${base} / TCP ${tcp} / UDP ${udp}`
+function formatStrategy(tcpStrategy?: string, udpStrategy?: string, legacyStrategy?: string) {
+  const fallback = strategyValue(legacyStrategy)
+  const tcp = strategyValue(tcpStrategy, fallback)
+  const udp = strategyValue(udpStrategy, fallback)
+  return `TCP ${tcp} / UDP ${udp}`
 }
 
 function TargetDetails({ targets }: { targets: ForwardTargetInfo[] }) {

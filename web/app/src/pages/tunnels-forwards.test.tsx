@@ -616,7 +616,6 @@ describe('tunnels and forwards pages', () => {
       tunnel_id: 'tun-1',
       protocols: ['tcp', 'udp'],
       listen: ':8443',
-      strategy: 'failover',
       tcp_strategy: 'failover',
       udp_strategy: 'failover',
       targets: [
