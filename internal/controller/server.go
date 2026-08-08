@@ -80,6 +80,7 @@ func Run(ctx context.Context, args []string) error {
 	s.hub.SetRevision(rev)
 	s.routes()
 
+	go s.historyCleanupLoop(ctx)
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           secureHeaders(s.mux),
@@ -2392,4 +2393,41 @@ func validateNodePortRange(portMin, portMax int) error {
 		return fmt.Errorf("port_min must be less than or equal to port_max")
 	}
 	return nil
+}
+
+func (s *Server) historyCleanupLoop(ctx context.Context) {
+	if s.cfg.CleanupInterval <= 0 || (s.cfg.MetricsRetention <= 0 && s.cfg.AuditRetention <= 0) {
+		return
+	}
+
+	s.cleanupHistory(ctx)
+	ticker := time.NewTicker(s.cfg.CleanupInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.cleanupHistory(ctx)
+		}
+	}
+}
+
+func (s *Server) cleanupHistory(ctx context.Context) {
+	now := time.Now().UTC()
+	var metricsBefore, auditBefore time.Time
+	if s.cfg.MetricsRetention > 0 {
+		metricsBefore = now.Add(-s.cfg.MetricsRetention)
+	}
+	if s.cfg.AuditRetention > 0 {
+		auditBefore = now.Add(-s.cfg.AuditRetention)
+	}
+	metricsDeleted, auditDeleted, err := s.store.PruneHistory(ctx, metricsBefore, auditBefore)
+	if err != nil {
+		s.log.Warn("history cleanup failed", "error", err)
+		return
+	}
+	if metricsDeleted > 0 || auditDeleted > 0 {
+		s.log.Info("history cleanup completed", "metrics_deleted", metricsDeleted, "audit_deleted", auditDeleted)
+	}
 }

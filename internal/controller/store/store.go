@@ -179,6 +179,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			detail TEXT NOT NULL,
 			created_at TEXT NOT NULL
 		);`,
+		`CREATE INDEX IF NOT EXISTS idx_metrics_observed_at ON metrics(observed_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_created_at ON audit(created_at);`,
 	}
 	for _, stmt := range statements {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
@@ -1490,4 +1492,42 @@ func closeRows(rows *sql.Rows) {
 
 func rollbackTx(tx *sql.Tx) {
 	_ = tx.Rollback()
+}
+
+func (s *Store) PruneHistory(ctx context.Context, metricsBefore, auditBefore time.Time) (metricsDeleted, auditDeleted int64, err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer rollbackTx(tx)
+
+	if !metricsBefore.IsZero() {
+		result, err := tx.ExecContext(ctx,
+			`DELETE FROM metrics WHERE observed_at < ?`,
+			metricsBefore.UTC().Format(time.RFC3339Nano),
+		)
+		if err != nil {
+			return 0, 0, err
+		}
+		metricsDeleted, _ = result.RowsAffected()
+	}
+	if !auditBefore.IsZero() {
+		result, err := tx.ExecContext(ctx,
+			`DELETE FROM audit WHERE created_at < ?`,
+			auditBefore.UTC().Format(time.RFC3339Nano),
+		)
+		if err != nil {
+			return 0, 0, err
+		}
+		auditDeleted, _ = result.RowsAffected()
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	if metricsDeleted > 0 || auditDeleted > 0 {
+		if _, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE);`); err != nil {
+			return metricsDeleted, auditDeleted, fmt.Errorf("checkpoint sqlite WAL: %w", err)
+		}
+	}
+	return metricsDeleted, auditDeleted, nil
 }

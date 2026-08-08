@@ -38,3 +38,13 @@ Main routes:
 - `cd web/app && npm run build` writes to `.tmp-webdist` at the repo root.
 - The controller serves `.tmp-webdist` when present.
 - The Docker image copies `.tmp-webdist` into `/app/.tmp-webdist`.
+
+## History Retention
+
+The controller stores configuration, audit events, and traffic metrics in `/data/nyarelay.db`. It prunes old history periodically by default:
+
+- metrics: 7 days (`NYARELAY_METRICS_RETENTION=168h`)
+- audit events: 90 days (`NYARELAY_AUDIT_RETENTION=2160h`)
+- cleanup interval: 1 hour (`NYARELAY_CLEANUP_INTERVAL=1h`)
+
+Durations use Go duration syntax. Set an individual retention to `0s` to disable that cleanup, or set the cleanup interval to `0s` to disable the cleanup loop entirely. After deleting rows, the controller checkpoints the SQLite WAL so the `-wal` file does not grow indefinitely.

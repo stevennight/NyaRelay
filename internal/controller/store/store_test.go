@@ -168,3 +168,43 @@ func newTestStore(t *testing.T) *Store {
 	})
 	return st
 }
+
+func TestPruneHistoryDeletesOnlyExpiredRows(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Now().UTC()
+	old := now.Add(-48 * time.Hour).Format(time.RFC3339Nano)
+	recent := now.Add(-2 * time.Hour).Format(time.RFC3339Nano)
+
+	if _, err := st.db.ExecContext(ctx, `
+		INSERT INTO metrics (node_id, stat_id, stat_kind, bytes_in, bytes_out, connections, observed_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?)
+	`, "node-1", "old", "forward", 1, 2, 3, old, "node-1", "recent", "forward", 4, 5, 6, recent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `
+		INSERT INTO audit (actor, action, target, detail, created_at)
+		VALUES (?, ?, ?, ?, ?), (?, ?, ?, ?, ?)
+	`, "admin", "old", "controller", "{}", old, "admin", "recent", "controller", "{}", recent); err != nil {
+		t.Fatal(err)
+	}
+
+	metricsDeleted, auditDeleted, err := st.PruneHistory(ctx, now.Add(-24*time.Hour), now.Add(-24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metricsDeleted != 1 || auditDeleted != 1 {
+		t.Fatalf("deleted metrics/audit = %d/%d, want 1/1", metricsDeleted, auditDeleted)
+	}
+
+	var metricsCount, auditCount int
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM metrics`).Scan(&metricsCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM audit`).Scan(&auditCount); err != nil {
+		t.Fatal(err)
+	}
+	if metricsCount != 1 || auditCount != 1 {
+		t.Fatalf("remaining metrics/audit = %d/%d, want 1/1", metricsCount, auditCount)
+	}
+}
