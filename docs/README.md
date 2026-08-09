@@ -48,3 +48,5 @@ The controller stores configuration, audit events, and traffic metrics in `/data
 - cleanup interval: 1 hour (`NYARELAY_CLEANUP_INTERVAL=1h`)
 
 Durations use Go duration syntax. Set an individual retention to `0s` to disable that cleanup, or set the cleanup interval to `0s` to disable the cleanup loop entirely. After deleting rows, the controller checkpoints the SQLite WAL so the `-wal` file does not grow indefinitely.
+
+These values can also be changed from Settings > Controller. Saved controller settings take precedence over environment defaults, are persisted in `/data/nyarelay.db`, and take effect immediately without restarting the controller.

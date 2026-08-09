@@ -130,6 +130,55 @@ describe('auth and security flows', () => {
     expect(JSON.parse(String(saveCall?.[1]?.body))).toEqual({ public_url: 'https://new.example.com' })
   })
 
+  it('updates history cleanup settings without a restart', async () => {
+    const fetchMock = installFetch([
+      {
+        path: '/api/controller/info',
+        method: 'GET',
+        response: jsonResponse({
+          signing_key: 'pub-key',
+          public_url: 'https://relay.example.com',
+          revision: 7,
+          history_cleanup: {
+            metrics_retention: '168h',
+            audit_retention: '2160h',
+            cleanup_interval: '1h',
+          },
+        }),
+      },
+      {
+        path: '/api/controller/info',
+        method: 'POST',
+        response: jsonResponse({
+          public_url: 'https://relay.example.com',
+          history_cleanup: {
+            metrics_retention: '24h',
+            audit_retention: '720h',
+            cleanup_interval: '15m',
+          },
+        }),
+      },
+    ])
+
+    renderWithClient(<ControllerSettingsPage />)
+
+    expect(await screen.findByDisplayValue('https://relay.example.com')).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('metrics 保留时长'), { target: { value: '24h' } })
+    fireEvent.change(screen.getByLabelText('audit 保留时长'), { target: { value: '720h' } })
+    fireEvent.change(screen.getByLabelText('清理执行周期'), { target: { value: '15m' } })
+    expect(screen.getByLabelText('metrics 保留时长')).toHaveValue('24h')
+    expect(screen.getByLabelText('audit 保留时长')).toHaveValue('720h')
+    expect(screen.getByLabelText('清理执行周期')).toHaveValue('15m')
+    fireEvent.click(screen.getByRole('button', { name: '保存清理策略' }))
+
+    expect(await screen.findByText('已保存，清理策略已立即生效')).toBeInTheDocument()
+    const saveCall = fetchMock.mock.calls.find(([path, init]) => path === '/api/controller/info' && init?.method === 'POST')
+    expect(JSON.parse(String(saveCall?.[1]?.body))).toEqual({
+      metrics_retention: '24h',
+      audit_retention: '720h',
+      cleanup_interval: '15m',
+    })
+  })
   it('shows controller build and bundled node release information', async () => {
     installFetch([
       {

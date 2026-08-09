@@ -2,8 +2,10 @@ package controller
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -60,11 +62,42 @@ func durationEnv(key string, fallback time.Duration) time.Duration {
 	if value == "" {
 		return fallback
 	}
-	parsed, err := time.ParseDuration(value)
-	if err != nil || parsed < 0 {
+	parsed, err := parseNonNegativeDuration(value)
+	if err != nil {
 		return fallback
 	}
 	return parsed
+}
+
+func parseNonNegativeDuration(value string) (time.Duration, error) {
+	value = strings.TrimSpace(value)
+	if value == "0" {
+		return 0, nil
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, err
+	}
+	if parsed < 0 {
+		return 0, fmt.Errorf("duration must not be negative")
+	}
+	return parsed, nil
+}
+
+func formatNonNegativeDuration(value time.Duration) string {
+	if value == 0 {
+		return "0s"
+	}
+	if value%time.Hour == 0 {
+		return fmt.Sprintf("%dh", value/time.Hour)
+	}
+	if value%time.Minute == 0 {
+		return fmt.Sprintf("%dm", value/time.Minute)
+	}
+	if value%time.Second == 0 {
+		return fmt.Sprintf("%ds", value/time.Second)
+	}
+	return value.String()
 }
 
 func env(key, fallback string) string {

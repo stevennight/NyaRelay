@@ -117,12 +117,19 @@ export interface Dashboard {
   revision: number
 }
 
+export interface HistoryCleanupConfig {
+  metrics_retention: string
+  audit_retention: string
+  cleanup_interval: string
+}
+
 export interface ControllerInfo {
   signing_key: string
   public_url: string
   revision: number
   build?: BuildInfo
   node_release?: SignedNodeRelease
+  history_cleanup?: HistoryCleanupConfig
 }
 
 export interface BuildInfo {

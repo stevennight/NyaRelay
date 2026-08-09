@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -33,20 +34,32 @@ import (
 )
 
 const (
-	sessionCookieName          = "nyarelay_session"
-	signingKeySetting          = "config_signing_private_key"
-	signingPubSetting          = "config_signing_public_key"
-	controllerPublicURLSetting = "controller_public_url"
+	sessionCookieName              = "nyarelay_session"
+	signingKeySetting              = "config_signing_private_key"
+	signingPubSetting              = "config_signing_public_key"
+	controllerPublicURLSetting     = "controller_public_url"
+	historyMetricsRetentionSetting = "history_cleanup_metrics_retention"
+	historyAuditRetentionSetting   = "history_cleanup_audit_retention"
+	historyCleanupIntervalSetting  = "history_cleanup_interval"
 )
 
+type historyCleanupConfig struct {
+	MetricsRetention time.Duration
+	AuditRetention   time.Duration
+	CleanupInterval  time.Duration
+}
+
 type Server struct {
-	cfg      Config
-	log      *slog.Logger
-	store    *store.Store
-	sessions *auth.Sessions
-	limiter  *auth.LoginLimiter
-	hub      *nodehub.Hub
-	mux      *http.ServeMux
+	cfg           Config
+	log           *slog.Logger
+	store         *store.Store
+	sessions      *auth.Sessions
+	limiter       *auth.LoginLimiter
+	hub           *nodehub.Hub
+	mux           *http.ServeMux
+	cleanupMu     sync.RWMutex
+	cleanupConfig historyCleanupConfig
+	cleanupWake   chan struct{}
 }
 
 func Run(ctx context.Context, args []string) error {
@@ -65,15 +78,20 @@ func Run(ctx context.Context, args []string) error {
 	defer closeStore(st)
 
 	s := &Server{
-		cfg:      cfg,
-		log:      logging.New(cfg.LogLevel),
-		store:    st,
-		sessions: auth.NewSessions(cfg.SessionLifetime),
-		limiter:  auth.NewLoginLimiter(),
-		hub:      nodehub.New(),
-		mux:      http.NewServeMux(),
+		cfg:           cfg,
+		log:           logging.New(cfg.LogLevel),
+		store:         st,
+		sessions:      auth.NewSessions(cfg.SessionLifetime),
+		limiter:       auth.NewLoginLimiter(),
+		hub:           nodehub.New(),
+		mux:           http.NewServeMux(),
+		cleanupConfig: historyCleanupConfigFromConfig(cfg),
+		cleanupWake:   make(chan struct{}, 1),
 	}
 	if err := s.ensureSigningKey(ctx); err != nil {
+		return err
+	}
+	if err := s.loadHistoryCleanupConfig(ctx); err != nil {
 		return err
 	}
 	rev, _ := st.CurrentRevision(ctx)
@@ -369,29 +387,84 @@ func (s *Server) handleControllerInfo(w http.ResponseWriter, r *http.Request, _ 
 		return
 	}
 	writeJSON(w, map[string]any{
-		"signing_key":  pub,
-		"public_url":   s.controllerPublicURL(r.Context()),
-		"revision":     s.hub.Revision(),
-		"build":        sharedversion.Info(),
-		"node_release": s.nodeRelease(),
+		"signing_key":     pub,
+		"public_url":      s.controllerPublicURL(r.Context()),
+		"revision":        s.hub.Revision(),
+		"build":           sharedversion.Info(),
+		"node_release":    s.nodeRelease(),
+		"history_cleanup": s.historyCleanupConfigResponse(),
 	})
 }
 
 func (s *Server) handleUpdateControllerInfo(w http.ResponseWriter, r *http.Request, session auth.Session) {
 	var req struct {
-		PublicURL string `json:"public_url"`
+		PublicURL        *string `json:"public_url"`
+		MetricsRetention *string `json:"metrics_retention"`
+		AuditRetention   *string `json:"audit_retention"`
+		CleanupInterval  *string `json:"cleanup_interval"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, err, http.StatusBadRequest)
 		return
 	}
-	value := strings.TrimSpace(req.PublicURL)
-	if err := s.store.SetSetting(r.Context(), controllerPublicURLSetting, value); err != nil {
+
+	next := s.currentHistoryCleanupConfig()
+	settings := make(map[string]string)
+	changes := make(map[string]string)
+	if req.PublicURL != nil {
+		value := strings.TrimSpace(*req.PublicURL)
+		settings[controllerPublicURLSetting] = value
+		changes["public_url"] = value
+	}
+	if req.MetricsRetention != nil {
+		parsed, err := parseNonNegativeDuration(*req.MetricsRetention)
+		if err != nil {
+			writeError(w, fmt.Errorf("metrics_retention: %w", err), http.StatusBadRequest)
+			return
+		}
+		next.MetricsRetention = parsed
+		settings[historyMetricsRetentionSetting] = formatNonNegativeDuration(parsed)
+		changes["metrics_retention"] = formatNonNegativeDuration(parsed)
+	}
+	if req.AuditRetention != nil {
+		parsed, err := parseNonNegativeDuration(*req.AuditRetention)
+		if err != nil {
+			writeError(w, fmt.Errorf("audit_retention: %w", err), http.StatusBadRequest)
+			return
+		}
+		next.AuditRetention = parsed
+		settings[historyAuditRetentionSetting] = formatNonNegativeDuration(parsed)
+		changes["audit_retention"] = formatNonNegativeDuration(parsed)
+	}
+	if req.CleanupInterval != nil {
+		parsed, err := parseNonNegativeDuration(*req.CleanupInterval)
+		if err != nil {
+			writeError(w, fmt.Errorf("cleanup_interval: %w", err), http.StatusBadRequest)
+			return
+		}
+		next.CleanupInterval = parsed
+		settings[historyCleanupIntervalSetting] = formatNonNegativeDuration(parsed)
+		changes["cleanup_interval"] = formatNonNegativeDuration(parsed)
+	}
+	if len(settings) == 0 {
+		writeError(w, errors.New("no controller settings supplied"), http.StatusBadRequest)
+		return
+	}
+	if err := s.store.SetSettings(r.Context(), settings); err != nil {
 		writeError(w, err, http.StatusInternalServerError)
 		return
 	}
-	_ = s.store.AddAudit(r.Context(), session.Username, "controller.public_url.update", "controller", map[string]string{"public_url": value})
-	writeJSON(w, map[string]string{"public_url": value})
+	if req.PublicURL != nil {
+		_ = s.store.AddAudit(r.Context(), session.Username, "controller.public_url.update", "controller", map[string]string{"public_url": changes["public_url"]})
+	}
+	if req.MetricsRetention != nil || req.AuditRetention != nil || req.CleanupInterval != nil {
+		s.setHistoryCleanupConfig(next)
+		_ = s.store.AddAudit(r.Context(), session.Username, "controller.history_cleanup.update", "controller", changes)
+	}
+	writeJSON(w, map[string]any{
+		"public_url":      s.controllerPublicURL(r.Context()),
+		"history_cleanup": s.historyCleanupConfigResponse(),
+	})
 }
 
 func (s *Server) handleListNodes(w http.ResponseWriter, r *http.Request, _ auth.Session) {
@@ -2395,32 +2468,129 @@ func validateNodePortRange(portMin, portMax int) error {
 	return nil
 }
 
-func (s *Server) historyCleanupLoop(ctx context.Context) {
-	if s.cfg.CleanupInterval <= 0 || (s.cfg.MetricsRetention <= 0 && s.cfg.AuditRetention <= 0) {
+func historyCleanupConfigFromConfig(cfg Config) historyCleanupConfig {
+	return historyCleanupConfig{
+		MetricsRetention: cfg.MetricsRetention,
+		AuditRetention:   cfg.AuditRetention,
+		CleanupInterval:  cfg.CleanupInterval,
+	}
+}
+
+func (s *Server) loadHistoryCleanupConfig(ctx context.Context) error {
+	next := historyCleanupConfigFromConfig(s.cfg)
+	settings := []struct {
+		key    string
+		target *time.Duration
+	}{
+		{historyMetricsRetentionSetting, &next.MetricsRetention},
+		{historyAuditRetentionSetting, &next.AuditRetention},
+		{historyCleanupIntervalSetting, &next.CleanupInterval},
+	}
+	for _, setting := range settings {
+		value, ok, err := s.store.GetSetting(ctx, setting.key)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		parsed, err := parseNonNegativeDuration(value)
+		if err != nil {
+			return fmt.Errorf("invalid persisted setting %s: %w", setting.key, err)
+		}
+		*setting.target = parsed
+	}
+	s.cleanupMu.Lock()
+	s.cleanupConfig = next
+	s.cleanupMu.Unlock()
+	return nil
+}
+
+func (s *Server) currentHistoryCleanupConfig() historyCleanupConfig {
+	s.cleanupMu.RLock()
+	defer s.cleanupMu.RUnlock()
+	return s.cleanupConfig
+}
+
+func (s *Server) setHistoryCleanupConfig(next historyCleanupConfig) {
+	s.cleanupMu.Lock()
+	s.cleanupConfig = next
+	s.cleanupMu.Unlock()
+	if s.cleanupWake == nil {
 		return
 	}
+	select {
+	case s.cleanupWake <- struct{}{}:
+	default:
+	}
+}
 
-	s.cleanupHistory(ctx)
-	ticker := time.NewTicker(s.cfg.CleanupInterval)
-	defer ticker.Stop()
+func (s *Server) historyCleanupConfigResponse() map[string]string {
+	cfg := s.currentHistoryCleanupConfig()
+	return map[string]string{
+		"metrics_retention": formatNonNegativeDuration(cfg.MetricsRetention),
+		"audit_retention":   formatNonNegativeDuration(cfg.AuditRetention),
+		"cleanup_interval":  formatNonNegativeDuration(cfg.CleanupInterval),
+	}
+}
+
+func historyCleanupEnabled(cfg historyCleanupConfig) bool {
+	return cfg.CleanupInterval > 0 && (cfg.MetricsRetention > 0 || cfg.AuditRetention > 0)
+}
+
+func (s *Server) historyCleanupLoop(ctx context.Context) {
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+
+	runCleanup := func() {
+		if historyCleanupEnabled(s.currentHistoryCleanupConfig()) {
+			s.cleanupHistory(ctx)
+		}
+	}
+	schedule := func() {
+		if timer != nil {
+			timer.Stop()
+			timer = nil
+		}
+		cfg := s.currentHistoryCleanupConfig()
+		if historyCleanupEnabled(cfg) {
+			timer = time.NewTimer(cfg.CleanupInterval)
+		}
+	}
+
+	runCleanup()
+	schedule()
 	for {
+		var timerC <-chan time.Time
+		if timer != nil {
+			timerC = timer.C
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			s.cleanupHistory(ctx)
+		case <-s.cleanupWake:
+			runCleanup()
+			schedule()
+		case <-timerC:
+			runCleanup()
+			schedule()
 		}
 	}
 }
 
 func (s *Server) cleanupHistory(ctx context.Context) {
+	cfg := s.currentHistoryCleanupConfig()
 	now := time.Now().UTC()
 	var metricsBefore, auditBefore time.Time
-	if s.cfg.MetricsRetention > 0 {
-		metricsBefore = now.Add(-s.cfg.MetricsRetention)
+	if cfg.MetricsRetention > 0 {
+		metricsBefore = now.Add(-cfg.MetricsRetention)
 	}
-	if s.cfg.AuditRetention > 0 {
-		auditBefore = now.Add(-s.cfg.AuditRetention)
+	if cfg.AuditRetention > 0 {
+		auditBefore = now.Add(-cfg.AuditRetention)
 	}
 	metricsDeleted, auditDeleted, err := s.store.PruneHistory(ctx, metricsBefore, auditBefore)
 	if err != nil {

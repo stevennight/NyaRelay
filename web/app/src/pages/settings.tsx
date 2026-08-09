@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, Navigate } from '@tanstack/react-router'
 import { useEffect, useState } from 'react'
 import { api, post } from '../api'
-import type { ControllerInfo } from '../types'
+import type { ControllerInfo, HistoryCleanupConfig } from '../types'
 import { Banner, DetailGrid, Field, FieldGrid, FormActions, InlineActions, PageFrame, Panel, Subnav } from '../components/ui'
 
 export function SettingsIndexPage() {
@@ -72,15 +72,28 @@ export function SecuritySettingsPage() {
 export function ControllerSettingsPage() {
   const queryClient = useQueryClient()
   const [publicUrl, setPublicUrl] = useState('')
+  const [historyCleanup, setHistoryCleanup] = useState<HistoryCleanupConfig>({
+    metrics_retention: '168h',
+    audit_retention: '2160h',
+    cleanup_interval: '1h',
+  })
   const [message, setMessage] = useState('')
   const info = useQuery({
     queryKey: ['controller-info'],
     queryFn: () => api<ControllerInfo>('/api/controller/info'),
   })
-  const update = useMutation({
+  const updatePublicUrl = useMutation({
     mutationFn: () => post('/api/controller/info', { public_url: publicUrl }),
     onSuccess: async () => {
       setMessage('已保存')
+      await queryClient.invalidateQueries({ queryKey: ['controller-info'] })
+    },
+    onError: (err) => setMessage(err instanceof Error ? err.message : '保存失败'),
+  })
+  const updateHistoryCleanup = useMutation({
+    mutationFn: () => post('/api/controller/info', historyCleanup),
+    onSuccess: async () => {
+      setMessage('已保存，清理策略已立即生效')
       await queryClient.invalidateQueries({ queryKey: ['controller-info'] })
     },
     onError: (err) => setMessage(err instanceof Error ? err.message : '保存失败'),
@@ -89,6 +102,9 @@ export function ControllerSettingsPage() {
   useEffect(() => {
     if (info.data) {
       setPublicUrl(info.data.public_url ?? '')
+      if (info.data.history_cleanup) {
+        setHistoryCleanup(info.data.history_cleanup)
+      }
     }
   }, [info.data])
 
@@ -118,7 +134,7 @@ export function ControllerSettingsPage() {
           onSubmit={(event) => {
             event.preventDefault()
             setMessage('')
-            update.mutate()
+            updatePublicUrl.mutate()
           }}
         >
           <FieldGrid>
@@ -131,7 +147,46 @@ export function ControllerSettingsPage() {
             </Field>
           </FieldGrid>
           <FormActions>
-            <button type="submit" disabled={update.isPending}>保存公开地址</button>
+            <button type="submit" disabled={updatePublicUrl.isPending}>保存公开地址</button>
+          </FormActions>
+        </form>
+      </Panel>
+      <Panel>
+        <h2>历史数据清理</h2>
+        <p>清理周期保存后立即生效。使用 Go duration 格式，填写 0s 可关闭对应清理。</p>
+        <form
+          className="form"
+          onSubmit={(event) => {
+            event.preventDefault()
+            setMessage('')
+            updateHistoryCleanup.mutate()
+          }}
+        >
+          <FieldGrid>
+            <Field label="metrics 保留时长" hint="默认 168h">
+              <input
+                value={historyCleanup.metrics_retention}
+                onChange={(event) => setHistoryCleanup((current) => ({ ...current, metrics_retention: event.target.value }))}
+                placeholder="168h"
+              />
+            </Field>
+            <Field label="audit 保留时长" hint="默认 2160h">
+              <input
+                value={historyCleanup.audit_retention}
+                onChange={(event) => setHistoryCleanup((current) => ({ ...current, audit_retention: event.target.value }))}
+                placeholder="2160h"
+              />
+            </Field>
+            <Field label="清理执行周期" hint="默认 1h">
+              <input
+                value={historyCleanup.cleanup_interval}
+                onChange={(event) => setHistoryCleanup((current) => ({ ...current, cleanup_interval: event.target.value }))}
+                placeholder="1h"
+              />
+            </Field>
+          </FieldGrid>
+          <FormActions>
+            <button type="submit" disabled={updateHistoryCleanup.isPending}>保存清理策略</button>
           </FormActions>
         </form>
         {message && <p>{message}</p>}
