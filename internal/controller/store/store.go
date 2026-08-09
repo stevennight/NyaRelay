@@ -15,6 +15,8 @@ import (
 	sharedversion "nyarelay/internal/shared/version"
 )
 
+const singleCandidateStrategyMigrationSetting = "migration_single_candidate_strategies_v1"
+
 type Store struct {
 	db *sql.DB
 }
@@ -193,7 +195,10 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := s.ensureTunnelColumns(ctx); err != nil {
 		return err
 	}
-	return s.ensureForwardColumns(ctx)
+	if err := s.ensureForwardColumns(ctx); err != nil {
+		return err
+	}
+	return s.migrateSingleCandidateStrategies(ctx)
 }
 
 func (s *Store) ensureNodeColumns(ctx context.Context) error {
@@ -314,6 +319,51 @@ func (s *Store) ensureForwardColumns(ctx context.Context) error {
 		WHERE TRIM(f.target) <> ''
 		  AND NOT EXISTS (SELECT 1 FROM forward_targets t WHERE t.forward_id = f.id)`)
 	return err
+}
+
+func (s *Store) migrateSingleCandidateStrategies(ctx context.Context) error {
+	if _, ok, err := s.GetSetting(ctx, singleCandidateStrategyMigrationSetting); err != nil {
+		return err
+	} else if ok {
+		return nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer rollbackTx(tx)
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE forwards
+		SET strategy = 'single', tcp_strategy = 'single', udp_strategy = 'single'
+		WHERE id IN (
+			SELECT forward_id
+			FROM forward_targets
+			WHERE enabled = 1 AND TRIM(address) <> ''
+			GROUP BY forward_id
+			HAVING COUNT(*) = 1
+		)`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE tunnel_stages
+		SET strategy = 'single', tcp_strategy = 'single', udp_strategy = 'single'
+		WHERE id IN (
+			SELECT stage_id
+			FROM tunnel_stage_nodes
+			WHERE TRIM(node_id) <> ''
+			GROUP BY stage_id
+			HAVING COUNT(*) = 1
+		)`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		singleCandidateStrategyMigrationSetting, "1",
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) tableColumns(ctx context.Context, table string) (map[string]bool, error) {

@@ -63,7 +63,10 @@ func (s *Service) Apply(ctx context.Context, cfg model.RelayConfig) error {
 	}
 	s.udp.clear()
 	s.udpTargets.clear()
+	s.selector.reset()
 	s.targets.reset()
+	s.selector.setFailTimeout(failureCooldownFromConfig(cfg))
+	s.targets.setFailTimeout(failureCooldownFromConfig(cfg))
 	runCtx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
 	s.servers = nil
@@ -85,7 +88,10 @@ func (s *Service) restorePreviousConfig(ctx context.Context, previousConfig mode
 	}
 	s.udp.clear()
 	s.udpTargets.clear()
+	s.selector.reset()
 	s.targets.reset()
+	s.selector.setFailTimeout(failureCooldownFromConfig(previousConfig))
+	s.targets.setFailTimeout(failureCooldownFromConfig(previousConfig))
 	s.cancel = nil
 	s.servers = nil
 	s.config = previousConfig

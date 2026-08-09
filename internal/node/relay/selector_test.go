@@ -211,3 +211,35 @@ func TestTargetSelectorFailoverRecovers(t *testing.T) {
 		t.Fatalf("target recovery order = %v, want [0 1]", got)
 	}
 }
+
+func TestSelectorsSingleRetryAfterFailureWithoutFallback(t *testing.T) {
+	candidateSel := newCandidateSelector()
+	candidateSel.failTimeout = time.Hour
+	stage := model.TunnelRuntimeStage{
+		Index:    1,
+		Strategy: "single",
+		Nodes: []model.TunnelRuntimeNode{
+			{NodeID: "primary"},
+			{NodeID: "backup"},
+		},
+	}
+	candidateSel.recordFailure("tun", 1, "primary", "tcp")
+	if got := candidateSel.order("tun", stage, "tcp"); !reflect.DeepEqual(got, []int{0}) {
+		t.Fatalf("single candidate order after failure = %v, want [0]", got)
+	}
+
+	targetSel := newTargetSelector()
+	targetSel.failTimeout = time.Hour
+	forward := model.ForwardRuntime{
+		ID:       "fwd",
+		Strategy: "single",
+		Targets: []model.ForwardTarget{
+			{ID: "primary", Address: "127.0.0.1:1", Enabled: true},
+			{ID: "backup", Address: "127.0.0.1:2", Enabled: true},
+		},
+	}
+	targetSel.recordFailure("fwd", "primary", "tcp")
+	if got := targetSel.order(forward, "tcp"); !reflect.DeepEqual(got, []int{0}) {
+		t.Fatalf("single target order after failure = %v, want [0]", got)
+	}
+}

@@ -77,6 +77,7 @@ export function ControllerSettingsPage() {
     audit_retention: '2160h',
     cleanup_interval: '1h',
   })
+  const [failureCooldown, setFailureCooldown] = useState('5s')
   const [message, setMessage] = useState('')
   const info = useQuery({
     queryKey: ['controller-info'],
@@ -98,6 +99,14 @@ export function ControllerSettingsPage() {
     },
     onError: (err) => setMessage(err instanceof Error ? err.message : '保存失败'),
   })
+  const updateFailureCooldown = useMutation({
+    mutationFn: () => post('/api/controller/info', { failure_cooldown: failureCooldown }),
+    onSuccess: async () => {
+      setMessage('已保存，故障冷却已立即生效')
+      await queryClient.invalidateQueries({ queryKey: ['controller-info'] })
+    },
+    onError: (err) => setMessage(err instanceof Error ? err.message : '保存失败'),
+  })
 
   useEffect(() => {
     if (info.data) {
@@ -105,6 +114,7 @@ export function ControllerSettingsPage() {
       if (info.data.history_cleanup) {
         setHistoryCleanup(info.data.history_cleanup)
       }
+      setFailureCooldown(info.data.failure_cooldown ?? '5s')
     }
   }, [info.data])
 
@@ -187,6 +197,30 @@ export function ControllerSettingsPage() {
           </FieldGrid>
           <FormActions>
             <button type="submit" disabled={updateHistoryCleanup.isPending}>保存清理策略</button>
+          </FormActions>
+        </form>
+      </Panel>
+      <Panel>
+        <h2>故障冷却</h2>
+        <form
+          className="form"
+          onSubmit={(event) => {
+            event.preventDefault()
+            setMessage('')
+            updateFailureCooldown.mutate()
+          }}
+        >
+          <FieldGrid>
+            <Field label="故障冷却时间" hint="默认 5s">
+              <input
+                value={failureCooldown}
+                onChange={(event) => setFailureCooldown(event.target.value)}
+                placeholder="5s"
+              />
+            </Field>
+          </FieldGrid>
+          <FormActions>
+            <button type="submit" disabled={updateFailureCooldown.isPending}>保存故障冷却</button>
           </FormActions>
         </form>
         {message && <p>{message}</p>}

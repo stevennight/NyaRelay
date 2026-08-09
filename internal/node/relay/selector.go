@@ -12,7 +12,7 @@ import (
 
 const (
 	defaultCandidateMaxFails    = 1
-	defaultCandidateFailTimeout = 60 * time.Second
+	defaultCandidateFailTimeout = 5 * time.Second
 )
 
 type candidateSelector struct {
@@ -49,6 +49,12 @@ func newCandidateSelector() *candidateSelector {
 	}
 }
 
+func failureCooldownFromConfig(cfg model.RelayConfig) time.Duration {
+	if cfg.FailureCooldownSeconds <= 0 {
+		return defaultCandidateFailTimeout
+	}
+	return time.Duration(cfg.FailureCooldownSeconds) * time.Second
+}
 func newTargetSelector() *targetSelector {
 	return &targetSelector{
 		rr:          make(map[string]int),
@@ -100,15 +106,9 @@ func (s *targetSelector) order(forward model.ForwardRuntime, network string) []i
 			}
 		}
 	case "single":
-		candidate := candidates[0]
-		if s.targetAvailableLocked(forward.ID, candidate.target.ID, network, now) {
-			order = append(order, candidate.index)
-		}
+		order = append(order, candidates[0].index)
 	default:
-		candidate := candidates[0]
-		if s.targetAvailableLocked(forward.ID, candidate.target.ID, network, now) {
-			order = append(order, candidate.index)
-		}
+		order = append(order, candidates[0].index)
 	}
 	return order
 }
@@ -137,6 +137,15 @@ func (s *targetSelector) recordFailure(forwardID, targetID, network string) {
 	if state.consecutiveFailures >= s.maxFails {
 		state.disabledUntil = now.Add(s.failTimeout)
 	}
+}
+
+func (s *targetSelector) setFailTimeout(timeout time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if timeout <= 0 {
+		timeout = defaultCandidateFailTimeout
+	}
+	s.failTimeout = timeout
 }
 
 func (s *targetSelector) reset() {
@@ -208,15 +217,9 @@ func (s *candidateSelector) order(tunnelID string, stage model.TunnelRuntimeStag
 			}
 		}
 	case "single":
-		candidate := candidates[0]
-		if s.candidateAvailableLocked(tunnelID, stage.Index, candidate.node.NodeID, network, now) {
-			order = append(order, candidate.index)
-		}
+		order = append(order, candidates[0].index)
 	default:
-		candidate := candidates[0]
-		if len(order) == 0 && s.candidateAvailableLocked(tunnelID, stage.Index, candidate.node.NodeID, network, now) {
-			order = append(order, candidate.index)
-		}
+		order = append(order, candidates[0].index)
 	}
 	return order
 }
@@ -246,6 +249,22 @@ func (s *candidateSelector) recordFailure(tunnelID string, stageIndex int, nodeI
 	if state.consecutiveFailures >= s.maxFails {
 		state.disabledUntil = now.Add(s.failTimeout)
 	}
+}
+
+func (s *candidateSelector) setFailTimeout(timeout time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if timeout <= 0 {
+		timeout = defaultCandidateFailTimeout
+	}
+	s.failTimeout = timeout
+}
+
+func (s *candidateSelector) reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rr = make(map[string]int)
+	s.states = make(map[string]*candidateState)
 }
 
 func (s *candidateSelector) candidateAvailableLocked(tunnelID string, stageIndex int, nodeID, network string, now time.Time) bool {

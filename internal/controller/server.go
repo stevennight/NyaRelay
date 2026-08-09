@@ -41,6 +41,7 @@ const (
 	historyMetricsRetentionSetting = "history_cleanup_metrics_retention"
 	historyAuditRetentionSetting   = "history_cleanup_audit_retention"
 	historyCleanupIntervalSetting  = "history_cleanup_interval"
+	failureCooldownSetting         = "relay_failure_cooldown"
 )
 
 type historyCleanupConfig struct {
@@ -50,16 +51,18 @@ type historyCleanupConfig struct {
 }
 
 type Server struct {
-	cfg           Config
-	log           *slog.Logger
-	store         *store.Store
-	sessions      *auth.Sessions
-	limiter       *auth.LoginLimiter
-	hub           *nodehub.Hub
-	mux           *http.ServeMux
-	cleanupMu     sync.RWMutex
-	cleanupConfig historyCleanupConfig
-	cleanupWake   chan struct{}
+	cfg             Config
+	log             *slog.Logger
+	store           *store.Store
+	sessions        *auth.Sessions
+	limiter         *auth.LoginLimiter
+	hub             *nodehub.Hub
+	mux             *http.ServeMux
+	cleanupMu       sync.RWMutex
+	cleanupConfig   historyCleanupConfig
+	cleanupWake     chan struct{}
+	failureMu       sync.RWMutex
+	failureCooldown time.Duration
 }
 
 func Run(ctx context.Context, args []string) error {
@@ -78,20 +81,24 @@ func Run(ctx context.Context, args []string) error {
 	defer closeStore(st)
 
 	s := &Server{
-		cfg:           cfg,
-		log:           logging.New(cfg.LogLevel),
-		store:         st,
-		sessions:      auth.NewSessions(cfg.SessionLifetime),
-		limiter:       auth.NewLoginLimiter(),
-		hub:           nodehub.New(),
-		mux:           http.NewServeMux(),
-		cleanupConfig: historyCleanupConfigFromConfig(cfg),
-		cleanupWake:   make(chan struct{}, 1),
+		cfg:             cfg,
+		log:             logging.New(cfg.LogLevel),
+		store:           st,
+		sessions:        auth.NewSessions(cfg.SessionLifetime),
+		limiter:         auth.NewLoginLimiter(),
+		hub:             nodehub.New(),
+		mux:             http.NewServeMux(),
+		cleanupConfig:   historyCleanupConfigFromConfig(cfg),
+		cleanupWake:     make(chan struct{}, 1),
+		failureCooldown: cfg.FailureCooldown,
 	}
 	if err := s.ensureSigningKey(ctx); err != nil {
 		return err
 	}
 	if err := s.loadHistoryCleanupConfig(ctx); err != nil {
+		return err
+	}
+	if err := s.loadFailureCooldown(ctx); err != nil {
 		return err
 	}
 	rev, _ := st.CurrentRevision(ctx)
@@ -387,12 +394,13 @@ func (s *Server) handleControllerInfo(w http.ResponseWriter, r *http.Request, _ 
 		return
 	}
 	writeJSON(w, map[string]any{
-		"signing_key":     pub,
-		"public_url":      s.controllerPublicURL(r.Context()),
-		"revision":        s.hub.Revision(),
-		"build":           sharedversion.Info(),
-		"node_release":    s.nodeRelease(),
-		"history_cleanup": s.historyCleanupConfigResponse(),
+		"signing_key":      pub,
+		"public_url":       s.controllerPublicURL(r.Context()),
+		"revision":         s.hub.Revision(),
+		"build":            sharedversion.Info(),
+		"node_release":     s.nodeRelease(),
+		"history_cleanup":  s.historyCleanupConfigResponse(),
+		"failure_cooldown": formatNonNegativeDuration(s.currentFailureCooldown()),
 	})
 }
 
@@ -402,6 +410,7 @@ func (s *Server) handleUpdateControllerInfo(w http.ResponseWriter, r *http.Reque
 		MetricsRetention *string `json:"metrics_retention"`
 		AuditRetention   *string `json:"audit_retention"`
 		CleanupInterval  *string `json:"cleanup_interval"`
+		FailureCooldown  *string `json:"failure_cooldown"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, err, http.StatusBadRequest)
@@ -409,6 +418,8 @@ func (s *Server) handleUpdateControllerInfo(w http.ResponseWriter, r *http.Reque
 	}
 
 	next := s.currentHistoryCleanupConfig()
+	nextFailureCooldown := s.currentFailureCooldown()
+	failureCooldownChanged := false
 	settings := make(map[string]string)
 	changes := make(map[string]string)
 	if req.PublicURL != nil {
@@ -446,6 +457,18 @@ func (s *Server) handleUpdateControllerInfo(w http.ResponseWriter, r *http.Reque
 		settings[historyCleanupIntervalSetting] = formatNonNegativeDuration(parsed)
 		changes["cleanup_interval"] = formatNonNegativeDuration(parsed)
 	}
+	if req.FailureCooldown != nil {
+		parsed, err := parsePositiveDuration(*req.FailureCooldown)
+		if err != nil {
+			writeError(w, fmt.Errorf("failure_cooldown: %w", err), http.StatusBadRequest)
+			return
+		}
+		nextFailureCooldown = parsed
+		failureCooldownChanged = true
+		settings[failureCooldownSetting] = formatNonNegativeDuration(parsed)
+		changes["failure_cooldown"] = formatNonNegativeDuration(parsed)
+	}
+
 	if len(settings) == 0 {
 		writeError(w, errors.New("no controller settings supplied"), http.StatusBadRequest)
 		return
@@ -461,9 +484,23 @@ func (s *Server) handleUpdateControllerInfo(w http.ResponseWriter, r *http.Reque
 		s.setHistoryCleanupConfig(next)
 		_ = s.store.AddAudit(r.Context(), session.Username, "controller.history_cleanup.update", "controller", changes)
 	}
+	if failureCooldownChanged {
+		s.setFailureCooldown(nextFailureCooldown)
+		rev, err := s.store.BumpRevision(r.Context())
+		if err != nil {
+			writeError(w, err, http.StatusInternalServerError)
+			return
+		}
+		s.hub.SetRevision(rev)
+		s.pushConfigs(r.Context())
+		_ = s.store.AddAudit(r.Context(), session.Username, "controller.failure_cooldown.update", "controller", map[string]string{
+			"failure_cooldown": formatNonNegativeDuration(nextFailureCooldown),
+		})
+	}
 	writeJSON(w, map[string]any{
-		"public_url":      s.controllerPublicURL(r.Context()),
-		"history_cleanup": s.historyCleanupConfigResponse(),
+		"public_url":       s.controllerPublicURL(r.Context()),
+		"history_cleanup":  s.historyCleanupConfigResponse(),
+		"failure_cooldown": formatNonNegativeDuration(s.currentFailureCooldown()),
 	})
 }
 
@@ -1905,13 +1942,14 @@ func (s *Server) compileConfig(ctx context.Context, nodeID string) (model.Signed
 	nodes = activeNodes(nodes)
 	scopedTunnels, scopedForwards := scopeConfigForNode(nodeID, tunnels, forwards)
 	cfg := model.RelayConfig{
-		Revision:  rev,
-		IssuedAt:  time.Now().UTC(),
-		NodeID:    nodeID,
-		Nodes:     nodes,
-		Tunnels:   scopedTunnels,
-		Forwards:  scopedForwards,
-		ExpiresAt: time.Now().UTC().Add(7 * 24 * time.Hour),
+		Revision:               rev,
+		IssuedAt:               time.Now().UTC(),
+		NodeID:                 nodeID,
+		Nodes:                  nodes,
+		Tunnels:                scopedTunnels,
+		Forwards:               scopedForwards,
+		FailureCooldownSeconds: int64(s.currentFailureCooldown() / time.Second),
+		ExpiresAt:              time.Now().UTC().Add(7 * 24 * time.Hour),
 	}
 	priv, _, err := s.store.GetSetting(ctx, signingKeySetting)
 	if err != nil {
@@ -2466,6 +2504,44 @@ func validateNodePortRange(portMin, portMax int) error {
 		return fmt.Errorf("port_min must be less than or equal to port_max")
 	}
 	return nil
+}
+
+func (s *Server) loadFailureCooldown(ctx context.Context) error {
+	next := s.cfg.FailureCooldown
+	if next <= 0 {
+		next = defaultFailureCooldown
+	}
+	value, ok, err := s.store.GetSetting(ctx, failureCooldownSetting)
+	if err != nil {
+		return err
+	}
+	if ok {
+		parsed, err := parsePositiveDuration(value)
+		if err != nil {
+			return fmt.Errorf("invalid persisted setting %s: %w", failureCooldownSetting, err)
+		}
+		next = parsed
+	}
+	s.setFailureCooldown(next)
+	return nil
+}
+
+func (s *Server) currentFailureCooldown() time.Duration {
+	s.failureMu.RLock()
+	defer s.failureMu.RUnlock()
+	if s.failureCooldown <= 0 {
+		return defaultFailureCooldown
+	}
+	return s.failureCooldown
+}
+
+func (s *Server) setFailureCooldown(next time.Duration) {
+	if next <= 0 {
+		next = defaultFailureCooldown
+	}
+	s.failureMu.Lock()
+	s.failureCooldown = next
+	s.failureMu.Unlock()
 }
 
 func historyCleanupConfigFromConfig(cfg Config) historyCleanupConfig {

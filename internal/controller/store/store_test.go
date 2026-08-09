@@ -208,3 +208,89 @@ func TestPruneHistoryDeletesOnlyExpiredRows(t *testing.T) {
 		t.Fatalf("remaining metrics/audit = %d/%d, want 1/1", metricsCount, auditCount)
 	}
 }
+
+func TestMigrateSingleCandidateStrategies(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	if _, err := st.db.ExecContext(ctx, `DELETE FROM settings WHERE key = ?`, singleCandidateStrategyMigrationSetting); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+
+	if _, err := st.db.ExecContext(ctx, `
+		INSERT INTO forwards
+			(id, name, tunnel_id, protocols_json, listen, target, strategy, tcp_strategy, udp_strategy, enabled, created_at, updated_at)
+		VALUES
+			('f-single', 'single', 'tun-1', '[]', '', '', 'failover', 'round_robin', 'random', 1, ?, ?),
+			('f-multi', 'multi', 'tun-1', '[]', '', '', 'failover', 'round_robin', 'random', 1, ?, ?),
+			('f-disabled', 'disabled', 'tun-1', '[]', '', '', 'failover', 'round_robin', 'random', 1, ?, ?)
+	`, now, now, now, now, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `
+		INSERT INTO forward_targets
+			(id, forward_id, position, address, protocols_json, weight, enabled, created_at, updated_at)
+		VALUES
+			('ft-single', 'f-single', 0, '127.0.0.1:1', '[]', 1, 1, ?, ?),
+			('ft-multi-a', 'f-multi', 0, '127.0.0.1:1', '[]', 1, 1, ?, ?),
+			('ft-multi-b', 'f-multi', 1, '127.0.0.1:2', '[]', 1, 1, ?, ?),
+			('ft-disabled', 'f-disabled', 0, '127.0.0.1:3', '[]', 1, 0, ?, ?)
+	`, now, now, now, now, now, now, now, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `
+		INSERT INTO tunnel_stages
+			(id, tunnel_id, stage_index, role, strategy, tcp_strategy, udp_strategy, created_at, updated_at)
+		VALUES
+			('stage-single', 'tun-1', 1, 'middle', 'failover', 'round_robin', 'random', ?, ?),
+			('stage-multi', 'tun-1', 2, 'middle', 'failover', 'round_robin', 'random', ?, ?)
+	`, now, now, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `
+		INSERT INTO tunnel_stage_nodes
+			(id, tunnel_id, stage_id, node_id, created_at, updated_at)
+		VALUES
+			('sn-single', 'tun-1', 'stage-single', 'node-a', ?, ?),
+			('sn-multi-a', 'tun-1', 'stage-multi', 'node-a', ?, ?),
+			('sn-multi-b', 'tun-1', 'stage-multi', 'node-b', ?, ?)
+	`, now, now, now, now, now, now); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := st.migrateSingleCandidateStrategies(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var strategy, tcpStrategy, udpStrategy string
+	if err := st.db.QueryRowContext(ctx, `SELECT strategy, tcp_strategy, udp_strategy FROM forwards WHERE id = 'f-single'`).Scan(&strategy, &tcpStrategy, &udpStrategy); err != nil {
+		t.Fatal(err)
+	}
+	if strategy != "single" || tcpStrategy != "single" || udpStrategy != "single" {
+		t.Fatalf("single forward strategies = %q/%q/%q", strategy, tcpStrategy, udpStrategy)
+	}
+	if err := st.db.QueryRowContext(ctx, `SELECT strategy, tcp_strategy, udp_strategy FROM forwards WHERE id = 'f-multi'`).Scan(&strategy, &tcpStrategy, &udpStrategy); err != nil {
+		t.Fatal(err)
+	}
+	if strategy != "failover" || tcpStrategy != "round_robin" || udpStrategy != "random" {
+		t.Fatalf("multi forward strategies changed = %q/%q/%q", strategy, tcpStrategy, udpStrategy)
+	}
+	if err := st.db.QueryRowContext(ctx, `SELECT strategy, tcp_strategy, udp_strategy FROM forwards WHERE id = 'f-disabled'`).Scan(&strategy, &tcpStrategy, &udpStrategy); err != nil {
+		t.Fatal(err)
+	}
+	if strategy != "failover" || tcpStrategy != "round_robin" || udpStrategy != "random" {
+		t.Fatalf("disabled forward strategies changed = %q/%q/%q", strategy, tcpStrategy, udpStrategy)
+	}
+	if err := st.db.QueryRowContext(ctx, `SELECT strategy, tcp_strategy, udp_strategy FROM tunnel_stages WHERE id = 'stage-single'`).Scan(&strategy, &tcpStrategy, &udpStrategy); err != nil {
+		t.Fatal(err)
+	}
+	if strategy != "single" || tcpStrategy != "single" || udpStrategy != "single" {
+		t.Fatalf("single stage strategies = %q/%q/%q", strategy, tcpStrategy, udpStrategy)
+	}
+	if err := st.db.QueryRowContext(ctx, `SELECT strategy, tcp_strategy, udp_strategy FROM tunnel_stages WHERE id = 'stage-multi'`).Scan(&strategy, &tcpStrategy, &udpStrategy); err != nil {
+		t.Fatal(err)
+	}
+	if strategy != "failover" || tcpStrategy != "round_robin" || udpStrategy != "random" {
+		t.Fatalf("multi stage strategies changed = %q/%q/%q", strategy, tcpStrategy, udpStrategy)
+	}
+}

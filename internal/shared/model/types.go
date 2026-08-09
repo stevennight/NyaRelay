@@ -150,13 +150,14 @@ type PortAllocation struct {
 }
 
 type RelayConfig struct {
-	Revision  int64            `json:"revision"`
-	IssuedAt  time.Time        `json:"issued_at"`
-	NodeID    string           `json:"node_id"`
-	Nodes     []Node           `json:"nodes"`
-	Tunnels   []TunnelRuntime  `json:"tunnels"`
-	Forwards  []ForwardRuntime `json:"forwards"`
-	ExpiresAt time.Time        `json:"expires_at"`
+	Revision               int64            `json:"revision"`
+	IssuedAt               time.Time        `json:"issued_at"`
+	NodeID                 string           `json:"node_id"`
+	Nodes                  []Node           `json:"nodes"`
+	Tunnels                []TunnelRuntime  `json:"tunnels"`
+	Forwards               []ForwardRuntime `json:"forwards"`
+	FailureCooldownSeconds int64            `json:"failure_cooldown_seconds"`
+	ExpiresAt              time.Time        `json:"expires_at"`
 }
 
 type TunnelRuntime struct {

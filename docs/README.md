@@ -50,3 +50,7 @@ The controller stores configuration, audit events, and traffic metrics in `/data
 Durations use Go duration syntax. Set an individual retention to `0s` to disable that cleanup, or set the cleanup interval to `0s` to disable the cleanup loop entirely. After deleting rows, the controller checkpoints the SQLite WAL so the `-wal` file does not grow indefinitely.
 
 These values can also be changed from Settings > Controller. Saved controller settings take precedence over environment defaults, are persisted in `/data/nyarelay.db`, and take effect immediately without restarting the controller.
+
+Relay candidate failure cooldown defaults to 5 seconds (NYARELAY_FAILURE_COOLDOWN=5s). It controls how long a failed multi-candidate tunnel node or forward target is skipped before being retried. The value can also be changed from Settings > Controller; it is persisted and pushed to connected nodes without a restart. Values use whole-second Go duration syntax and must be greater than zero.
+
+On first startup after this migration, Forward and Tunnel stage rules with exactly one enabled candidate are converted to single. Rules with multiple candidates keep their existing strategies.

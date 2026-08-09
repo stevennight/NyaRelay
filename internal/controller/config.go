@@ -21,12 +21,14 @@ type Config struct {
 	MetricsRetention time.Duration
 	AuditRetention   time.Duration
 	CleanupInterval  time.Duration
+	FailureCooldown  time.Duration
 }
 
 const (
 	defaultMetricsRetention = 7 * 24 * time.Hour
 	defaultAuditRetention   = 90 * 24 * time.Hour
 	defaultCleanupInterval  = time.Hour
+	defaultFailureCooldown  = 5 * time.Second
 )
 
 func parseConfig(args []string) Config {
@@ -41,6 +43,7 @@ func parseConfig(args []string) Config {
 		MetricsRetention: durationEnv("NYARELAY_METRICS_RETENTION", defaultMetricsRetention),
 		AuditRetention:   durationEnv("NYARELAY_AUDIT_RETENTION", defaultAuditRetention),
 		CleanupInterval:  durationEnv("NYARELAY_CLEANUP_INTERVAL", defaultCleanupInterval),
+		FailureCooldown:  positiveDurationEnv("NYARELAY_FAILURE_COOLDOWN", defaultFailureCooldown),
 	}
 	fs := flag.NewFlagSet("controller", flag.ExitOnError)
 	fs.StringVar(&cfg.ListenAddr, "listen", cfg.ListenAddr, "controller listen address")
@@ -52,6 +55,7 @@ func parseConfig(args []string) Config {
 	fs.DurationVar(&cfg.MetricsRetention, "metrics-retention", cfg.MetricsRetention, "metrics retention duration; 0 disables cleanup")
 	fs.DurationVar(&cfg.AuditRetention, "audit-retention", cfg.AuditRetention, "audit retention duration; 0 disables cleanup")
 	fs.DurationVar(&cfg.CleanupInterval, "cleanup-interval", cfg.CleanupInterval, "history cleanup interval; 0 disables cleanup")
+	fs.DurationVar(&cfg.FailureCooldown, "failure-cooldown", cfg.FailureCooldown, "candidate failure cooldown duration")
 	_ = fs.Parse(args)
 	cfg.DBPath = filepath.Join(cfg.DataDir, "nyarelay.db")
 	return cfg
@@ -67,6 +71,32 @@ func durationEnv(key string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return parsed
+}
+
+func positiveDurationEnv(key string, fallback time.Duration) time.Duration {
+	value := env(key, "")
+	if value == "" {
+		return fallback
+	}
+	parsed, err := parsePositiveDuration(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func parsePositiveDuration(value string) (time.Duration, error) {
+	parsed, err := parseNonNegativeDuration(value)
+	if err != nil {
+		return 0, err
+	}
+	if parsed <= 0 {
+		return 0, fmt.Errorf("duration must be greater than zero")
+	}
+	if parsed%time.Second != 0 {
+		return 0, fmt.Errorf("duration must use whole seconds")
+	}
+	return parsed, nil
 }
 
 func parseNonNegativeDuration(value string) (time.Duration, error) {

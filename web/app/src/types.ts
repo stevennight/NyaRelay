@@ -130,6 +130,7 @@ export interface ControllerInfo {
   build?: BuildInfo
   node_release?: SignedNodeRelease
   history_cleanup?: HistoryCleanupConfig
+  failure_cooldown?: string
 }
 
 export interface BuildInfo {
