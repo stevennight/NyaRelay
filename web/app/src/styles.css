@@ -408,6 +408,20 @@ td small {
   overflow-wrap: anywhere;
 }
 
+.table-sort {
+  min-height: 24px;
+  width: 100%;
+  justify-content: flex-start;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  gap: 6px;
+}
+
+.table-sort:hover {
+  background: transparent;
+  color: var(--primary-hover);
+}
 .table-wrap a {
   color: var(--primary-hover);
   text-decoration: none;

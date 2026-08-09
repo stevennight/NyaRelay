@@ -16,7 +16,7 @@ import {
   PageFrame,
   Panel,
   StatusPill,
-  Table,
+  SortableTable,
   formatTime,
 } from '../components/ui'
 
@@ -36,6 +36,14 @@ const emptyForm: NodeForm = {
   port_max: '65535',
 }
 
+const nodeColumns = [
+  { key: 'name', label: '名称', getValue: (node: NodeInfo) => node.name },
+  { key: 'status', label: '状态', getValue: (node: NodeInfo) => node.revoked ? 'revoked' : node.status },
+  { key: 'version', label: '版本', getValue: (node: NodeInfo) => node.version || '' },
+  { key: 'system', label: '系统', getValue: (node: NodeInfo) => [node.system?.os, node.system?.arch].filter(Boolean).join('/') },
+  { key: 'last_seen', label: '最近心跳', getValue: (node: NodeInfo) => node.last_seen ? Date.parse(node.last_seen) : null },
+  { key: 'actions', label: '操作', sortable: false, getValue: () => null },
+]
 export function NodesPage() {
   const navigate = useNavigate()
   return <NodesListView onCloseModal={() => navigate({ to: '/nodes', replace: true })} />
@@ -132,8 +140,13 @@ function NodesListView({
           }
         />
       ) : (
-        <Table headers={['名称', '状态', '版本', '系统', '最近心跳', '操作']}>
-          {nodes.map((node) => (
+        <SortableTable
+          items={nodes}
+          columns={nodeColumns}
+          getRowKey={(node) => node.id}
+          defaultSortKey='name'
+        >
+          {(node) => (
             <tr key={node.id}>
               <td>
                 <strong>
@@ -170,8 +183,8 @@ function NodesListView({
                 </InlineActions>
               </td>
             </tr>
-          ))}
-        </Table>
+          )}
+        </SortableTable>
       )}
       {modal === 'new' && <NodeCreateModal onClose={onCloseModal} />}
       {modal === 'detail' && nodeId && <NodeDetailModal nodeId={nodeId} onClose={onCloseModal} />}

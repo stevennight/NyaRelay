@@ -16,7 +16,7 @@ import {
   Modal,
   PageFrame,
   StatusPill,
-  Table,
+  SortableTable,
   ToggleField,
   formatTime,
 } from '../components/ui'
@@ -173,6 +173,21 @@ function ForwardsListView({
       return true
     })
   }, [filters, forwards, nodeMap, tunnelMap])
+  const forwardColumns = [
+    { key: 'name', label: '名称', getValue: (forward: ForwardInfo) => forward.name },
+    { key: 'protocols', label: '协议', getValue: (forward: ForwardInfo) => formatProtocols(forward.protocols) },
+    { key: 'tunnel', label: '隧道', getValue: (forward: ForwardInfo) => tunnelMap.get(forward.tunnel_id)?.name ?? forward.tunnel_id },
+    {
+      key: 'entry',
+      label: '入口地址',
+      getValue: (forward: ForwardInfo) => {
+        const tunnel = tunnelMap.get(forward.tunnel_id)
+        return formatForwardEndpoint(forward, tunnel, nodeMap) + ' ' + listenPortSummary(forward.listen)
+      },
+    },
+    { key: 'target', label: '目标', getValue: (forward: ForwardInfo) => formatTargetSummary(forward) },
+    { key: 'status', label: '状态', getValue: (forward: ForwardInfo) => forward.enabled ? 'enabled' : 'disabled' },
+  ]
   const hasActiveFilters = Boolean(
     filters.name.trim() || filters.tunnelID || filters.entryAddress.trim() || filters.targetAddress.trim(),
   )
@@ -248,8 +263,13 @@ function ForwardsListView({
           {filteredForwards.length === 0 ? (
             <EmptyState title="没有匹配的转发" text="调整名称、隧道、入口地址或目标地址筛选后再查看。" />
           ) : (
-            <Table headers={['名称', '协议', '隧道', '入口地址', '目标', '状态']}>
-              {filteredForwards.map((forward) => {
+            <SortableTable
+              items={filteredForwards}
+              columns={forwardColumns}
+              getRowKey={(forward) => forward.id}
+              defaultSortKey='name'
+            >
+              {(forward) => {
                 const tunnel = tunnelMap.get(forward.tunnel_id)
                 return (
                   <tr key={forward.id}>
@@ -271,8 +291,8 @@ function ForwardsListView({
                     <td><StatusPill value={forward.enabled ? 'enabled' : 'disabled'} /></td>
                   </tr>
                 )
-              })}
-            </Table>
+              }}
+            </SortableTable>
           )}
         </>
       )}

@@ -15,7 +15,7 @@ import {
   Modal,
   PageFrame,
   StatusPill,
-  Table,
+  SortableTable,
   ToggleField,
   formatTime,
 } from '../components/ui'
@@ -100,6 +100,13 @@ function TunnelsListView({
     enabled: (query.data ?? []).length > 0,
   })
   const nodeMap = useMemo(() => indexByID(nodesQuery.data ?? []), [nodesQuery.data])
+  const tunnelColumns = [
+    { key: 'name', label: '名称', getValue: (tunnel: TunnelInfo) => tunnel.name },
+    { key: 'type', label: '类型', getValue: (tunnel: TunnelInfo) => tunnel.type },
+    { key: 'transport', label: '传输', getValue: (tunnel: TunnelInfo) => tunnel.transport },
+    { key: 'path', label: '路径', getValue: (tunnel: TunnelInfo) => formatTunnelPath(tunnel, nodeMap) },
+    { key: 'status', label: '状态', getValue: (tunnel: TunnelInfo) => tunnel.enabled ? 'online' : 'offline' },
+  ]
 
   return (
     <PageFrame
@@ -125,8 +132,13 @@ function TunnelsListView({
           }
         />
       ) : (
-        <Table headers={['名称', '类型', '传输', '路径', '状态']}>
-          {(query.data ?? []).map((tunnel) => (
+        <SortableTable
+          items={query.data ?? []}
+          columns={tunnelColumns}
+          getRowKey={(tunnel) => tunnel.id}
+          defaultSortKey='name'
+        >
+          {(tunnel) => (
             <tr key={tunnel.id}>
               <td>
                 <strong>
@@ -141,8 +153,8 @@ function TunnelsListView({
               <td>{formatTunnelPath(tunnel, nodeMap)}</td>
               <td><StatusPill value={tunnel.enabled ? 'online' : 'offline'} /></td>
             </tr>
-          ))}
-        </Table>
+          )}
+        </SortableTable>
       )}
       {modal === 'new' && <TunnelCreateModal onClose={onCloseModal} />}
       {modal === 'detail' && tunnelId && <TunnelDetailModal tunnelId={tunnelId} onClose={onCloseModal} />}

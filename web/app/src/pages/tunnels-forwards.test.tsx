@@ -136,6 +136,33 @@ describe('tunnels and forwards pages', () => {
     expect(await screen.findByText('还没有隧道')).toBeInTheDocument()
   })
 
+  it('sorts tunnels by name and reverses the order on a second click', async () => {
+    installFetch([
+      {
+        path: '/api/tunnels',
+        method: 'GET',
+        response: jsonResponse([
+          { ...tunnel, id: 'tun-z', name: 'z-tunnel' },
+          { ...tunnel, id: 'tun-a', name: 'a-tunnel' },
+        ]),
+      },
+      {
+        path: '/api/nodes',
+        method: 'GET',
+        response: jsonResponse(nodes),
+      },
+    ])
+
+    renderWithClient(<TunnelsPage />)
+
+    const rows = await screen.findAllByRole('row')
+    expect(rows[1]).toHaveTextContent('a-tunnel')
+    expect(rows[2]).toHaveTextContent('z-tunnel')
+
+    fireEvent.click(screen.getByRole('button', { name: /descending$/ }))
+    const reversedRows = screen.getAllByRole('row')
+    expect(reversedRows[1]).toHaveTextContent('z-tunnel')
+  })
   it('hides revoked nodes in the tunnel selector', async () => {
     installFetch([
       {
@@ -524,6 +551,11 @@ describe('tunnels and forwards pages', () => {
     renderWithClient(<ForwardsPage />)
 
     expect(await screen.findByText('web-public')).toBeInTheDocument()
+    const forwardRows = await screen.findAllByRole('row')
+    expect(forwardRows[1]).toHaveTextContent('admin-panel')
+    expect(forwardRows[2]).toHaveTextContent('web-public')
+    fireEvent.click(screen.getByRole('button', { name: /descending$/ }))
+    expect(screen.getAllByRole('row')[1]).toHaveTextContent('web-public')
     expect(screen.getByText('admin-panel')).toBeInTheDocument()
     expect(await screen.findByText('edge.example.com:8443')).toBeInTheDocument()
     expect(await screen.findByText('edge.example.com:9443')).toBeInTheDocument()

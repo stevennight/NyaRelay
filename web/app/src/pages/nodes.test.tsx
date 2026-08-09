@@ -106,6 +106,33 @@ describe('node pages', () => {
     expect(screen.queryByText('revoked-node')).not.toBeInTheDocument()
   })
 
+  it('sorts nodes by name and reverses the order on a second click', async () => {
+    installFetch([
+      {
+        path: '/api/nodes',
+        method: 'GET',
+        response: jsonResponse([
+          { ...node, id: 'node-z', name: 'z-node' },
+          { ...node, id: 'node-a', name: 'a-node' },
+        ]),
+      },
+      {
+        path: '/api/controller/info',
+        method: 'GET',
+        response: jsonResponse(controllerInfo),
+      },
+    ])
+
+    renderWithClient(<NodesPage />)
+
+    const rows = await screen.findAllByRole('row')
+    expect(rows[1]).toHaveTextContent('a-node')
+    expect(rows[2]).toHaveTextContent('z-node')
+
+    fireEvent.click(screen.getByRole('button', { name: /descending$/ }))
+    const reversedRows = screen.getAllByRole('row')
+    expect(reversedRows[1]).toHaveTextContent('z-node')
+  })
   it('creates a node and shows the launch command', async () => {
     const fetchMock = installFetch([
       {

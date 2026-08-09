@@ -1,6 +1,6 @@
-import { X } from 'lucide-react'
+import { ArrowDown, ArrowUp, ArrowUpDown, X } from 'lucide-react'
 import type { ReactNode } from 'react'
-import { cloneElement, isValidElement, useEffect, useId } from 'react'
+import { cloneElement, Fragment, isValidElement, useEffect, useId, useMemo, useState } from 'react'
 
 export function PageFrame({
   title,
@@ -53,6 +53,99 @@ export function Table({
           </tr>
         </thead>
         <tbody>{children}</tbody>
+      </table>
+    </div>
+  )
+}
+
+export type SortValue = string | number | null | undefined
+
+export type SortableTableColumn<T> = {
+  key: string
+  label: string
+  getValue: (item: T) => SortValue
+  sortable?: boolean
+}
+
+export function SortableTable<T>({
+  items,
+  columns,
+  getRowKey,
+  defaultSortKey,
+  children,
+}: {
+  items: T[]
+  columns: SortableTableColumn<T>[]
+  getRowKey: (item: T) => string
+  defaultSortKey?: string
+  children: (item: T) => ReactNode
+}) {
+  const initialSortKey = defaultSortKey ?? columns.find((column) => column.sortable !== false)?.key ?? ''
+  const [sort, setSort] = useState<{ key: string; direction: 'asc' | 'desc' }>({
+    key: initialSortKey,
+    direction: 'asc',
+  })
+  const sortedItems = useMemo(() => {
+    const column = columns.find((candidate) => candidate.key === sort.key && candidate.sortable !== false)
+    if (!column) return items
+
+    const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' })
+    return items
+      .map((item, index) => ({ item, index }))
+      .sort((left, right) => {
+        const leftValue = column.getValue(left.item)
+        const rightValue = column.getValue(right.item)
+        let comparison = 0
+
+        if (leftValue == null && rightValue != null) return 1
+        if (leftValue != null && rightValue == null) return -1
+        if (typeof leftValue === 'number' && typeof rightValue === 'number') comparison = leftValue - rightValue
+        else comparison = collator.compare(String(leftValue ?? ''), String(rightValue ?? ''))
+
+        return (comparison || left.index - right.index) * (sort.direction === 'asc' ? 1 : -1)
+      })
+      .map(({ item }) => item)
+  }, [columns, items, sort])
+
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            {columns.map((column) => {
+              const active = column.key === sort.key && column.sortable !== false
+              const direction = active ? sort.direction : undefined
+              return (
+                <th
+                  key={column.key}
+                  aria-sort={direction === 'asc' ? 'ascending' : direction === 'desc' ? 'descending' : 'none'}
+                >
+                  {column.sortable === false ? (
+                    column.label
+                  ) : (
+                    <button
+                      className="table-sort"
+                      type="button"
+                      onClick={() => setSort((current) => ({
+                        key: column.key,
+                        direction: current.key === column.key && current.direction === 'asc' ? 'desc' : 'asc',
+                      }))}
+                      aria-label={`${column.label} ${direction === 'asc' ? 'descending' : 'ascending'}`}
+                    >
+                      <span>{column.label}</span>
+                      {direction === 'asc' ? <ArrowUp size={14} /> : direction === 'desc' ? <ArrowDown size={14} /> : <ArrowUpDown size={14} />}
+                    </button>
+                  )}
+                </th>
+              )
+            })}
+          </tr>
+        </thead>
+        <tbody>
+          {sortedItems.map((item) => (
+            <Fragment key={getRowKey(item)}>{children(item)}</Fragment>
+          ))}
+        </tbody>
       </table>
     </div>
   )
