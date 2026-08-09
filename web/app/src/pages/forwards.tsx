@@ -22,7 +22,7 @@ import {
 } from '../components/ui'
 
 type ProtocolMode = 'tcp' | 'udp' | 'tcp_udp'
-type SelectionStrategy = 'failover' | 'round_robin' | 'random'
+type SelectionStrategy = 'single' | 'failover' | 'round_robin' | 'random'
 
 type ForwardTargetForm = {
   id: string
@@ -57,8 +57,8 @@ const emptyForwardForm = (): ForwardForm => ({
   tunnel_id: '',
   protocol_mode: 'tcp_udp',
   listen: '',
-  tcp_strategy: 'failover',
-  udp_strategy: 'failover',
+  tcp_strategy: 'single',
+  udp_strategy: 'single',
   targets: [emptyTargetForm()],
   enabled: true,
 })
@@ -705,6 +705,7 @@ function ForwardEditor({
 
 function strategyOptions() {
   return [
+    <option key="single" value="single">单候选</option>,
     <option key="failover" value="failover">故障切换</option>,
     <option key="round_robin" value="round_robin">轮询</option>,
     <option key="random" value="random">随机</option>,
@@ -720,7 +721,7 @@ function strategyValue(strategy: string | undefined, fallback?: string): Selecti
     case 'random':
       return 'random'
     case 'single':
-      return strategyValue(fallback)
+      return 'single'
     default:
       return fallback ? strategyValue(fallback) : 'failover'
   }

@@ -627,6 +627,9 @@ describe('tunnels and forwards pages', () => {
     expect(await screen.findByRole('dialog', { name: '新建转发' })).toBeInTheDocument()
     expect(await screen.findByRole('option', { name: 'cn-sg-hk' })).toBeInTheDocument()
     expect(screen.getByLabelText('协议')).toHaveValue('tcp_udp')
+    expect(screen.getAllByRole('option', { name: '单候选' })).toHaveLength(2)
+    expect(screen.getByLabelText('TCP 策略')).toHaveValue('single')
+    expect(screen.getByLabelText('UDP 策略')).toHaveValue('single')
     fireEvent.change(screen.getByLabelText('名称'), { target: { value: 'web' } })
     fireEvent.change(screen.getByLabelText('隧道'), { target: { value: 'tun-1' } })
     fireEvent.change(screen.getByLabelText('监听端口'), { target: { value: '8443' } })
@@ -648,8 +651,8 @@ describe('tunnels and forwards pages', () => {
       tunnel_id: 'tun-1',
       protocols: ['tcp', 'udp'],
       listen: ':8443',
-      tcp_strategy: 'failover',
-      udp_strategy: 'failover',
+      tcp_strategy: 'single',
+      udp_strategy: 'single',
       targets: [
         {
           id: '',
