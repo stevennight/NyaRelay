@@ -312,6 +312,55 @@ func TestPrepareTunnelEntryAddressDefaultsToFirstEntryNode(t *testing.T) {
 	}
 }
 
+func TestPrepareTunnelChainStageUsesReportedNodeIP(t *testing.T) {
+	srv := testPrepareTunnelServer(t)
+	nodes := []model.Node{
+		{
+			ID:       "entry-reported-ip",
+			Name:     "entry-reported-ip",
+			Status:   model.NodeOnline,
+			System:   model.NodeSystem{IP: "198.51.100.10"},
+			PortMin:  10000,
+			PortMax:  10010,
+			Approved: true,
+		},
+		{
+			ID:       "middle-reported-ip",
+			Name:     "middle-reported-ip",
+			Status:   model.NodeOnline,
+			System:   model.NodeSystem{IP: "198.51.100.20"},
+			PortMin:  10000,
+			PortMax:  10010,
+			Approved: true,
+		},
+	}
+	for _, node := range nodes {
+		if err := srv.store.UpsertNode(context.Background(), node, "token-"+node.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tunnel, _, err := srv.prepareTunnel(context.Background(), tunnelRequest{
+		ID:        "tun_reported_ip",
+		Name:      "reported ip",
+		Type:      model.TunnelChain,
+		Transport: model.TunnelTransportDirect,
+		Stages: []model.TunnelStage{
+			{Nodes: []model.TunnelStageNode{{NodeID: "entry-reported-ip"}}},
+			{Nodes: []model.TunnelStageNode{{NodeID: "middle-reported-ip"}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tunnel.EntryAddress != "198.51.100.10" {
+		t.Fatalf("entry address = %q, want reported entry IP", tunnel.EntryAddress)
+	}
+	if got := tunnel.Stages[1].Nodes[0].PublicAddr; got != "198.51.100.20:10000" {
+		t.Fatalf("chain stage public address = %q, want reported IP and allocated port", got)
+	}
+}
+
 func TestPrepareTunnelPatchKeepsExistingEntryAddressWhenOmitted(t *testing.T) {
 	srv := testPrepareTunnelServer(t)
 	entry := model.Node{

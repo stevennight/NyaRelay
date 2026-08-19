@@ -1082,11 +1082,13 @@ func (s *Server) prepareTunnel(ctx context.Context, req tunnelRequest) (model.Tu
 				}
 				markPortUsed(used, realNode.ID, "tcp", port)
 			}
-			if node.PublicAddr == "" && realNode.PublicHost != "" {
-				node.PublicAddr = net.JoinHostPort(realNode.PublicHost, strconv.Itoa(port))
+			if node.PublicAddr == "" {
+				if host := defaultNodePublicHost(realNode); host != "" {
+					node.PublicAddr = net.JoinHostPort(host, strconv.Itoa(port))
+				}
 			}
 			if node.PublicAddr == "" && node.ConnectAddr == "" {
-				return model.Tunnel{}, nil, fmt.Errorf("node %s requires public_host or connect_addr for chain stage", realNode.ID)
+				return model.Tunnel{}, nil, fmt.Errorf("node %s requires public_host, reported system.ip, or connect_addr for chain stage", realNode.ID)
 			}
 			if node.Settings == nil {
 				node.Settings = map[string]string{}
@@ -1564,6 +1566,10 @@ func tunnelEntryNodeID(tunnel model.Tunnel) (string, error) {
 }
 
 func defaultTunnelEntryAddress(node model.Node) string {
+	return defaultNodePublicHost(node)
+}
+
+func defaultNodePublicHost(node model.Node) string {
 	if host := hostOnly(node.PublicHost); host != "" {
 		return host
 	}
