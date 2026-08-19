@@ -366,6 +366,63 @@ func TestPrepareTunnelPatchKeepsExistingEntryAddressWhenOmitted(t *testing.T) {
 	}
 }
 
+func TestPrepareTunnelAssignsNewIDToInsertedStageBeforeExistingExit(t *testing.T) {
+	srv := testPrepareTunnelServer(t)
+	for _, node := range []model.Node{
+		{ID: "entry", Name: "entry", Status: model.NodeOnline, PublicHost: "entry.example.com", PortMin: 10000, PortMax: 20000, Approved: true},
+		{ID: "middle", Name: "middle", Status: model.NodeOnline, PublicHost: "middle.example.com", PortMin: 10000, PortMax: 20000, Approved: true},
+		{ID: "exit", Name: "exit", Status: model.NodeOnline, PublicHost: "exit.example.com", PortMin: 10000, PortMax: 20000, Approved: true},
+		{ID: "new-exit", Name: "new-exit", Status: model.NodeOnline, PublicHost: "new-exit.example.com", PortMin: 10000, PortMax: 20000, Approved: true},
+	} {
+		if err := srv.store.UpsertNode(context.Background(), node, "token-"+node.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	existing := model.Tunnel{
+		ID:        "tun-stage-insert",
+		Name:      "stage insert",
+		Type:      model.TunnelChain,
+		Transport: model.TunnelTransportDirect,
+		Enabled:   true,
+		Stages: []model.TunnelStage{
+			{ID: "stage-entry", Index: 0, Role: model.TunnelStageEntry, Strategy: "single", Nodes: []model.TunnelStageNode{{ID: "stage-node-entry", NodeID: "entry"}}},
+			{ID: "stage-middle", Index: 1, Role: model.TunnelStageMiddle, Strategy: "single", Nodes: []model.TunnelStageNode{{ID: "stage-node-middle", NodeID: "middle", ListenAddr: ":10001", PublicAddr: "middle.example.com:10001"}}},
+			{ID: "stage-exit", Index: 2, Role: model.TunnelStageExit, Strategy: "single", Nodes: []model.TunnelStageNode{{ID: "stage-node-exit", NodeID: "exit", ListenAddr: ":10002", PublicAddr: "exit.example.com:10002"}}},
+		},
+	}
+	if _, err := srv.store.SaveTunnel(context.Background(), existing, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	prepared, allocations, err := srv.prepareTunnel(context.Background(), tunnelRequest{
+		ID:        existing.ID,
+		Name:      existing.Name,
+		Type:      existing.Type,
+		Transport: existing.Transport,
+		Stages: []model.TunnelStage{
+			{ID: "stage-entry", Nodes: []model.TunnelStageNode{{ID: "stage-node-entry", NodeID: "entry"}}},
+			{ID: "stage-exit", Nodes: []model.TunnelStageNode{{ID: "stage-node-exit", NodeID: "exit"}}},
+			{Nodes: []model.TunnelStageNode{{NodeID: "new-exit"}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prepared.Stages[1].ID != "stage-exit" {
+		t.Fatalf("moved stage ID = %q, want stage-exit", prepared.Stages[1].ID)
+	}
+	if prepared.Stages[2].ID == "stage-exit" || prepared.Stages[2].ID == "" {
+		t.Fatalf("inserted stage ID = %q, want a new unique ID", prepared.Stages[2].ID)
+	}
+	if prepared.Stages[1].ID == prepared.Stages[2].ID {
+		t.Fatalf("stage IDs are not unique: %q", prepared.Stages[1].ID)
+	}
+	if _, err := srv.store.SaveTunnel(context.Background(), prepared, allocations); err != nil {
+		t.Fatalf("save prepared tunnel: %v", err)
+	}
+}
+
 func TestPrepareTunnelKeepsPerProtocolStageFields(t *testing.T) {
 	srv := testPrepareTunnelServer(t)
 	entry := model.Node{ID: "entry", Name: "entry", Status: model.NodeOnline, PublicHost: "entry.example.com", Approved: true}

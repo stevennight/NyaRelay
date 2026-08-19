@@ -978,18 +978,29 @@ func (s *Server) prepareTunnel(ctx context.Context, req tunnelRequest) (model.Tu
 	used := usedPortSet(allocations, excludedOwners)
 	var outAllocations []model.PortAllocation
 	seenNodes := map[string]bool{}
+	requestedStageIDs := make(map[string]bool, len(tunnel.Stages))
+	for _, stage := range tunnel.Stages {
+		if stageID := strings.TrimSpace(stage.ID); stageID != "" {
+			requestedStageIDs[stageID] = true
+		}
+	}
+	usedStageIDs := make(map[string]bool, len(tunnel.Stages))
+	usedStageNodeIDs := make(map[string]bool)
 	for i := range tunnel.Stages {
 		stage := &tunnel.Stages[i]
 		stage.TunnelID = tunnel.ID
 		stage.Index = i
 		stage.Role = roleForStage(tunnel.Type, i, len(tunnel.Stages))
-		if stage.ID == "" {
-			if existingStage := findExistingStage(existing, i); existingStage.ID != "" {
+		stage.ID = strings.TrimSpace(stage.ID)
+		if stage.ID == "" || usedStageIDs[stage.ID] {
+			if existingStage := findExistingStage(existing, i); existingStage.ID != "" &&
+				!usedStageIDs[existingStage.ID] && !requestedStageIDs[existingStage.ID] {
 				stage.ID = existingStage.ID
 			} else {
 				stage.ID = ids.New("stage")
 			}
 		}
+		usedStageIDs[stage.ID] = true
 		if stage.Strategy == "" {
 			if len(stage.Nodes) > 1 {
 				stage.Strategy = "failover"
@@ -1008,6 +1019,7 @@ func (s *Server) prepareTunnel(ctx context.Context, req tunnelRequest) (model.Tu
 			node := &stage.Nodes[j]
 			node.TunnelID = tunnel.ID
 			node.StageID = stage.ID
+			node.ID = strings.TrimSpace(node.ID)
 			node.NodeID = strings.TrimSpace(node.NodeID)
 			if node.NodeID == "" {
 				return model.Tunnel{}, nil, fmt.Errorf("stage %d node id is required", i)
@@ -1021,13 +1033,14 @@ func (s *Server) prepareTunnel(ctx context.Context, req tunnelRequest) (model.Tu
 				return model.Tunnel{}, nil, fmt.Errorf("node %s not found", node.NodeID)
 			}
 			existingNode := findExistingStageNode(existing, i, node.NodeID)
-			if node.ID == "" {
-				if existingNode.ID != "" {
+			if node.ID == "" || usedStageNodeIDs[node.ID] {
+				if existingNode.ID != "" && !usedStageNodeIDs[existingNode.ID] {
 					node.ID = existingNode.ID
 				} else {
 					node.ID = ids.New("stage_node")
 				}
 			}
+			usedStageNodeIDs[node.ID] = true
 			if node.Weight <= 0 {
 				node.Weight = 1
 			}
