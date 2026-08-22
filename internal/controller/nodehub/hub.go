@@ -74,12 +74,14 @@ func (h *Hub) RegisterSocket(nodeID string, conn *websocket.Conn) {
 	}
 }
 
-func (h *Hub) UnregisterSocket(nodeID string, conn *websocket.Conn) {
+func (h *Hub) UnregisterSocket(nodeID string, conn *websocket.Conn) bool {
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	if current, ok := h.sockets[nodeID]; ok && current.conn == conn {
 		delete(h.sockets, nodeID)
+		return true
 	}
-	h.mu.Unlock()
+	return false
 }
 
 func (h *Hub) NodeIDs() []string {

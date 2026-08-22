@@ -1796,24 +1796,24 @@ func (s *Server) handleNodeWS(w http.ResponseWriter, r *http.Request, node model
 	}
 	defer closeWebSocket(conn, websocket.StatusNormalClosure, "bye")
 	s.hub.RegisterSocket(node.ID, conn)
-	defer s.hub.UnregisterSocket(node.ID, conn)
+	defer func() {
+		if s.hub.UnregisterSocket(node.ID, conn) {
+			_ = s.store.MarkNodeOffline(context.Background(), node.ID)
+		}
+	}()
 
 	var hello sharedprotocol.ControlMessage
 	if err := wsjson.Read(r.Context(), conn, &hello); err != nil {
-		_ = s.store.MarkNodeOffline(r.Context(), node.ID)
 		return
 	}
 	if hello.Type != "hello" {
 		_ = wsjson.Write(r.Context(), conn, sharedprotocol.ControlMessage{Type: "error", Error: "expected hello"})
-		_ = s.store.MarkNodeOffline(r.Context(), node.ID)
 		return
 	}
 	if err := s.store.MarkNodeSeen(r.Context(), node.ID, hello.System, hello.Version); err != nil {
-		_ = s.store.MarkNodeOffline(r.Context(), node.ID)
 		return
 	}
 	if err := s.sendNodeConfig(r.Context(), node.ID, conn); err != nil {
-		_ = s.store.MarkNodeOffline(r.Context(), node.ID)
 		return
 	}
 	if err := s.sendNodeUpdateIfNeeded(r.Context(), node.ID, func(msg sharedprotocol.ControlMessage) error {
@@ -1825,7 +1825,6 @@ func (s *Server) handleNodeWS(w http.ResponseWriter, r *http.Request, node model
 	for {
 		var msg sharedprotocol.ControlMessage
 		if err := wsjson.Read(r.Context(), conn, &msg); err != nil {
-			_ = s.store.MarkNodeOffline(context.Background(), node.ID)
 			return
 		}
 		switch msg.Type {
