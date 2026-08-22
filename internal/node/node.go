@@ -13,7 +13,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 
 	"nyarelay/internal/node/relay"
@@ -25,6 +24,18 @@ import (
 )
 
 var Version = sharedversion.Version
+
+type controlLoopOptions struct {
+	heartbeatInterval time.Duration
+	writeTimeout      time.Duration
+	pingTimeout       time.Duration
+}
+
+var defaultControlLoopOptions = controlLoopOptions{
+	heartbeatInterval: 20 * time.Second,
+	writeTimeout:      10 * time.Second,
+	pingTimeout:       10 * time.Second,
+}
 
 type configProvider interface {
 	config(context.Context) (model.SignedConfig, error)
@@ -143,6 +154,10 @@ func bootstrapConfig(
 }
 
 func controlLoop(ctx context.Context, client *client, cfg Config, log *slog.Logger, apply func(context.Context, model.SignedConfig, string) error) {
+	controlLoopWithOptions(ctx, client, cfg, log, apply, defaultControlLoopOptions)
+}
+
+func controlLoopWithOptions(ctx context.Context, client *client, cfg Config, log *slog.Logger, apply func(context.Context, model.SignedConfig, string) error, options controlLoopOptions) {
 	backoff := time.Second
 	for {
 		if ctx.Err() != nil {
@@ -161,12 +176,16 @@ func controlLoop(ctx context.Context, client *client, cfg Config, log *slog.Logg
 			continue
 		}
 		backoff = time.Second
+		log.Debug("control websocket connected", "controller", cfg.ControllerURL)
+		connCtx, cancelConn := context.WithCancel(ctx)
 
 		var writeMu sync.Mutex
 		write := func(msg sharedprotocol.ControlMessage) error {
 			writeMu.Lock()
 			defer writeMu.Unlock()
-			return wsjson.Write(ctx, conn, msg)
+			writeCtx, cancelWrite := context.WithTimeout(connCtx, options.writeTimeout)
+			defer cancelWrite()
+			return wsjson.Write(writeCtx, conn, msg)
 		}
 
 		hello := sharedprotocol.ControlMessage{
@@ -176,14 +195,16 @@ func controlLoop(ctx context.Context, client *client, cfg Config, log *slog.Logg
 			System:  nodeSystem(),
 		}
 		if err := write(hello); err != nil {
-			_ = conn.Close(websocket.StatusNormalClosure, "hello failed")
+			log.Debug("control websocket hello failed", "error", err)
+			cancelConn()
+			_ = conn.CloseNow()
 			continue
 		}
 		reportUpdateStatus(ctx, cfg, write, log)
 
 		hbDone := make(chan struct{})
 		go func() {
-			ticker := time.NewTicker(20 * time.Second)
+			ticker := time.NewTicker(options.heartbeatInterval)
 			defer ticker.Stop()
 			defer close(hbDone)
 			for {
@@ -201,16 +222,30 @@ func controlLoop(ctx context.Context, client *client, cfg Config, log *slog.Logg
 						msg.UpdateReport = &report
 					}
 					if err := write(msg); err != nil {
+						log.Debug("control websocket heartbeat write failed", "error", err)
+						cancelConn()
+						_ = conn.CloseNow()
 						return
 					}
+					pingCtx, cancelPing := context.WithTimeout(connCtx, options.pingTimeout)
+					if err := conn.Ping(pingCtx); err != nil {
+						cancelPing()
+						log.Debug("control websocket heartbeat ping failed", "error", err)
+						cancelConn()
+						_ = conn.CloseNow()
+						return
+					}
+					cancelPing()
 				}
 			}
 		}()
 
 		for {
 			var msg sharedprotocol.ControlMessage
-			if err := wsjson.Read(ctx, conn, &msg); err != nil {
-				_ = conn.Close(websocket.StatusNormalClosure, "read failed")
+			if err := wsjson.Read(connCtx, conn, &msg); err != nil {
+				log.Debug("control websocket read failed", "error", err)
+				cancelConn()
+				_ = conn.CloseNow()
 				<-hbDone
 				break
 			}
@@ -249,6 +284,7 @@ func controlLoop(ctx context.Context, client *client, cfg Config, log *slog.Logg
 				}
 			}
 		}
+		cancelConn()
 
 		if !sleep(ctx, backoff) {
 			return

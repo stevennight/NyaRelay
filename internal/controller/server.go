@@ -1804,9 +1804,11 @@ func (s *Server) handleNodeWS(w http.ResponseWriter, r *http.Request, node model
 
 	var hello sharedprotocol.ControlMessage
 	if err := wsjson.Read(r.Context(), conn, &hello); err != nil {
+		s.log.Debug("node websocket hello read failed", "node", node.ID, "error", err)
 		return
 	}
 	if hello.Type != "hello" {
+		s.log.Debug("node websocket hello rejected", "node", node.ID, "type", hello.Type)
 		_ = wsjson.Write(r.Context(), conn, sharedprotocol.ControlMessage{Type: "error", Error: "expected hello"})
 		return
 	}
@@ -1825,6 +1827,7 @@ func (s *Server) handleNodeWS(w http.ResponseWriter, r *http.Request, node model
 	for {
 		var msg sharedprotocol.ControlMessage
 		if err := wsjson.Read(r.Context(), conn, &msg); err != nil {
+			s.log.Debug("node websocket read failed", "node", node.ID, "error", err)
 			return
 		}
 		switch msg.Type {
