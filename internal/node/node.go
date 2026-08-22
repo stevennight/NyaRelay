@@ -25,6 +25,9 @@ import (
 
 var Version = sharedversion.Version
 
+// Keep control messages bounded while allowing node-scoped configs with many relays.
+const controlWebSocketReadLimit int64 = 256 * 1024
+
 type controlLoopOptions struct {
 	heartbeatInterval time.Duration
 	writeTimeout      time.Duration
@@ -177,6 +180,7 @@ func controlLoopWithOptions(ctx context.Context, client *client, cfg Config, log
 		}
 		backoff = time.Second
 		log.Debug("control websocket connected", "controller", cfg.ControllerURL)
+		conn.SetReadLimit(controlWebSocketReadLimit)
 		connCtx, cancelConn := context.WithCancel(ctx)
 
 		var writeMu sync.Mutex

@@ -5,6 +5,10 @@
 - `controller`: Docker container behind Caddy, stores state in SQLite, serves the admin UI.
 - `node`: systemd service on each relay VPS, runs the agent and relay runtime together.
 
+## Troubleshooting
+
+- [Node offline with an active control WebSocket](troubleshooting.md)
+
 ## Link Types
 
 - `direct`: raw node-to-node forwarding.
