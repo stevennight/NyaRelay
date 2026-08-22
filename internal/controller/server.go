@@ -679,7 +679,7 @@ func (s *Server) handleUpdateNodeBinary(w http.ResponseWriter, r *http.Request, 
 	}
 	_ = s.store.AddAudit(r.Context(), session.Username, "node.update.request", node.ID, map[string]string{"version": release.Manifest.Version})
 	if err := s.pushNodeUpdate(r.Context(), node.ID); err != nil {
-		s.log.Debug("push node update failed", "node", node.ID, "error", err)
+		s.log.Warn("push node update failed", "node", node.ID, "error", err)
 	}
 	writeJSON(w, updated)
 }
@@ -706,7 +706,7 @@ func (s *Server) handleUpdateAllNodeBinaries(w http.ResponseWriter, r *http.Requ
 		}
 		requested++
 		if err := s.pushNodeUpdate(r.Context(), node.ID); err != nil {
-			s.log.Debug("push node update failed", "node", node.ID, "error", err)
+			s.log.Warn("push node update failed", "node", node.ID, "error", err)
 		}
 	}
 	_ = s.store.AddAudit(r.Context(), session.Username, "node.update.request_all", "nodes", map[string]any{"version": release.Manifest.Version, "count": requested})
@@ -1798,55 +1798,89 @@ func (s *Server) handleNodeWS(w http.ResponseWriter, r *http.Request, node model
 	s.hub.RegisterSocket(node.ID, conn)
 	defer func() {
 		if s.hub.UnregisterSocket(node.ID, conn) {
-			_ = s.store.MarkNodeOffline(context.Background(), node.ID)
+			if err := s.store.MarkNodeOffline(context.Background(), node.ID); err != nil {
+				s.log.Error("mark node offline failed", "node", node.ID, "error", err)
+			} else {
+				s.log.Info("node offline", "node", node.ID)
+			}
 		}
 	}()
 
 	var hello sharedprotocol.ControlMessage
 	if err := wsjson.Read(r.Context(), conn, &hello); err != nil {
-		s.log.Debug("node websocket hello read failed", "node", node.ID, "error", err)
+		logNodeWebSocketReadFailure(s.log, r.Context(), err, "node", node.ID, "phase", "hello")
 		return
 	}
 	if hello.Type != "hello" {
-		s.log.Debug("node websocket hello rejected", "node", node.ID, "type", hello.Type)
+		s.log.Warn("node websocket hello rejected", "node", node.ID, "type", hello.Type)
 		_ = wsjson.Write(r.Context(), conn, sharedprotocol.ControlMessage{Type: "error", Error: "expected hello"})
 		return
 	}
 	if err := s.store.MarkNodeSeen(r.Context(), node.ID, hello.System, hello.Version); err != nil {
+		s.log.Error("mark node seen failed", "node", node.ID, "error", err)
 		return
 	}
+	s.log.Info("node online", "node", node.ID, "version", hello.Version)
 	if err := s.sendNodeConfig(r.Context(), node.ID, conn); err != nil {
+		s.log.Warn("send node config failed", "node", node.ID, "error", err)
 		return
 	}
 	if err := s.sendNodeUpdateIfNeeded(r.Context(), node.ID, func(msg sharedprotocol.ControlMessage) error {
 		return wsjson.Write(r.Context(), conn, msg)
 	}); err != nil {
-		s.log.Debug("send node update failed", "node", node.ID, "error", err)
+		logNodeWebSocketFailure(s.log, r.Context(), "send node update failed", err, "node", node.ID)
 	}
 
 	for {
 		var msg sharedprotocol.ControlMessage
 		if err := wsjson.Read(r.Context(), conn, &msg); err != nil {
-			s.log.Debug("node websocket read failed", "node", node.ID, "error", err)
+			logNodeWebSocketReadFailure(s.log, r.Context(), err, "node", node.ID)
 			return
 		}
 		switch msg.Type {
 		case "heartbeat":
-			_ = s.store.MarkNodeSeen(r.Context(), node.ID, msg.System, msg.Version)
+			if err := s.store.MarkNodeSeen(r.Context(), node.ID, msg.System, msg.Version); err != nil {
+				s.log.Error("mark node heartbeat failed", "node", node.ID, "error", err)
+			}
 			if msg.UpdateReport != nil {
-				_ = s.store.UpdateNodeReport(r.Context(), node.ID, *msg.UpdateReport)
+				if err := s.store.UpdateNodeReport(r.Context(), node.ID, *msg.UpdateReport); err != nil {
+					s.log.Warn("update node report failed", "node", node.ID, "error", err)
+				}
 			}
 			if err := s.pushNodeUpdate(r.Context(), node.ID); err != nil {
-				s.log.Debug("push node update failed", "node", node.ID, "error", err)
+				logNodeWebSocketFailure(s.log, r.Context(), "push node update failed", err, "node", node.ID)
 			}
 		case "pull_config":
-			_ = s.sendNodeConfig(r.Context(), node.ID, conn)
+			if err := s.sendNodeConfig(r.Context(), node.ID, conn); err != nil {
+				s.log.Warn("send node config failed", "node", node.ID, "error", err)
+			}
 		case "update_status":
 			if msg.UpdateReport != nil {
-				_ = s.store.UpdateNodeReport(r.Context(), node.ID, *msg.UpdateReport)
+				if err := s.store.UpdateNodeReport(r.Context(), node.ID, *msg.UpdateReport); err != nil {
+					s.log.Warn("update node report failed", "node", node.ID, "error", err)
+				}
 			}
 		}
 	}
+}
+
+func logNodeWebSocketFailure(log *slog.Logger, ctx context.Context, message string, err error, args ...any) {
+	args = append(args, "error", err)
+	if ctx.Err() != nil {
+		log.Debug(message, args...)
+		return
+	}
+	log.Warn(message, args...)
+}
+
+func logNodeWebSocketReadFailure(log *slog.Logger, ctx context.Context, err error, args ...any) {
+	status := websocket.CloseStatus(err)
+	if status == websocket.StatusNormalClosure || status == websocket.StatusGoingAway {
+		args = append(args, "error", err)
+		log.Debug("node websocket read failed", args...)
+		return
+	}
+	logNodeWebSocketFailure(log, ctx, "node websocket read failed", err, args...)
 }
 
 func (s *Server) handleNodeConfig(w http.ResponseWriter, r *http.Request, node model.Node) {
@@ -1895,7 +1929,7 @@ func (s *Server) sendNodeConfig(ctx context.Context, nodeID string, conn *websoc
 func (s *Server) pushConfigs(ctx context.Context) {
 	for _, nodeID := range s.hub.NodeIDs() {
 		if err := s.pushConfig(ctx, nodeID); err != nil {
-			s.log.Debug("push config failed", "node", nodeID, "error", err)
+			s.log.Warn("push config failed", "node", nodeID, "error", err)
 		}
 	}
 }

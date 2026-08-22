@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 
 	"nyarelay/internal/node/relay"
@@ -169,7 +170,7 @@ func controlLoopWithOptions(ctx context.Context, client *client, cfg Config, log
 
 		conn, err := client.connectWS(ctx)
 		if err != nil {
-			log.Debug("control websocket connect failed", "error", err)
+			logControlFailure(log, ctx, "control websocket connect failed", "error", err)
 			if !sleep(ctx, backoff) {
 				return
 			}
@@ -179,7 +180,7 @@ func controlLoopWithOptions(ctx context.Context, client *client, cfg Config, log
 			continue
 		}
 		backoff = time.Second
-		log.Debug("control websocket connected", "controller", cfg.ControllerURL)
+		log.Info("control websocket connected", "controller", cfg.ControllerURL)
 		conn.SetReadLimit(controlWebSocketReadLimit)
 		connCtx, cancelConn := context.WithCancel(ctx)
 
@@ -199,7 +200,7 @@ func controlLoopWithOptions(ctx context.Context, client *client, cfg Config, log
 			System:  nodeSystem(),
 		}
 		if err := write(hello); err != nil {
-			log.Debug("control websocket hello failed", "error", err)
+			logControlFailure(log, connCtx, "control websocket hello failed", "error", err)
 			cancelConn()
 			_ = conn.CloseNow()
 			continue
@@ -226,7 +227,7 @@ func controlLoopWithOptions(ctx context.Context, client *client, cfg Config, log
 						msg.UpdateReport = &report
 					}
 					if err := write(msg); err != nil {
-						log.Debug("control websocket heartbeat write failed", "error", err)
+						logControlFailure(log, connCtx, "control websocket heartbeat write failed", "error", err)
 						cancelConn()
 						_ = conn.CloseNow()
 						return
@@ -234,7 +235,7 @@ func controlLoopWithOptions(ctx context.Context, client *client, cfg Config, log
 					pingCtx, cancelPing := context.WithTimeout(connCtx, options.pingTimeout)
 					if err := conn.Ping(pingCtx); err != nil {
 						cancelPing()
-						log.Debug("control websocket heartbeat ping failed", "error", err)
+						logControlFailure(log, connCtx, "control websocket heartbeat ping failed", "error", err)
 						cancelConn()
 						_ = conn.CloseNow()
 						return
@@ -247,7 +248,7 @@ func controlLoopWithOptions(ctx context.Context, client *client, cfg Config, log
 		for {
 			var msg sharedprotocol.ControlMessage
 			if err := wsjson.Read(connCtx, conn, &msg); err != nil {
-				log.Debug("control websocket read failed", "error", err)
+				logControlReadFailure(log, connCtx, err)
 				cancelConn()
 				_ = conn.CloseNow()
 				<-hbDone
@@ -257,30 +258,34 @@ func controlLoopWithOptions(ctx context.Context, client *client, cfg Config, log
 			case "config":
 				if msg.Config != nil {
 					if err := apply(ctx, *msg.Config, "ws"); err != nil {
-						log.Debug("config apply failed", "error", err)
+						logControlFailure(log, ctx, "config apply failed", "error", err)
 					}
 				}
 			case "update":
 				if msg.Update != nil {
 					if err := handleUpdateCommand(cfg, *msg.Update); err != nil {
 						log.Warn("update request failed", "error", err)
-						_ = write(sharedprotocol.ControlMessage{
+						if writeErr := write(sharedprotocol.ControlMessage{
 							Type: "update_status",
 							UpdateReport: &model.NodeUpdateReport{
 								Status:  model.NodeUpdateFailed,
 								Version: msg.Update.Version,
 								Error:   err.Error(),
 							},
-						})
+						}); writeErr != nil {
+							logControlFailure(log, connCtx, "update status write failed", "error", writeErr)
+						}
 						continue
 					}
-					_ = write(sharedprotocol.ControlMessage{
+					if writeErr := write(sharedprotocol.ControlMessage{
 						Type: "update_status",
 						UpdateReport: &model.NodeUpdateReport{
 							Status:  model.NodeUpdateRequested,
 							Version: msg.Update.Version,
 						},
-					})
+					}); writeErr != nil {
+						logControlFailure(log, connCtx, "update status write failed", "error", writeErr)
+					}
 				}
 			case "error":
 				if msg.Error != "" {
@@ -305,8 +310,25 @@ func reportUpdateStatus(ctx context.Context, cfg Config, write func(sharedprotoc
 		return
 	}
 	if err := write(sharedprotocol.ControlMessage{Type: "update_status", UpdateReport: &report}); err != nil {
-		log.Debug("update status report failed", "error", err)
+		logControlFailure(log, ctx, "update status report failed", "error", err)
 	}
+}
+
+func logControlFailure(log *slog.Logger, ctx context.Context, message string, args ...any) {
+	if ctx.Err() != nil {
+		log.Debug(message, args...)
+		return
+	}
+	log.Warn(message, args...)
+}
+
+func logControlReadFailure(log *slog.Logger, ctx context.Context, err error) {
+	status := websocket.CloseStatus(err)
+	if ctx.Err() != nil || status == websocket.StatusNormalClosure || status == websocket.StatusGoingAway {
+		log.Debug("control websocket read failed", "error", err)
+		return
+	}
+	log.Warn("control websocket read failed", "error", err)
 }
 
 func restartNodeService() error {

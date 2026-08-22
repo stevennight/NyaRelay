@@ -10,6 +10,17 @@
 - A direct HTTP request to `/api/node/config` returns `200 OK`.
 - The node log shows a successful WebSocket connection followed by a read failure.
 
+### Log levels
+
+The default `NYARELAY_LOG_LEVEL=info` is intended to be sufficient for normal operation checks. Control-plane failures are visible without enabling debug logging:
+
+- `INFO`: controller/node startup, node online or offline transitions, WebSocket recovery, and successful configuration application.
+- `WARN`: WebSocket connect, hello, heartbeat, read, configuration apply, configuration push, or update push failures. This includes `websocket: message too big`.
+- `ERROR`: persistent failures writing node state or applying a configuration rollback.
+- `DEBUG`: normal WebSocket close, periodic metrics details, UDP per-packet failures, and other high-frequency data-plane details.
+
+Use `NYARELAY_LOG_LEVEL=debug` only when the warning context is not enough; it is not required to see a node control connection failure.
+
 ### Check the node log first
 
 Look for this sequence in the node service log:

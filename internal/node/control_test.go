@@ -1,7 +1,9 @@
 package node
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -157,5 +159,31 @@ func TestControlLoopAcceptsConfigLargerThanDefaultWebSocketLimit(t *testing.T) {
 	case <-loopDone:
 	case <-time.After(time.Second):
 		t.Fatal("control loop did not stop")
+	}
+}
+
+func TestControlFailureLogLevels(t *testing.T) {
+	var warningOutput bytes.Buffer
+	handlerOptions := &slog.HandlerOptions{Level: slog.LevelDebug}
+	warningLog := slog.New(slog.NewTextHandler(&warningOutput, handlerOptions))
+	logControlFailure(warningLog, context.Background(), "control failure", "error", errors.New("unavailable"))
+	if !strings.Contains(warningOutput.String(), "level=WARN") {
+		t.Fatalf("expected warning log, got %q", warningOutput.String())
+	}
+
+	var debugOutput bytes.Buffer
+	debugLog := slog.New(slog.NewTextHandler(&debugOutput, handlerOptions))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	logControlFailure(debugLog, ctx, "control shutdown", "error", context.Canceled)
+	if !strings.Contains(debugOutput.String(), "level=DEBUG") {
+		t.Fatalf("expected debug log during shutdown, got %q", debugOutput.String())
+	}
+
+	var closeOutput bytes.Buffer
+	closeLog := slog.New(slog.NewTextHandler(&closeOutput, handlerOptions))
+	logControlReadFailure(closeLog, context.Background(), websocket.CloseError{Code: websocket.StatusNormalClosure})
+	if !strings.Contains(closeOutput.String(), "level=DEBUG") {
+		t.Fatalf("expected debug log for normal close, got %q", closeOutput.String())
 	}
 }
