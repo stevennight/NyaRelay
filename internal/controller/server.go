@@ -1959,12 +1959,12 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, _ auth.Sess
 }
 
 func (s *Server) handleTraffic(w http.ResponseWriter, r *http.Request, _ auth.Session) {
-	summary, err := s.store.MetricSummary(r.Context(), 200)
+	overview, err := s.store.MetricOverview(r.Context(), 200)
 	if err != nil {
 		writeError(w, err, http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, summary)
+	writeJSON(w, overview)
 }
 
 func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request, node model.Node) {

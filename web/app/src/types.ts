@@ -169,13 +169,42 @@ export interface NodeInstallInfo {
   command: string
 }
 
-export interface TrafficSummary {
+export interface TrafficMetricItem {
   stat_id: string
   kind: string
   bytes_in: number
   bytes_out: number
   connections: number
   last_seen: string
+}
+
+export interface TrafficKindSummary {
+  kind: string
+  objects: number
+  bytes_in: number
+  bytes_out: number
+  connections: number
+  last_seen: string
+}
+
+export interface TrafficTrendPoint {
+  bucket: string
+  bytes_in: number
+  bytes_out: number
+  connections: number
+}
+
+export interface TrafficSummary {
+  totals: {
+    bytes_in: number
+    bytes_out: number
+    connections: number
+    objects: number
+    last_seen: string
+  }
+  by_kind: TrafficKindSummary[]
+  trend: TrafficTrendPoint[]
+  items: TrafficMetricItem[]
 }
 
 export interface SetupStatus {

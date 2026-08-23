@@ -1663,6 +1663,152 @@ type MetricSummary struct {
 	LastSeen    string `json:"last_seen"`
 }
 
+type MetricOverview struct {
+	Totals MetricTotals        `json:"totals"`
+	Kinds  []MetricKindSummary `json:"by_kind"`
+	Trend  []MetricTrendPoint  `json:"trend"`
+	Items  []MetricSummary     `json:"items"`
+}
+
+type MetricTotals struct {
+	BytesIn     int64  `json:"bytes_in"`
+	BytesOut    int64  `json:"bytes_out"`
+	Connections int64  `json:"connections"`
+	Objects     int64  `json:"objects"`
+	LastSeen    string `json:"last_seen"`
+}
+
+type MetricKindSummary struct {
+	Kind        string `json:"kind"`
+	Objects     int64  `json:"objects"`
+	BytesIn     int64  `json:"bytes_in"`
+	BytesOut    int64  `json:"bytes_out"`
+	Connections int64  `json:"connections"`
+	LastSeen    string `json:"last_seen"`
+}
+
+type MetricTrendPoint struct {
+	Bucket      string `json:"bucket"`
+	BytesIn     int64  `json:"bytes_in"`
+	BytesOut    int64  `json:"bytes_out"`
+	Connections int64  `json:"connections"`
+}
+
+const metricTrendBucketCount = 24
+
+func (s *Store) MetricOverview(ctx context.Context, limit int) (MetricOverview, error) {
+	items, err := s.MetricSummary(ctx, limit)
+	if err != nil {
+		return MetricOverview{}, err
+	}
+	if items == nil {
+		items = []MetricSummary{}
+	}
+
+	var bytesIn, bytesOut, connections float64
+	var totals MetricTotals
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT total(bytes_in), total(bytes_out), total(connections), COALESCE(MAX(observed_at), ''),
+				(SELECT COUNT(*) FROM (SELECT stat_id, stat_kind FROM metrics GROUP BY stat_id, stat_kind))
+		 FROM metrics`,
+	).Scan(&bytesIn, &bytesOut, &connections, &totals.LastSeen, &totals.Objects); err != nil {
+		return MetricOverview{}, err
+	}
+	totals.BytesIn = saturatingMetricTotal(bytesIn)
+	totals.BytesOut = saturatingMetricTotal(bytesOut)
+	totals.Connections = saturatingMetricTotal(connections)
+
+	kinds, err := s.metricKindSummary(ctx)
+	if err != nil {
+		return MetricOverview{}, err
+	}
+	if kinds == nil {
+		kinds = []MetricKindSummary{}
+	}
+	trend, err := s.metricTrend(ctx, time.Now().UTC())
+	if err != nil {
+		return MetricOverview{}, err
+	}
+
+	return MetricOverview{
+		Totals: totals,
+		Kinds:  kinds,
+		Trend:  trend,
+		Items:  items,
+	}, nil
+}
+
+func (s *Store) metricKindSummary(ctx context.Context) ([]MetricKindSummary, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT stat_kind, COUNT(DISTINCT stat_id), total(bytes_in), total(bytes_out), total(connections), COALESCE(MAX(observed_at), '')
+		 FROM metrics
+		 GROUP BY stat_kind
+		 ORDER BY total(bytes_in) + total(bytes_out) DESC, stat_kind`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer closeRows(rows)
+
+	var out []MetricKindSummary
+	for rows.Next() {
+		var item MetricKindSummary
+		var bytesIn, bytesOut, connections float64
+		if err := rows.Scan(&item.Kind, &item.Objects, &bytesIn, &bytesOut, &connections, &item.LastSeen); err != nil {
+			return nil, err
+		}
+		item.BytesIn = saturatingMetricTotal(bytesIn)
+		item.BytesOut = saturatingMetricTotal(bytesOut)
+		item.Connections = saturatingMetricTotal(connections)
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) metricTrend(ctx context.Context, now time.Time) ([]MetricTrendPoint, error) {
+	end := now.UTC().Truncate(time.Hour).Add(time.Hour)
+	start := end.Add(-metricTrendBucketCount * time.Hour)
+	points := make([]MetricTrendPoint, metricTrendBucketCount)
+	byBucket := make(map[string]int, metricTrendBucketCount)
+	for index := range points {
+		bucket := start.Add(time.Duration(index) * time.Hour).UTC().Format(time.RFC3339)
+		points[index].Bucket = bucket
+		byBucket[bucket] = index
+	}
+
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT substr(observed_at, 1, 13) || ':00:00Z', total(bytes_in), total(bytes_out), total(connections)
+		 FROM metrics
+		 WHERE observed_at >= ? AND observed_at < ?
+		 GROUP BY substr(observed_at, 1, 13)
+		 ORDER BY substr(observed_at, 1, 13)`,
+		start.Format(time.RFC3339Nano), end.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer closeRows(rows)
+
+	for rows.Next() {
+		var bucket string
+		var bytesIn, bytesOut, connections float64
+		if err := rows.Scan(&bucket, &bytesIn, &bytesOut, &connections); err != nil {
+			return nil, err
+		}
+		index, ok := byBucket[bucket]
+		if !ok {
+			continue
+		}
+		points[index].BytesIn = saturatingMetricTotal(bytesIn)
+		points[index].BytesOut = saturatingMetricTotal(bytesOut)
+		points[index].Connections = saturatingMetricTotal(connections)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return points, nil
+}
+
 func (s *Store) MetricSummary(ctx context.Context, limit int) ([]MetricSummary, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
@@ -1671,7 +1817,7 @@ func (s *Store) MetricSummary(ctx context.Context, limit int) ([]MetricSummary, 
 		`SELECT stat_id, stat_kind, total(bytes_in), total(bytes_out), total(connections), MAX(observed_at)
 		 FROM metrics
 		 GROUP BY stat_id, stat_kind
-		 ORDER BY MAX(observed_at) DESC
+		 ORDER BY total(bytes_in) + total(bytes_out) DESC, MAX(observed_at) DESC
 		 LIMIT ?`, limit,
 	)
 	if err != nil {

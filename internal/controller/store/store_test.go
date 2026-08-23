@@ -497,6 +497,78 @@ func TestMetricSummarySaturatesLargeTotals(t *testing.T) {
 	}
 }
 
+func TestMetricOverviewBuildsKindAndHourlySummaries(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Now().UTC()
+	currentHour := now.Truncate(time.Hour).Add(-10 * time.Minute)
+	previousHour := currentHour.Add(-2 * time.Hour)
+
+	if err := st.InsertMetrics(ctx, model.MetricsReport{
+		NodeID:     "node-1",
+		ObservedAt: currentHour,
+		ForwardStats: []model.TrafficStat{{
+			ID:          "forward:fwd-1",
+			BytesIn:     100,
+			BytesOut:    50,
+			Connections: 3,
+		}},
+		TunnelStats: []model.TrafficStat{{
+			ID:          "tunnel:tun-1",
+			BytesIn:     40,
+			BytesOut:    20,
+			Connections: 2,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.InsertMetrics(ctx, model.MetricsReport{
+		NodeID:     "node-1",
+		ObservedAt: previousHour,
+		ForwardStats: []model.TrafficStat{{
+			ID:          "forward:fwd-1",
+			BytesIn:     10,
+			BytesOut:    5,
+			Connections: 1,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	overview, err := st.MetricOverview(ctx, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if overview.Totals.BytesIn != 150 || overview.Totals.BytesOut != 75 || overview.Totals.Connections != 6 || overview.Totals.Objects != 2 {
+		t.Fatalf("overview totals = %#v, want 150/75/6/2", overview.Totals)
+	}
+	if len(overview.Kinds) != 2 {
+		t.Fatalf("kind summary count = %d, want 2", len(overview.Kinds))
+	}
+	if len(overview.Items) != 2 {
+		t.Fatalf("object summary count = %d, want 2", len(overview.Items))
+	}
+	if len(overview.Trend) != metricTrendBucketCount {
+		t.Fatalf("trend point count = %d, want %d", len(overview.Trend), metricTrendBucketCount)
+	}
+
+	wantBuckets := map[string][3]int64{
+		currentHour.Truncate(time.Hour).Format(time.RFC3339):  {140, 70, 5},
+		previousHour.Truncate(time.Hour).Format(time.RFC3339): {10, 5, 1},
+	}
+	for _, point := range overview.Trend {
+		if want, ok := wantBuckets[point.Bucket]; ok {
+			got := [3]int64{point.BytesIn, point.BytesOut, point.Connections}
+			if got != want {
+				t.Fatalf("trend bucket %s = %v, want %v", point.Bucket, got, want)
+			}
+			delete(wantBuckets, point.Bucket)
+		}
+	}
+	if len(wantBuckets) != 0 {
+		t.Fatalf("missing trend buckets: %v", wantBuckets)
+	}
+}
+
 func TestMigrateSingleCandidateStrategies(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
