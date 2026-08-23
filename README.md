@@ -82,7 +82,7 @@ Edit `deploy/docker/.env` on each server:
 
 ```dotenv
 NYARELAY_IMAGE=ghcr.io/<owner>/nyarelay
-NYARELAY_VERSION=v0.1.22
+NYARELAY_VERSION=v0.1.23
 NYARELAY_PUBLIC_URL=https://relay.example.com
 NYARELAY_SECRETS_KEY_FILE=/etc/nyarelay/controller-secrets.key
 NYARELAY_BIND_ADDR=127.0.0.1
@@ -116,7 +116,7 @@ For local source builds, add the build override:
 docker compose --env-file deploy/docker/.env -f deploy/docker/docker-compose.yml -f deploy/docker/docker-compose.build.yml up -d --build
 ```
 
-Release a version by pushing a tag such as `v0.1.22`. The release workflow publishes `ghcr.io/<owner>/nyarelay:v0.1.22` and Linux node binaries for amd64 and arm64. Deploying a version is just changing `NYARELAY_VERSION` in the server `.env` and running the compose commands above.
+Release a version by pushing a tag such as `v0.1.23`. The release workflow publishes `ghcr.io/<owner>/nyarelay:v0.1.23` and Linux node binaries for amd64 and arm64. Deploying a version is just changing `NYARELAY_VERSION` in the server `.env` and running the compose commands above.
 
 The release workflow must be configured with these repository secrets for signed node installation and node update approval from the panel:
 

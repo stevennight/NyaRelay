@@ -23,7 +23,6 @@ services:
     secrets:
       - source: nyarelay_secrets_key
         target: nyarelay_secrets_key
-        mode: 0444
     ports:
       - "${NYARELAY_BIND_ADDR:-127.0.0.1}:${NYARELAY_HOST_PORT:-8080}:8080"
 

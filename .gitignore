@@ -11,5 +11,6 @@ node_modules/
 *.db-shm
 *.db-wal
 deploy/docker/.env
+deploy/docker/controller-secrets.key
 
 .idea
