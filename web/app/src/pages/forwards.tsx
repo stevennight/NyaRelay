@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate } from '@tanstack/react-router'
 import { ArrowDown, ArrowUp, Pause, Play, Plus, RotateCcw, Settings, Trash2 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { Dispatch, SetStateAction } from 'react'
 import { api, post } from '../api'
 import type { Dashboard, ForwardInfo, ForwardProtocol, ForwardTargetInfo, NodeInfo, TunnelInfo } from '../types'
@@ -19,12 +19,14 @@ import {
   SortableTable,
   ToggleField,
   formatTime,
+  useSessionState,
 } from '../components/ui'
 
 type ProtocolMode = 'tcp' | 'udp' | 'tcp_udp'
 type SelectionStrategy = 'single' | 'failover' | 'round_robin' | 'random'
 
 type ForwardTargetForm = {
+  clientID: string
   id: string
   address: string
   protocols: ForwardProtocol[]
@@ -51,6 +53,12 @@ type ForwardFilters = {
   targetAddress: string
 }
 
+function isForwardFilters(value: unknown): value is ForwardFilters {
+  if (!value || typeof value !== 'object') return false
+  const candidate = value as Record<string, unknown>
+  return ['name', 'tunnelID', 'entryAddress', 'targetAddress'].every((key) => typeof candidate[key] === 'string')
+}
+
 const emptyForwardForm = (): ForwardForm => ({
   id: '',
   name: '',
@@ -65,12 +73,20 @@ const emptyForwardForm = (): ForwardForm => ({
 
 function emptyTargetForm(): ForwardTargetForm {
   return {
+    clientID: newFormClientID('target'),
     id: '',
     address: '',
     protocols: [],
     weight: 1,
     enabled: true,
   }
+}
+
+let nextFormClientID = 0
+
+function newFormClientID(prefix: string) {
+  nextFormClientID += 1
+  return `${prefix}-${nextFormClientID}`
 }
 
 const emptyForwardFilters = (): ForwardFilters => ({
@@ -129,7 +145,7 @@ function ForwardsListView({
   })
   const tunnelMap = useMemo(() => indexByID(tunnelsQuery.data ?? []), [tunnelsQuery.data])
   const nodeMap = useMemo(() => indexByID(nodesQuery.data ?? []), [nodesQuery.data])
-  const [filters, setFilters] = useState<ForwardFilters>(emptyForwardFilters)
+  const [filters, setFilters] = useSessionState<ForwardFilters>('forwards.filters', emptyForwardFilters, isForwardFilters)
   const forwards = forwardsQuery.data ?? []
   const tunnelOptions = useMemo(() => {
     const options = (tunnelsQuery.data ?? []).map((tunnel) => ({
@@ -260,6 +276,14 @@ function ForwardsListView({
               重置
             </button>
           </div>
+          <div className="list-summary" aria-live="polite">
+            <span>{hasActiveFilters ? `显示 ${filteredForwards.length} / ${forwards.length} 条转发` : `共 ${forwards.length} 条转发`}</span>
+            {hasActiveFilters && (
+              <button className="text-button" type="button" onClick={() => setFilters(emptyForwardFilters())}>
+                清除筛选
+              </button>
+            )}
+          </div>
           {filteredForwards.length === 0 ? (
             <EmptyState title="没有匹配的转发" text="调整名称、隧道、入口地址或目标地址筛选后再查看。" />
           ) : (
@@ -267,7 +291,8 @@ function ForwardsListView({
               items={filteredForwards}
               columns={forwardColumns}
               getRowKey={(forward) => forward.id}
-              defaultSortKey='name'
+              defaultSortKey="name"
+              storageKey="forwards"
             >
               {(forward) => {
                 const tunnel = tunnelMap.get(forward.tunnel_id)
@@ -305,16 +330,23 @@ function ForwardsListView({
 function ForwardCreateModal({ onClose }: { onClose: () => void }) {
   const queryClient = useQueryClient()
   const navigate = useNavigate()
+  const [editorDirty, setEditorDirty] = useState(false)
+  const handleClose = () => {
+    if (editorDirty && !window.confirm('当前转发还有未保存的修改，确定关闭吗？')) return
+    onClose()
+  }
 
   return (
     <Modal
       title="新建转发"
       subtitle="选择隧道后，入口节点会按协议启动 TCP、UDP 或同端口双协议监听。"
-      onClose={onClose}
+      onClose={handleClose}
       size="lg"
     >
       <ForwardEditor
+        onDirtyChange={setEditorDirty}
         onSaved={async (saved) => {
+          setEditorDirty(false)
           await queryClient.invalidateQueries({ queryKey: ['forwards'] })
           navigate({ to: '/forwards/$forwardId', params: { forwardId: saved.id }, replace: true })
         }}
@@ -327,6 +359,7 @@ function ForwardDetailModal({ forwardId, onClose }: { forwardId: string; onClose
   const queryClient = useQueryClient()
   const navigate = useNavigate()
   const [mode, setMode] = useState<'details' | 'edit'>('details')
+  const [editorDirty, setEditorDirty] = useState(false)
   const [message, setMessage] = useState('')
   const forwardQuery = useQuery({
     queryKey: ['forward', forwardId],
@@ -375,31 +408,46 @@ function ForwardDetailModal({ forwardId, onClose }: { forwardId: string; onClose
       navigate({ to: '/forwards', replace: true })
     },
   })
+  const handleClose = () => {
+    if (mode === 'edit' && editorDirty && !window.confirm('当前转发还有未保存的修改，确定关闭吗？')) return
+    onClose()
+  }
+  const toggleMode = () => {
+    if (mode === 'edit' && editorDirty && !window.confirm('当前转发还有未保存的修改，确定放弃吗？')) return
+    setMode(mode === 'edit' ? 'details' : 'edit')
+  }
 
   return (
     <Modal
       title={forward?.name || '转发详情'}
       subtitle="保存后控制器会重新签名并推送相关节点配置。"
-      onClose={onClose}
+      onClose={handleClose}
       size="lg"
       action={forward ? (
         <InlineActions>
-          <button className="ghost" type="button" onClick={() => setMode(mode === 'edit' ? 'details' : 'edit')}>
+          <button className="ghost" type="button" onClick={toggleMode}>
             <Settings size={16} />
             {mode === 'edit' ? '查看详情' : '编辑'}
           </button>
           {forward.enabled ? (
-            <button className="ghost" type="button" onClick={() => pause.mutate()} disabled={pause.isPending}>
+            <button className="ghost" type="button" onClick={() => pause.mutate()} disabled={pause.isPending || editorDirty}>
               <Pause size={16} />
               暂停
             </button>
           ) : (
-            <button className="ghost" type="button" onClick={() => resume.mutate()} disabled={resume.isPending}>
+            <button className="ghost" type="button" onClick={() => resume.mutate()} disabled={resume.isPending || editorDirty}>
               <Play size={16} />
               恢复
             </button>
           )}
-          <button className="ghost danger" type="button" onClick={() => remove.mutate()} disabled={remove.isPending}>
+          <button
+            className="ghost danger"
+            type="button"
+            onClick={() => {
+              if (window.confirm(`确定删除转发“${forward.name}”吗？`)) remove.mutate()
+            }}
+            disabled={remove.isPending || editorDirty}
+          >
             <Trash2 size={16} />
             删除
           </button>
@@ -415,8 +463,10 @@ function ForwardDetailModal({ forwardId, onClose }: { forwardId: string; onClose
           {mode === 'edit' ? (
             <ForwardEditor
               initialForward={forward}
+              onDirtyChange={setEditorDirty}
               onSaved={async () => {
                 setMessage('已保存')
+                setEditorDirty(false)
                 setMode('details')
                 await queryClient.invalidateQueries({ queryKey: ['forwards'] })
                 await queryClient.invalidateQueries({ queryKey: ['forward', forwardId] })
@@ -474,9 +524,11 @@ function ForwardDetailsContent({
 function ForwardEditor({
   initialForward,
   onSaved,
+  onDirtyChange,
 }: {
   initialForward?: ForwardInfo
   onSaved: (saved: ForwardInfo) => void | Promise<void>
+  onDirtyChange?: (dirty: boolean) => void
 }) {
   const tunnelsQuery = useQuery({
     queryKey: ['tunnels'],
@@ -495,9 +547,14 @@ function ForwardEditor({
   }, [tunnelsQuery.data, initialForward?.tunnel_id])
   const [form, setForm] = useState<ForwardForm>(emptyForwardForm())
   const [error, setError] = useState('')
+  const [dirty, setDirty] = useState(false)
+  const updateForm: typeof setForm = (updater) => {
+    setDirty(true)
+    setForm(updater)
+  }
 
   useEffect(() => {
-    if (!initialForward) return
+    if (!initialForward || dirty) return
     setForm({
       id: initialForward.id,
       name: initialForward.name,
@@ -508,6 +565,7 @@ function ForwardEditor({
       udp_strategy: strategyValue(initialForward.udp_strategy, initialForward.strategy),
       targets: forwardTargets(initialForward).map((target) => ({
         id: target.id,
+        clientID: target.id || newFormClientID('target'),
         address: target.address,
         protocols: target.protocols ?? [],
         weight: Math.max(1, target.weight ?? 1),
@@ -515,7 +573,12 @@ function ForwardEditor({
       })),
       enabled: initialForward.enabled,
     })
-  }, [initialForward])
+    setDirty(false)
+  }, [dirty, initialForward])
+
+  useEffect(() => {
+    onDirtyChange?.(dirty)
+  }, [dirty, onDirtyChange])
 
   const save = useMutation({
     mutationFn: () => {
@@ -528,7 +591,11 @@ function ForwardEditor({
         tcp_strategy: form.tcp_strategy,
         udp_strategy: form.udp_strategy,
         targets: form.targets.map((target, position) => ({
-          ...target,
+          id: target.id,
+          address: target.address,
+          protocols: target.protocols,
+          weight: target.weight,
+          enabled: target.enabled,
           position,
         })),
         enabled: form.enabled,
@@ -542,10 +609,26 @@ function ForwardEditor({
       return post<ForwardInfo>('/api/forwards', payload)
     },
     onSuccess: async (saved) => {
+      setDirty(false)
       await onSaved(saved)
     },
     onError: (err) => setError(err instanceof Error ? err.message : '保存失败'),
   })
+
+  const previousTargetCount = useRef(form.targets.length)
+  const targetRefs = useRef<Record<string, HTMLDivElement | null>>({})
+
+  useEffect(() => {
+    if (form.targets.length > previousTargetCount.current) {
+      const newTarget = form.targets[form.targets.length - 1]
+      if (newTarget) {
+        const scrollToTarget = () => targetRefs.current[newTarget.clientID]?.scrollIntoView?.({ block: 'nearest' })
+        if (typeof window.requestAnimationFrame === 'function') window.requestAnimationFrame(scrollToTarget)
+        else window.setTimeout(scrollToTarget, 0)
+      }
+    }
+    previousTargetCount.current = form.targets.length
+  }, [form.targets.length])
 
   return (
     <form
@@ -558,17 +641,17 @@ function ForwardEditor({
     >
       <FieldGrid>
         <Field label="名称">
-          <input value={form.name} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} />
+          <input value={form.name} onChange={(event) => updateForm((current) => ({ ...current, name: event.target.value }))} />
         </Field>
         <Field label="协议">
-          <select value={form.protocol_mode} onChange={(event) => setForm((current) => ({ ...current, protocol_mode: event.target.value as ProtocolMode }))}>
+          <select value={form.protocol_mode} onChange={(event) => updateForm((current) => ({ ...current, protocol_mode: event.target.value as ProtocolMode }))}>
             <option value="tcp">TCP</option>
             <option value="udp">UDP</option>
             <option value="tcp_udp">TCP+UDP</option>
           </select>
         </Field>
         <Field label="隧道">
-          <select value={form.tunnel_id} onChange={(event) => setForm((current) => ({ ...current, tunnel_id: event.target.value }))}>
+          <select value={form.tunnel_id} onChange={(event) => updateForm((current) => ({ ...current, tunnel_id: event.target.value }))}>
             <option value="">选择隧道</option>
             {tunnels.map((tunnel) => <option key={tunnel.id} value={tunnel.id}>{tunnel.name}</option>)}
           </select>
@@ -576,14 +659,14 @@ function ForwardEditor({
         <Field label="监听端口" hint="留空自动分配；填写 8443 即监听该端口。">
           <input
             value={form.listen}
-            onChange={(event) => setForm((current) => ({ ...current, listen: event.target.value }))}
+            onChange={(event) => updateForm((current) => ({ ...current, listen: event.target.value }))}
             placeholder="8443"
           />
         </Field>
         <Field label="TCP 策略">
           <select
             value={form.tcp_strategy}
-            onChange={(event) => setForm((current) => ({ ...current, tcp_strategy: event.target.value as SelectionStrategy }))}
+            onChange={(event) => updateForm((current) => ({ ...current, tcp_strategy: event.target.value as SelectionStrategy }))}
           >
             {strategyOptions()}
           </select>
@@ -591,16 +674,17 @@ function ForwardEditor({
         <Field label="UDP 策略">
           <select
             value={form.udp_strategy}
-            onChange={(event) => setForm((current) => ({ ...current, udp_strategy: event.target.value as SelectionStrategy }))}
+            onChange={(event) => updateForm((current) => ({ ...current, udp_strategy: event.target.value as SelectionStrategy }))}
           >
             {strategyOptions()}
           </select>
         </Field>
         <ToggleField
           label="启用"
+          ariaLabel="启用转发"
           description="保存后入口节点会按配置监听。"
           checked={form.enabled}
-          onChange={(checked) => setForm((current) => ({ ...current, enabled: checked }))}
+          onChange={(checked) => updateForm((current) => ({ ...current, enabled: checked }))}
         />
       </FieldGrid>
       <section className="form-section">
@@ -612,7 +696,7 @@ function ForwardEditor({
           <button
             type="button"
             className="ghost"
-            onClick={() => setForm((current) => ({ ...current, targets: [...current.targets, emptyTargetForm()] }))}
+            onClick={() => updateForm((current) => ({ ...current, targets: [...current.targets, emptyTargetForm()] }))}
           >
             <Plus size={16} />
             添加目标
@@ -620,12 +704,16 @@ function ForwardEditor({
         </div>
         <div className="forward-target-list">
           {form.targets.map((target, index) => (
-            <div className="hop forward-target-row" key={target.id || `target-${index}`}>
+            <div
+              className="hop forward-target-row"
+              key={target.clientID}
+              ref={(element) => { targetRefs.current[target.clientID] = element }}
+            >
               <span>{index + 1}</span>
               <input
                 aria-label={index === 0 ? '目标地址' : `目标地址 ${index + 1}`}
                 value={target.address}
-                onChange={(event) => updateTarget(setForm, index, { address: event.target.value })}
+                onChange={(event) => updateTarget(updateForm, index, { address: event.target.value })}
                 placeholder="10.0.0.8:443"
               />
               <label className="candidate-weight">
@@ -635,7 +723,7 @@ function ForwardEditor({
                   type="number"
                   min={1}
                   value={String(target.weight)}
-                  onChange={(event) => updateTarget(setForm, index, { weight: Math.max(1, Number(event.target.value) || 1) })}
+                  onChange={(event) => updateTarget(updateForm, index, { weight: Math.max(1, Number(event.target.value) || 1) })}
                 />
               </label>
               <div className="candidate-protocols">
@@ -644,7 +732,7 @@ function ForwardEditor({
                     <input
                       type="checkbox"
                       checked={target.protocols.length === 0 || target.protocols.includes(protocol)}
-                      onChange={(event) => updateTarget(setForm, index, {
+                      onChange={(event) => updateTarget(updateForm, index, {
                         protocols: toggleTargetProtocol(target.protocols, protocol, event.target.checked),
                       })}
                     />
@@ -654,8 +742,9 @@ function ForwardEditor({
               </div>
               <ToggleField
                 label="启用"
+                ariaLabel={`启用目标 ${index + 1}`}
                 checked={target.enabled}
-                onChange={(checked) => updateTarget(setForm, index, { enabled: checked })}
+                onChange={(checked) => updateTarget(updateForm, index, { enabled: checked })}
               />
               <InlineActions>
                 <button
@@ -664,7 +753,7 @@ function ForwardEditor({
                   aria-label={`上移目标 ${index + 1}`}
                   title="上移目标"
                   disabled={index === 0}
-                  onClick={() => moveTarget(setForm, index, index - 1)}
+                  onClick={() => moveTarget(updateForm, index, index - 1)}
                 >
                   <ArrowUp size={16} />
                 </button>
@@ -674,7 +763,7 @@ function ForwardEditor({
                   aria-label={`下移目标 ${index + 1}`}
                   title="下移目标"
                   disabled={index === form.targets.length - 1}
-                  onClick={() => moveTarget(setForm, index, index + 1)}
+                  onClick={() => moveTarget(updateForm, index, index + 1)}
                 >
                   <ArrowDown size={16} />
                 </button>
@@ -682,7 +771,7 @@ function ForwardEditor({
                   type="button"
                   className="ghost danger"
                   disabled={form.targets.length === 1}
-                  onClick={() => setForm((current) => ({
+                  onClick={() => updateForm((current) => ({
                     ...current,
                     targets: current.targets.filter((_, targetIndex) => targetIndex !== index),
                   }))}

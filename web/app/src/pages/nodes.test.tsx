@@ -133,6 +133,40 @@ describe('node pages', () => {
     const reversedRows = screen.getAllByRole('row')
     expect(reversedRows[1]).toHaveTextContent('z-node')
   })
+
+  it('filters nodes and restores the filter after the list remounts', async () => {
+    installFetch([
+      {
+        path: '/api/nodes',
+        method: 'GET',
+        response: jsonResponse([
+          node,
+          { ...node, id: 'node-2', name: 'sg-2', public_host: 'sg.example.com', status: 'offline' },
+        ]),
+      },
+      {
+        path: '/api/controller/info',
+        method: 'GET',
+        response: jsonResponse(controllerInfo),
+      },
+    ])
+
+    const list = renderWithClient(<NodesPage />)
+
+    expect(await screen.findByText('hk-1')).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('搜索节点'), { target: { value: 'sg.example.com' } })
+    expect(screen.getByText('sg-2')).toBeInTheDocument()
+    expect(screen.queryByText('hk-1')).not.toBeInTheDocument()
+    expect(screen.getByText('显示 1 / 2 个节点')).toBeInTheDocument()
+
+    list.unmount()
+    renderWithClient(<NodesPage />)
+
+    expect(await screen.findByDisplayValue('sg.example.com')).toBeInTheDocument()
+    expect(screen.getByText('sg-2')).toBeInTheDocument()
+    expect(screen.queryByText('hk-1')).not.toBeInTheDocument()
+  })
+
   it('creates a node and shows the launch command', async () => {
     const fetchMock = installFetch([
       {

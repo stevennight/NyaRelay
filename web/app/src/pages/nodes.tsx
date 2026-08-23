@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate } from '@tanstack/react-router'
 import { ClipboardCopy, Download, Plus, RefreshCw, Settings, Trash2 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { api, post } from '../api'
 import type { ControllerInfo, NodeInfo, NodeInstallInfo, SignedNodeRelease } from '../types'
 import {
@@ -18,6 +18,7 @@ import {
   StatusPill,
   SortableTable,
   formatTime,
+  useSessionState,
 } from '../components/ui'
 
 type NodeForm = {
@@ -44,6 +45,21 @@ const nodeColumns = [
   { key: 'last_seen', label: '最近心跳', getValue: (node: NodeInfo) => node.last_seen ? Date.parse(node.last_seen) : null },
   { key: 'actions', label: '操作', sortable: false, getValue: () => null },
 ]
+
+type NodeFilters = {
+  query: string
+  status: 'all' | 'online' | 'offline'
+}
+
+const emptyNodeFilters = (): NodeFilters => ({ query: '', status: 'all' })
+
+function isNodeFilters(value: unknown): value is NodeFilters {
+  if (!value || typeof value !== 'object') return false
+  const candidate = value as Record<string, unknown>
+  return typeof candidate.query === 'string'
+    && (candidate.status === 'all' || candidate.status === 'online' || candidate.status === 'offline')
+}
+
 export function NodesPage() {
   const navigate = useNavigate()
   return <NodesListView onCloseModal={() => navigate({ to: '/nodes', replace: true })} />
@@ -100,7 +116,26 @@ function NodesListView({
       await queryClient.invalidateQueries({ queryKey: ['nodes'] })
     },
   })
-  const nodes = (query.data ?? []).filter((node) => !node.revoked)
+  const nodes = useMemo(() => (query.data ?? []).filter((node) => !node.revoked), [query.data])
+  const [filters, setFilters] = useSessionState<NodeFilters>('nodes.filters', emptyNodeFilters, isNodeFilters)
+  const filteredNodes = useMemo(() => {
+    const needle = filters.query.trim().toLowerCase()
+    return nodes.filter((node) => {
+      if (filters.status !== 'all' && node.status !== filters.status) return false
+      if (!needle) return true
+      const searchable = [
+        node.name,
+        node.id,
+        node.version,
+        node.public_host,
+        node.system?.hostname,
+        node.system?.ip,
+        ...Object.entries(node.labels ?? {}).flat(),
+      ].filter(Boolean).join(' ').toLowerCase()
+      return searchable.includes(needle)
+    })
+  }, [filters, nodes])
+  const hasActiveFilters = Boolean(filters.query.trim() || filters.status !== 'all')
   const release = controllerInfo.data?.node_release
 
   return (
@@ -140,51 +175,89 @@ function NodesListView({
           }
         />
       ) : (
-        <SortableTable
-          items={nodes}
-          columns={nodeColumns}
-          getRowKey={(node) => node.id}
-          defaultSortKey='name'
-        >
-          {(node) => (
-            <tr key={node.id}>
-              <td>
-                <strong>
-                  <Link to="/nodes/$nodeId" params={{ nodeId: node.id }}>
-                    {node.name}
-                  </Link>
-                </strong>
-                <small>{node.id}</small>
-              </td>
-              <td><StatusPill value={node.revoked ? 'revoked' : node.status} /></td>
-              <td>
-                {node.version || '-'}
-                {nodeUpdateSummary(node)}
-                {release?.update_enabled && canUpdateNode(node, release) ? <small>可更新到 {release.manifest.version}</small> : null}
-              </td>
-              <td>{[node.system?.os, node.system?.arch].filter(Boolean).join('/') || '-'}</td>
-              <td>{formatTime(node.last_seen)}</td>
-              <td>
-                <InlineActions>
-                  {release?.update_enabled && canUpdateNode(node, release) ? (
-                    <button
-                      className="ghost"
-                      type="button"
-                      onClick={() => updateNode.mutate(node.id)}
-                      disabled={updateNode.isPending}
-                    >
-                      <RefreshCw size={16} />
-                      更新
-                    </button>
-                  ) : null}
-                  <Link to="/nodes/$nodeId" params={{ nodeId: node.id }} className="button-link ghost">
-                    详情
-                  </Link>
-                </InlineActions>
-              </td>
-            </tr>
+        <>
+          <div className="list-filters list-filters-compact" role="search" aria-label="节点筛选">
+            <Field label="搜索节点">
+              <input
+                value={filters.query}
+                onChange={(event) => setFilters((current) => ({ ...current, query: event.target.value }))}
+                placeholder="名称、ID、地址或标签"
+              />
+            </Field>
+            <Field label="状态">
+              <select
+                value={filters.status}
+                onChange={(event) => setFilters((current) => ({ ...current, status: event.target.value as NodeFilters['status'] }))}
+              >
+                <option value="all">全部状态</option>
+                <option value="online">在线</option>
+                <option value="offline">离线</option>
+              </select>
+            </Field>
+            <button className="ghost" type="button" onClick={() => setFilters(emptyNodeFilters())} disabled={!hasActiveFilters}>
+              <RefreshCw size={16} />
+              重置
+            </button>
+          </div>
+          <div className="list-summary" aria-live="polite">
+            <span>{hasActiveFilters ? `显示 ${filteredNodes.length} / ${nodes.length} 个节点` : `共 ${nodes.length} 个节点`}</span>
+            {hasActiveFilters && (
+              <button className="text-button" type="button" onClick={() => setFilters(emptyNodeFilters())}>
+                清除筛选
+              </button>
+            )}
+          </div>
+          {filteredNodes.length === 0 ? (
+            <EmptyState title="没有匹配的节点" text="调整搜索词或状态筛选后再查看。" />
+          ) : (
+            <SortableTable
+              items={filteredNodes}
+              columns={nodeColumns}
+              getRowKey={(node) => node.id}
+              defaultSortKey="name"
+              storageKey="nodes"
+            >
+              {(node) => (
+                <tr key={node.id}>
+                  <td>
+                    <strong>
+                      <Link to="/nodes/$nodeId" params={{ nodeId: node.id }}>
+                        {node.name}
+                      </Link>
+                    </strong>
+                    <small>{node.id}</small>
+                  </td>
+                  <td><StatusPill value={node.revoked ? 'revoked' : node.status} /></td>
+                  <td>
+                    {node.version || '-'}
+                    {nodeUpdateSummary(node)}
+                    {release?.update_enabled && canUpdateNode(node, release) ? <small>可更新到 {release.manifest.version}</small> : null}
+                  </td>
+                  <td>{[node.system?.os, node.system?.arch].filter(Boolean).join('/') || '-'}</td>
+                  <td>{formatTime(node.last_seen)}</td>
+                  <td>
+                    <InlineActions>
+                      {release?.update_enabled && canUpdateNode(node, release) ? (
+                        <button
+                          className="ghost"
+                          type="button"
+                          onClick={() => updateNode.mutate(node.id)}
+                          disabled={updateNode.isPending}
+                        >
+                          <RefreshCw size={16} />
+                          更新
+                        </button>
+                      ) : null}
+                      <Link to="/nodes/$nodeId" params={{ nodeId: node.id }} className="button-link ghost">
+                        详情
+                      </Link>
+                    </InlineActions>
+                  </td>
+                </tr>
+              )}
+            </SortableTable>
           )}
-        </SortableTable>
+        </>
       )}
       {modal === 'new' && <NodeCreateModal onClose={onCloseModal} />}
       {modal === 'detail' && nodeId && <NodeDetailModal nodeId={nodeId} onClose={onCloseModal} />}
@@ -195,8 +268,13 @@ function NodesListView({
 function NodeCreateModal({ onClose }: { onClose: () => void }) {
   const queryClient = useQueryClient()
   const [form, setForm] = useState<NodeForm>(emptyForm)
+  const [editorDirty, setEditorDirty] = useState(false)
   const [error, setError] = useState('')
   const [result, setResult] = useState<NodeInstallInfo | null>(null)
+  const handleClose = () => {
+    if (editorDirty && !window.confirm('当前节点还有未保存的修改，确定关闭吗？')) return
+    onClose()
+  }
 
   const create = useMutation({
     mutationFn: () =>
@@ -204,6 +282,7 @@ function NodeCreateModal({ onClose }: { onClose: () => void }) {
         ...nodePayload(form),
       }),
     onSuccess: async (created) => {
+      setEditorDirty(false)
       setResult(created)
       await queryClient.invalidateQueries({ queryKey: ['nodes'] })
     },
@@ -214,7 +293,7 @@ function NodeCreateModal({ onClose }: { onClose: () => void }) {
     <Modal
       title="添加节点"
       subtitle={result ? '节点凭据已生成，请在目标机器执行安装命令。' : '填写基础信息后生成节点凭据和安装命令。'}
-      onClose={onClose}
+      onClose={handleClose}
       size="lg"
     >
       {result ? (
@@ -225,7 +304,10 @@ function NodeCreateModal({ onClose }: { onClose: () => void }) {
           error={error}
           submitLabel="生成节点凭据"
           pending={create.isPending}
-          onChange={setForm}
+          onChange={(next) => {
+            setEditorDirty(true)
+            setForm(next)
+          }}
           onSubmit={() => {
             setError('')
             create.mutate()
@@ -240,6 +322,7 @@ function NodeDetailModal({ nodeId, onClose }: { nodeId: string; onClose: () => v
   const queryClient = useQueryClient()
   const navigate = useNavigate()
   const [mode, setMode] = useState<'details' | 'edit'>('details')
+  const [editorDirty, setEditorDirty] = useState(false)
   const [installOpen, setInstallOpen] = useState(false)
   const [editForm, setEditForm] = useState<NodeForm>(emptyForm)
   const [message, setMessage] = useState('')
@@ -273,6 +356,7 @@ function NodeDetailModal({ nodeId, onClose }: { nodeId: string; onClose: () => v
       }),
     onSuccess: async () => {
       setMessage('已保存')
+      setEditorDirty(false)
       setMode('details')
       await queryClient.invalidateQueries({ queryKey: ['nodes'] })
       await queryClient.invalidateQueries({ queryKey: ['node', nodeId] })
@@ -293,7 +377,7 @@ function NodeDetailModal({ nodeId, onClose }: { nodeId: string; onClose: () => v
   const release = controllerInfo.data?.node_release
 
   useEffect(() => {
-    if (!node) return
+    if (!node || editorDirty) return
     setEditForm({
       name: node.name,
       labels: JSON.stringify(node.labels ?? {}, null, 2),
@@ -301,17 +385,27 @@ function NodeDetailModal({ nodeId, onClose }: { nodeId: string; onClose: () => v
       port_min: String(node.port_min ?? 10000),
       port_max: String(node.port_max ?? 65535),
     })
-  }, [node])
+    setEditorDirty(false)
+  }, [editorDirty, node])
+
+  const handleClose = () => {
+    if (mode === 'edit' && editorDirty && !window.confirm('当前节点还有未保存的修改，确定关闭吗？')) return
+    onClose()
+  }
+  const toggleMode = () => {
+    if (mode === 'edit' && editorDirty && !window.confirm('当前节点还有未保存的修改，确定放弃吗？')) return
+    setMode(mode === 'edit' ? 'details' : 'edit')
+  }
 
   return (
     <Modal
       title={node?.name || '节点详情'}
       subtitle="查看节点状态、系统信息和节点配置。"
-      onClose={onClose}
+      onClose={handleClose}
       size="lg"
       action={node ? (
         <InlineActions>
-          <button className="ghost" type="button" onClick={() => setMode(mode === 'edit' ? 'details' : 'edit')}>
+          <button className="ghost" type="button" onClick={toggleMode}>
             <Settings size={16} />
             {mode === 'edit' ? '查看详情' : '编辑'}
           </button>
@@ -322,18 +416,25 @@ function NodeDetailModal({ nodeId, onClose }: { nodeId: string; onClose: () => v
               setInstallOpen(true)
               await installQuery.refetch()
             }}
-            disabled={installQuery.isFetching}
+            disabled={installQuery.isFetching || editorDirty}
           >
             <Download size={16} />
             安装命令
           </button>
           {release?.update_enabled && canUpdateNode(node, release) ? (
-            <button className="ghost" type="button" onClick={() => updateBinary.mutate()} disabled={updateBinary.isPending}>
+            <button className="ghost" type="button" onClick={() => updateBinary.mutate()} disabled={updateBinary.isPending || editorDirty}>
               <RefreshCw size={16} />
               更新版本
             </button>
           ) : null}
-          <button className="ghost danger" type="button" onClick={() => revoke.mutate()} disabled={revoke.isPending}>
+          <button
+            className="ghost danger"
+            type="button"
+            onClick={() => {
+              if (window.confirm(`确定吊销节点“${node.name}”吗？`)) revoke.mutate()
+            }}
+            disabled={revoke.isPending || editorDirty}
+          >
             <Trash2 size={16} />
             吊销
           </button>
@@ -349,7 +450,10 @@ function NodeDetailModal({ nodeId, onClose }: { nodeId: string; onClose: () => v
               error={update.error instanceof Error ? update.error.message : ''}
               submitLabel="保存节点设置"
               pending={update.isPending}
-              onChange={setEditForm}
+              onChange={(next) => {
+                setEditorDirty(true)
+                setEditForm(next)
+              }}
               onSubmit={() => {
                 setMessage('')
                 update.mutate()
@@ -513,6 +617,13 @@ function NodeInstallContent({
   loading?: boolean
   error?: string
 }) {
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'error'>('idle')
+  const copyTimer = useRef<number | undefined>(undefined)
+
+  useEffect(() => () => {
+    if (copyTimer.current !== undefined) window.clearTimeout(copyTimer.current)
+  }, [])
+
   if (!result) {
     return loading ? (
       <Panel>
@@ -525,6 +636,16 @@ function NodeInstallContent({
     ) : null
   }
   const command = result.command || ''
+  const copyCommand = async () => {
+    try {
+      await copyText(command)
+      setCopyState('copied')
+      if (copyTimer.current !== undefined) window.clearTimeout(copyTimer.current)
+      copyTimer.current = window.setTimeout(() => setCopyState('idle'), 1800)
+    } catch {
+      setCopyState('error')
+    }
+  }
   return (
     <Panel>
       <h3>节点安装命令</h3>
@@ -540,9 +661,9 @@ function NodeInstallContent({
           <Download size={16} />
           下载脚本
         </a>
-        <button className="ghost" type="button" onClick={() => { void copyText(command) }}>
+        <button className="ghost" type="button" onClick={() => { void copyCommand() }}>
           <ClipboardCopy size={16} />
-          复制命令
+          {copyState === 'copied' ? '已复制' : copyState === 'error' ? '复制失败' : '复制命令'}
         </button>
         <Link to="/nodes/$nodeId" params={{ nodeId: result.node.id }} className="button-link">
           节点详情

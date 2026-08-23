@@ -1,6 +1,15 @@
 import { ArrowDown, ArrowUp, ArrowUpDown, X } from 'lucide-react'
-import type { ReactNode } from 'react'
-import { cloneElement, Fragment, isValidElement, useEffect, useId, useMemo, useState } from 'react'
+import type { Dispatch, ReactNode, SetStateAction } from 'react'
+import {
+  cloneElement,
+  Fragment,
+  isValidElement,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 
 export function PageFrame({
   title,
@@ -72,19 +81,49 @@ export function SortableTable<T>({
   columns,
   getRowKey,
   defaultSortKey,
+  storageKey,
   children,
 }: {
   items: T[]
   columns: SortableTableColumn<T>[]
   getRowKey: (item: T) => string
   defaultSortKey?: string
+  storageKey?: string
   children: (item: T) => ReactNode
 }) {
   const initialSortKey = defaultSortKey ?? columns.find((column) => column.sortable !== false)?.key ?? ''
-  const [sort, setSort] = useState<{ key: string; direction: 'asc' | 'desc' }>({
-    key: initialSortKey,
-    direction: 'asc',
+  const [sort, setSort] = useState<{ key: string; direction: 'asc' | 'desc' }>(() => {
+    if (storageKey) {
+      try {
+        const stored = sessionStorage.getItem(`nyarelay:table-sort:${storageKey}`)
+        if (stored) {
+          const parsed = JSON.parse(stored) as { key?: unknown; direction?: unknown }
+          const storedColumn = typeof parsed.key === 'string'
+            ? columns.find((column) => column.key === parsed.key && column.sortable !== false)
+            : undefined
+          if (storedColumn && (parsed.direction === 'asc' || parsed.direction === 'desc')) {
+            return { key: storedColumn.key, direction: parsed.direction }
+          }
+        }
+      } catch {
+        // Storage can be unavailable in privacy-restricted browser contexts.
+      }
+    }
+    return { key: initialSortKey, direction: 'asc' }
   })
+  useEffect(() => {
+    const hasValidSort = columns.some((column) => column.key === sort.key && column.sortable !== false)
+    if (hasValidSort || (sort.key === initialSortKey && sort.direction === 'asc')) return
+    setSort({ key: initialSortKey, direction: 'asc' })
+  }, [columns, initialSortKey, sort.direction, sort.key])
+  useEffect(() => {
+    if (!storageKey) return
+    try {
+      sessionStorage.setItem(`nyarelay:table-sort:${storageKey}`, JSON.stringify(sort))
+    } catch {
+      // Storage can be unavailable in privacy-restricted browser contexts.
+    }
+  }, [sort, storageKey])
   const sortedItems = useMemo(() => {
     const column = columns.find((candidate) => candidate.key === sort.key && candidate.sortable !== false)
     if (!column) return items
@@ -207,18 +246,20 @@ export function ToggleField({
   checked,
   onChange,
   disabled,
+  ariaLabel,
 }: {
   label: string
   description?: string
   checked: boolean
   onChange: (checked: boolean) => void
   disabled?: boolean
+  ariaLabel?: string
 }) {
   return (
     <label className="toggle-field">
       <input
         type="checkbox"
-        aria-label={label}
+        aria-label={ariaLabel ?? label}
         checked={checked}
         disabled={disabled}
         onChange={(event) => onChange(event.target.checked)}
@@ -256,21 +297,58 @@ export function Modal({
   size?: 'md' | 'lg'
 }) {
   const titleID = useId()
+  const dialogRef = useRef<HTMLElement>(null)
+  const closeButtonRef = useRef<HTMLButtonElement>(null)
+  const onCloseRef = useRef(onClose)
+
+  useEffect(() => {
+    onCloseRef.current = onClose
+  }, [onClose])
 
   useEffect(() => {
     const previousOverflow = document.body.style.overflow
+    const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null
     document.body.style.overflow = 'hidden'
+    closeButtonRef.current?.focus()
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
-        onClose()
+        onCloseRef.current()
+        return
+      }
+      if (event.key !== 'Tab') return
+
+      const focusable = Array.from(dialogRef.current?.querySelectorAll<HTMLElement>([
+        'button:not([disabled])',
+        '[href]',
+        'input:not([disabled])',
+        'select:not([disabled])',
+        'textarea:not([disabled])',
+        '[tabindex]:not([tabindex="-1"])',
+      ].join(',')) ?? []).filter((element) => element.tabIndex >= 0)
+      if (focusable.length === 0) {
+        event.preventDefault()
+        closeButtonRef.current?.focus()
+        return
+      }
+
+      const activeIndex = focusable.indexOf(document.activeElement as HTMLElement)
+      if (event.shiftKey) {
+        if (activeIndex <= 0) {
+          event.preventDefault()
+          focusable[focusable.length - 1].focus()
+        }
+      } else if (activeIndex < 0 || activeIndex === focusable.length - 1) {
+        event.preventDefault()
+        focusable[0].focus()
       }
     }
     document.addEventListener('keydown', handleKeyDown)
     return () => {
       document.body.style.overflow = previousOverflow
       document.removeEventListener('keydown', handleKeyDown)
+      if (previouslyFocused?.isConnected) previouslyFocused.focus()
     }
-  }, [onClose])
+  }, [])
 
   return (
     <div
@@ -278,11 +356,11 @@ export function Modal({
       role="presentation"
       onMouseDown={(event) => {
         if (event.target === event.currentTarget) {
-          onClose()
+          onCloseRef.current()
         }
       }}
     >
-      <section className={`modal modal-${size}`} role="dialog" aria-modal="true" aria-labelledby={titleID}>
+      <section ref={dialogRef} className={`modal modal-${size}`} role="dialog" aria-modal="true" aria-labelledby={titleID}>
         <header className="modal-header">
           <div className="modal-title">
             <h2 id={titleID}>{title}</h2>
@@ -290,7 +368,7 @@ export function Modal({
           </div>
           <div className="modal-header-actions">
             {action}
-            <button className="icon-button" type="button" aria-label="关闭" onClick={onClose}>
+            <button ref={closeButtonRef} className="icon-button" type="button" aria-label="关闭" onClick={() => onCloseRef.current()}>
               <X size={18} />
             </button>
           </div>
@@ -330,6 +408,68 @@ export function EmptyState({
       {action}
     </section>
   )
+}
+
+export function useSessionState<T>(
+  key: string,
+  initialValue: T | (() => T),
+  validate?: (value: unknown) => value is T,
+): [T, Dispatch<SetStateAction<T>>] {
+  const [value, setValue] = useState<T>(() => {
+    try {
+      const stored = sessionStorage.getItem(`nyarelay:state:${key}`)
+      if (stored) {
+        const parsed = JSON.parse(stored) as unknown
+        if (!validate || validate(parsed)) return parsed as T
+      }
+    } catch {
+      // Storage can be unavailable in privacy-restricted browser contexts.
+    }
+    return typeof initialValue === 'function'
+      ? (initialValue as () => T)()
+      : initialValue
+  })
+
+  useEffect(() => {
+    try {
+      sessionStorage.setItem(`nyarelay:state:${key}`, JSON.stringify(value))
+    } catch {
+      // Storage can be unavailable in privacy-restricted browser contexts.
+    }
+  }, [key, value])
+
+  return [value, setValue]
+}
+
+export function useListScrollRestoration(key: string) {
+  useEffect(() => {
+    const content = document.querySelector<HTMLElement>('.content')
+    if (!content) return
+
+    const storageKey = `nyarelay:list-scroll:${key}`
+    try {
+      const stored = sessionStorage.getItem(storageKey)
+      if (stored) {
+        const scrollTop = Number(stored)
+        if (Number.isFinite(scrollTop)) content.scrollTop = scrollTop
+      }
+    } catch {
+      // Storage can be unavailable in privacy-restricted browser contexts.
+    }
+
+    const save = () => {
+      try {
+        sessionStorage.setItem(storageKey, String(content.scrollTop))
+      } catch {
+        // Storage can be unavailable in privacy-restricted browser contexts.
+      }
+    }
+    content.addEventListener('scroll', save, { passive: true })
+    return () => {
+      save()
+      content.removeEventListener('scroll', save)
+    }
+  }, [key])
 }
 
 export function Subnav({

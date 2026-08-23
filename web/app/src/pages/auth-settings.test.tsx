@@ -1,6 +1,7 @@
 import { fireEvent, screen, waitFor } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 import { LoginPage, SetupPage } from './auth'
+import { DashboardPage } from './dashboard'
 import { ControllerSettingsPage, SecuritySettingsPage } from './settings'
 import { installFetch, jsonResponse, renderWithClient } from '../test/helpers'
 import { routerMocks } from '../test/router-mocks'
@@ -179,8 +180,20 @@ describe('auth and security flows', () => {
       cleanup_interval: '15m',
     })
   })
-  it('shows controller build and bundled node release information', async () => {
+  it('shows controller build and bundled node release information on the dashboard', async () => {
     installFetch([
+      {
+        path: '/api/dashboard',
+        method: 'GET',
+        response: jsonResponse({
+          nodes: 2,
+          online_nodes: 2,
+          tunnels: 1,
+          forwards: 2,
+          active_forwards: 2,
+          revision: 7,
+        }),
+      },
       {
         path: '/api/controller/info',
         method: 'GET',
@@ -204,9 +217,10 @@ describe('auth and security flows', () => {
       },
     ])
 
-    renderWithClient(<ControllerSettingsPage />)
+    renderWithClient(<DashboardPage />)
 
-    expect(await screen.findByText('v0.1.3 (abc123 / 2026-07-01T00:00:00Z)')).toBeInTheDocument()
+    expect((await screen.findAllByText('v0.1.3')).length).toBe(2)
+    expect(screen.getByText('abc123')).toBeInTheDocument()
     expect(screen.getByText('已启用')).toBeInTheDocument()
   })
 })

@@ -163,6 +163,40 @@ describe('tunnels and forwards pages', () => {
     const reversedRows = screen.getAllByRole('row')
     expect(reversedRows[1]).toHaveTextContent('z-tunnel')
   })
+
+  it('filters tunnels and restores the filter after the list remounts', async () => {
+    installFetch([
+      {
+        path: '/api/tunnels',
+        method: 'GET',
+        response: jsonResponse([
+          tunnel,
+          { ...tunnel, id: 'tun-direct', name: 'direct-hk', type: 'direct', transport: 'direct' },
+        ]),
+      },
+      {
+        path: '/api/nodes',
+        method: 'GET',
+        response: jsonResponse(nodes),
+      },
+    ])
+
+    const list = renderWithClient(<TunnelsPage />)
+
+    expect(await screen.findByText('cn-sg-hk')).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('类型'), { target: { value: 'direct' } })
+    expect(screen.getByText('direct-hk')).toBeInTheDocument()
+    expect(screen.queryByText('cn-sg-hk')).not.toBeInTheDocument()
+    expect(screen.getByText('显示 1 / 2 条隧道')).toBeInTheDocument()
+
+    list.unmount()
+    renderWithClient(<TunnelsPage />)
+
+    expect(await screen.findByLabelText('类型')).toHaveValue('direct')
+    expect(screen.getByText('direct-hk')).toBeInTheDocument()
+    expect(screen.queryByText('cn-sg-hk')).not.toBeInTheDocument()
+  })
+
   it('hides revoked nodes in the tunnel selector', async () => {
     installFetch([
       {
@@ -548,7 +582,7 @@ describe('tunnels and forwards pages', () => {
       },
     ])
 
-    renderWithClient(<ForwardsPage />)
+    const list = renderWithClient(<ForwardsPage />)
 
     expect(await screen.findByText('web-public')).toBeInTheDocument()
     const forwardRows = await screen.findAllByRole('row')
@@ -576,6 +610,13 @@ describe('tunnels and forwards pages', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '重置' }))
     fireEvent.change(screen.getByLabelText('目标地址'), { target: { value: '10.0.0.8' } })
+    expect(screen.getByText('web-public')).toBeInTheDocument()
+    expect(screen.queryByText('admin-panel')).not.toBeInTheDocument()
+
+    list.unmount()
+    renderWithClient(<ForwardsPage />)
+
+    expect(await screen.findByDisplayValue('10.0.0.8')).toBeInTheDocument()
     expect(screen.getByText('web-public')).toBeInTheDocument()
     expect(screen.queryByText('admin-panel')).not.toBeInTheDocument()
   })

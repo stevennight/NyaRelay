@@ -1,7 +1,7 @@
 import '@testing-library/jest-dom/vitest'
 
 import * as React from 'react'
-import { afterEach, vi } from 'vitest'
+import { afterEach, beforeEach, vi } from 'vitest'
 import { routerMocks } from './router-mocks'
 
 function applyParams(to: string, params?: Record<string, string>) {
@@ -31,8 +31,14 @@ vi.mock('@tanstack/react-router', () => {
   }
 })
 
+beforeEach(() => {
+  vi.spyOn(window, 'confirm').mockReturnValue(true)
+})
+
 afterEach(() => {
   vi.clearAllMocks()
+  vi.restoreAllMocks()
   vi.unstubAllGlobals()
+  window.sessionStorage.clear()
   window.history.replaceState({}, '', '/')
 })

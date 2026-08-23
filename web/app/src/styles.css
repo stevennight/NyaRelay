@@ -329,7 +329,7 @@ nav .nav-link.active, nav .nav-link:hover, .logout:hover {
 
 .stats {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   gap: 14px;
 }
 
@@ -443,6 +443,39 @@ td small {
   min-width: 96px;
 }
 
+.list-filters-compact {
+  grid-template-columns: minmax(240px, 2fr) minmax(160px, 1fr) auto;
+}
+
+.list-filters-tunnels {
+  grid-template-columns: minmax(240px, 2fr) minmax(150px, 1fr) minmax(170px, 1fr) auto;
+}
+
+.list-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 28px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.text-button {
+  min-height: 28px;
+  padding: 0;
+  background: transparent;
+  color: var(--primary-hover);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.text-button:hover:not(:disabled) {
+  background: transparent;
+  color: var(--primary);
+  text-decoration: underline;
+}
+
 .status {
   display: inline-flex;
   min-width: 70px;
@@ -528,6 +561,17 @@ td small {
   justify-content: flex-end;
   gap: 10px;
   padding-top: 2px;
+}
+
+.modal-body .form-actions {
+  position: sticky;
+  bottom: -22px;
+  z-index: 4;
+  margin: 0 -22px -22px;
+  padding: 14px 22px 22px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+  box-shadow: 0 -8px 18px rgba(18, 25, 38, 0.06);
 }
 
 .modal-backdrop {
@@ -770,6 +814,7 @@ td small {
 
 .forward-target-row {
   grid-template-columns: 32px minmax(180px, 2fr) minmax(90px, 110px) minmax(126px, auto) minmax(110px, auto) auto;
+  scroll-margin-block: 84px;
 }
 
 .forward-target-row .toggle-field {
@@ -825,6 +870,7 @@ td small {
 
 .candidate-row {
   grid-template-columns: 32px 40px minmax(180px, 2fr) minmax(110px, 1fr) minmax(126px, auto) auto;
+  scroll-margin-block: 84px;
 }
 
 .candidate-row.dragging {
@@ -1021,6 +1067,14 @@ td small {
 
   .modal-header,
   .modal-body {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+
+  .modal-body .form-actions {
+    bottom: -22px;
+    margin-left: -16px;
+    margin-right: -16px;
     padding-left: 16px;
     padding-right: 16px;
   }

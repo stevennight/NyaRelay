@@ -44,7 +44,13 @@ export function SecuritySettingsPage() {
         <p>用任意 TOTP 应用扫描密钥，输入 6 位验证码后启用。</p>
         <InlineActions>
           <button onClick={() => setup.mutate()} disabled={setup.isPending}>生成 TOTP 密钥</button>
-          <button className="ghost danger" onClick={() => disable.mutate()} disabled={disable.isPending}>
+          <button
+            className="ghost danger"
+            onClick={() => {
+              if (window.confirm('确定关闭 TOTP 双因素认证吗？')) disable.mutate()
+            }}
+            disabled={disable.isPending}
+          >
             关闭 TOTP
           </button>
         </InlineActions>
@@ -119,7 +125,7 @@ export function ControllerSettingsPage() {
   }, [info.data])
 
   return (
-    <PageFrame title="控制器" subtitle="这里显示控制器公钥、公开地址和当前配置版本。">
+    <PageFrame title="控制器" subtitle="管理控制器公开地址、签名材料和运行参数。">
       <SettingsTabs />
       <Panel>
         <h2>控制器信息</h2>
@@ -129,8 +135,6 @@ export function ControllerSettingsPage() {
             items={[
               { label: '公开地址', value: info.data.public_url || '-' },
               { label: '配置版本', value: String(info.data.revision) },
-              { label: '应用版本', value: formatBuild(info.data.build) },
-              { label: '内置 Node 版本', value: info.data.node_release?.manifest.version || '-' },
               { label: 'Node 自动更新', value: info.data.node_release?.update_enabled ? '已启用' : (info.data.node_release?.disabled_reason || '未启用') },
               { label: '签名公钥', value: <code>{info.data.signing_key}</code> },
             ]}
@@ -231,12 +235,6 @@ export function ControllerSettingsPage() {
       </Panel>
     </PageFrame>
   )
-}
-
-function formatBuild(build?: { version: string; commit?: string; build_date?: string }) {
-  if (!build) return '-'
-  const suffix = [build.commit, build.build_date].filter(Boolean).join(' / ')
-  return suffix ? `${build.version} (${suffix})` : build.version
 }
 
 function SettingsTabs() {

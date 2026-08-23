@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate } from '@tanstack/react-router'
-import { GripVertical, Pause, Play, Plus, Settings, Trash2 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { GripVertical, Pause, Play, Plus, RefreshCw, Settings, Trash2 } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { api, post } from '../api'
 import type { ForwardProtocol, NodeInfo, TunnelInfo, TunnelStageRole, TunnelTransport, TunnelType } from '../types'
 import {
@@ -18,9 +18,11 @@ import {
   SortableTable,
   ToggleField,
   formatTime,
+  useSessionState,
 } from '../components/ui'
 
 type TunnelNodeForm = {
+  clientID: string
   id: string
   node_id: string
   weight: number
@@ -28,6 +30,7 @@ type TunnelNodeForm = {
 }
 
 type TunnelStageForm = {
+  clientID: string
   id: string
   strategy: string
   tcp_strategy: string
@@ -43,6 +46,26 @@ type TunnelForm = {
   entry_address: string
   enabled: boolean
   stages: TunnelStageForm[]
+}
+
+type TunnelFilters = {
+  query: string
+  type: 'all' | TunnelType
+  transport: 'all' | TunnelTransport
+}
+
+const emptyTunnelFilters = (): TunnelFilters => ({ query: '', type: 'all', transport: 'all' })
+
+function isTunnelFilters(value: unknown): value is TunnelFilters {
+  if (!value || typeof value !== 'object') return false
+  const candidate = value as Record<string, unknown>
+  return typeof candidate.query === 'string'
+    && (candidate.type === 'all' || candidate.type === 'direct' || candidate.type === 'chain')
+    && (candidate.transport === 'all'
+      || candidate.transport === 'direct'
+      || candidate.transport === 'tls'
+      || candidate.transport === 'mtls'
+      || candidate.transport === 'ws-tls')
 }
 
 const emptyTunnelForm = (): TunnelForm => ({
@@ -100,6 +123,24 @@ function TunnelsListView({
     enabled: (query.data ?? []).length > 0,
   })
   const nodeMap = useMemo(() => indexByID(nodesQuery.data ?? []), [nodesQuery.data])
+  const tunnels = query.data ?? []
+  const [filters, setFilters] = useSessionState<TunnelFilters>('tunnels.filters', emptyTunnelFilters, isTunnelFilters)
+  const filteredTunnels = useMemo(() => {
+    const needle = filters.query.trim().toLowerCase()
+    return tunnels.filter((tunnel) => {
+      if (filters.type !== 'all' && tunnel.type !== filters.type) return false
+      if (filters.transport !== 'all' && tunnel.transport !== filters.transport) return false
+      if (!needle) return true
+      const searchable = [
+        tunnel.name,
+        tunnel.id,
+        tunnel.entry_address,
+        formatTunnelPath(tunnel, nodeMap),
+      ].filter(Boolean).join(' ').toLowerCase()
+      return searchable.includes(needle)
+    })
+  }, [filters, nodeMap, tunnels])
+  const hasActiveFilters = Boolean(filters.query.trim() || filters.type !== 'all' || filters.transport !== 'all')
   const tunnelColumns = [
     { key: 'name', label: '名称', getValue: (tunnel: TunnelInfo) => tunnel.name },
     { key: 'type', label: '类型', getValue: (tunnel: TunnelInfo) => tunnel.type },
@@ -120,7 +161,7 @@ function TunnelsListView({
       }
     >
       {query.error && <Banner text={query.error instanceof Error ? query.error.message : '加载失败'} />}
-      {(query.data ?? []).length === 0 ? (
+      {tunnels.length === 0 ? (
         <EmptyState
           title="还没有隧道"
           text="先选择入口节点；需要多跳时再添加中间节点和出口节点。"
@@ -132,29 +173,79 @@ function TunnelsListView({
           }
         />
       ) : (
-        <SortableTable
-          items={query.data ?? []}
-          columns={tunnelColumns}
-          getRowKey={(tunnel) => tunnel.id}
-          defaultSortKey='name'
-        >
-          {(tunnel) => (
-            <tr key={tunnel.id}>
-              <td>
-                <strong>
-                  <Link to="/tunnels/$tunnelId" params={{ tunnelId: tunnel.id }}>
-                    {tunnel.name}
-                  </Link>
-                </strong>
-                <small>{tunnel.id}</small>
-              </td>
-              <td>{tunnel.type}</td>
-              <td>{tunnel.transport}</td>
-              <td>{formatTunnelPath(tunnel, nodeMap)}</td>
-              <td><StatusPill value={tunnel.enabled ? 'online' : 'offline'} /></td>
-            </tr>
+        <>
+          <div className="list-filters list-filters-tunnels" role="search" aria-label="隧道筛选">
+            <Field label="搜索隧道">
+              <input
+                value={filters.query}
+                onChange={(event) => setFilters((current) => ({ ...current, query: event.target.value }))}
+                placeholder="名称、ID、入口或路径"
+              />
+            </Field>
+            <Field label="类型">
+              <select
+                value={filters.type}
+                onChange={(event) => setFilters((current) => ({ ...current, type: event.target.value as TunnelFilters['type'] }))}
+              >
+                <option value="all">全部类型</option>
+                <option value="direct">直入直出</option>
+                <option value="chain">链式隧道</option>
+              </select>
+            </Field>
+            <Field label="传输">
+              <select
+                value={filters.transport}
+                onChange={(event) => setFilters((current) => ({ ...current, transport: event.target.value as TunnelFilters['transport'] }))}
+              >
+                <option value="all">全部传输</option>
+                <option value="direct">Direct stream</option>
+                <option value="tls">TLS</option>
+                <option value="mtls">mTLS</option>
+                <option value="ws-tls">WS over TLS</option>
+              </select>
+            </Field>
+            <button className="ghost" type="button" onClick={() => setFilters(emptyTunnelFilters())} disabled={!hasActiveFilters}>
+              <RefreshCw size={16} />
+              重置
+            </button>
+          </div>
+          <div className="list-summary" aria-live="polite">
+            <span>{hasActiveFilters ? `显示 ${filteredTunnels.length} / ${tunnels.length} 条隧道` : `共 ${tunnels.length} 条隧道`}</span>
+            {hasActiveFilters && (
+              <button className="text-button" type="button" onClick={() => setFilters(emptyTunnelFilters())}>
+                清除筛选
+              </button>
+            )}
+          </div>
+          {filteredTunnels.length === 0 ? (
+            <EmptyState title="没有匹配的隧道" text="调整搜索词、类型或传输筛选后再查看。" />
+          ) : (
+            <SortableTable
+              items={filteredTunnels}
+              columns={tunnelColumns}
+              getRowKey={(tunnel) => tunnel.id}
+              defaultSortKey="name"
+              storageKey="tunnels"
+            >
+              {(tunnel) => (
+                <tr key={tunnel.id}>
+                  <td>
+                    <strong>
+                      <Link to="/tunnels/$tunnelId" params={{ tunnelId: tunnel.id }}>
+                        {tunnel.name}
+                      </Link>
+                    </strong>
+                    <small>{tunnel.id}</small>
+                  </td>
+                  <td>{tunnel.type}</td>
+                  <td>{tunnel.transport}</td>
+                  <td>{formatTunnelPath(tunnel, nodeMap)}</td>
+                  <td><StatusPill value={tunnel.enabled ? 'online' : 'offline'} /></td>
+                </tr>
+              )}
+            </SortableTable>
           )}
-        </SortableTable>
+        </>
       )}
       {modal === 'new' && <TunnelCreateModal onClose={onCloseModal} />}
       {modal === 'detail' && tunnelId && <TunnelDetailModal tunnelId={tunnelId} onClose={onCloseModal} />}
@@ -165,16 +256,23 @@ function TunnelsListView({
 function TunnelCreateModal({ onClose }: { onClose: () => void }) {
   const queryClient = useQueryClient()
   const navigate = useNavigate()
+  const [editorDirty, setEditorDirty] = useState(false)
+  const handleClose = () => {
+    if (editorDirty && !window.confirm('当前隧道还有未保存的修改，确定关闭吗？')) return
+    onClose()
+  }
 
   return (
     <Modal
       title="新建隧道"
       subtitle="隧道由一层或多层 stage 组成，每层可放多个候选节点。"
-      onClose={onClose}
+      onClose={handleClose}
       size="lg"
     >
       <TunnelEditor
+        onDirtyChange={setEditorDirty}
         onSaved={async (saved) => {
+          setEditorDirty(false)
           await queryClient.invalidateQueries({ queryKey: ['tunnels'] })
           navigate({ to: '/tunnels/$tunnelId', params: { tunnelId: saved.id }, replace: true })
         }}
@@ -187,6 +285,7 @@ function TunnelDetailModal({ tunnelId, onClose }: { tunnelId: string; onClose: (
   const queryClient = useQueryClient()
   const navigate = useNavigate()
   const [mode, setMode] = useState<'details' | 'edit'>('details')
+  const [editorDirty, setEditorDirty] = useState(false)
   const [message, setMessage] = useState('')
   const dashboardQuery = useQuery({
     queryKey: ['dashboard'],
@@ -230,31 +329,46 @@ function TunnelDetailModal({ tunnelId, onClose }: { tunnelId: string; onClose: (
   })
 
   const tunnel = query.data
+  const handleClose = () => {
+    if (mode === 'edit' && editorDirty && !window.confirm('当前隧道还有未保存的修改，确定关闭吗？')) return
+    onClose()
+  }
+  const toggleMode = () => {
+    if (mode === 'edit' && editorDirty && !window.confirm('当前隧道还有未保存的修改，确定放弃吗？')) return
+    setMode(mode === 'edit' ? 'details' : 'edit')
+  }
 
   return (
     <Modal
       title={tunnel?.name || '隧道详情'}
       subtitle="保存后控制器会重新签名并推送相关节点配置。"
-      onClose={onClose}
+      onClose={handleClose}
       size="lg"
       action={tunnel ? (
         <InlineActions>
-          <button className="ghost" type="button" onClick={() => setMode(mode === 'edit' ? 'details' : 'edit')}>
+          <button className="ghost" type="button" onClick={toggleMode}>
             <Settings size={16} />
             {mode === 'edit' ? '查看详情' : '编辑'}
           </button>
           {tunnel.enabled ? (
-            <button className="ghost" type="button" onClick={() => disable.mutate()} disabled={disable.isPending}>
+            <button className="ghost" type="button" onClick={() => disable.mutate()} disabled={disable.isPending || editorDirty}>
               <Pause size={16} />
               停用
             </button>
           ) : (
-            <button className="ghost" type="button" onClick={() => enable.mutate()} disabled={enable.isPending}>
+            <button className="ghost" type="button" onClick={() => enable.mutate()} disabled={enable.isPending || editorDirty}>
               <Play size={16} />
               启用
             </button>
           )}
-          <button className="ghost danger" type="button" onClick={() => remove.mutate()} disabled={remove.isPending}>
+          <button
+            className="ghost danger"
+            type="button"
+            onClick={() => {
+              if (window.confirm(`确定删除隧道“${tunnel.name}”吗？`)) remove.mutate()
+            }}
+            disabled={remove.isPending || editorDirty}
+          >
             <Trash2 size={16} />
             删除
           </button>
@@ -270,8 +384,10 @@ function TunnelDetailModal({ tunnelId, onClose }: { tunnelId: string; onClose: (
           {mode === 'edit' ? (
             <TunnelEditor
               initialTunnel={tunnel}
+              onDirtyChange={setEditorDirty}
               onSaved={async () => {
                 setMessage('已保存')
+                setEditorDirty(false)
                 setMode('details')
                 await queryClient.invalidateQueries({ queryKey: ['tunnels'] })
                 await queryClient.invalidateQueries({ queryKey: ['tunnel', tunnelId] })
@@ -335,9 +451,11 @@ function TunnelDetailsContent({
 function TunnelEditor({
   initialTunnel,
   onSaved,
+  onDirtyChange,
 }: {
   initialTunnel?: TunnelInfo
   onSaved: (saved: TunnelInfo) => void | Promise<void>
+  onDirtyChange?: (dirty: boolean) => void
 }) {
   const nodesQuery = useQuery({
     queryKey: ['nodes'],
@@ -355,10 +473,17 @@ function TunnelEditor({
   }, [allNodes, initialTunnel])
   const [form, setForm] = useState<TunnelForm>(emptyTunnelForm())
   const [error, setError] = useState('')
+  const [dirty, setDirty] = useState(false)
+  const updateForm: typeof setForm = (updater) => {
+    setDirty(true)
+    setForm(updater)
+  }
   const [draggingCandidate, setDraggingCandidate] = useState<{ stageIndex: number; nodeIndex: number } | null>(null)
+  const candidateRefs = useRef<Record<string, HTMLDivElement | null>>({})
+  const previousCandidateCounts = useRef<Record<string, number>>({})
 
   useEffect(() => {
-    if (!initialTunnel) return
+    if (!initialTunnel || dirty) return
     setForm({
       id: initialTunnel.id,
       name: initialTunnel.name,
@@ -368,12 +493,14 @@ function TunnelEditor({
       enabled: initialTunnel.enabled,
       stages: initialTunnel.stages.length > 0
         ? initialTunnel.stages.map((stage) => ({
+          clientID: stage.id || newFormClientID('stage'),
           id: stage.id,
           strategy: stage.strategy || 'single',
           tcp_strategy: stage.tcp_strategy || '',
           udp_strategy: stage.udp_strategy || '',
           nodes: stage.nodes.length > 0
             ? stage.nodes.map((node) => ({
+              clientID: node.id || newFormClientID('candidate'),
               id: node.id,
               node_id: node.node_id,
               weight: node.weight || 1,
@@ -383,7 +510,27 @@ function TunnelEditor({
         }))
         : defaultStagesForType(initialTunnel.type),
     })
-  }, [initialTunnel])
+    setDirty(false)
+  }, [dirty, initialTunnel])
+
+  useEffect(() => {
+    onDirtyChange?.(dirty)
+  }, [dirty, onDirtyChange])
+
+  useEffect(() => {
+    form.stages.forEach((stage) => {
+      const previousCount = previousCandidateCounts.current[stage.clientID]
+      if (previousCount !== undefined && stage.nodes.length > previousCount) {
+        const newCandidate = stage.nodes[stage.nodes.length - 1]
+        if (newCandidate) {
+          const scrollToCandidate = () => candidateRefs.current[newCandidate.clientID]?.scrollIntoView?.({ block: 'nearest' })
+          if (typeof window.requestAnimationFrame === 'function') window.requestAnimationFrame(scrollToCandidate)
+          else window.setTimeout(scrollToCandidate, 0)
+        }
+      }
+      previousCandidateCounts.current[stage.clientID] = stage.nodes.length
+    })
+  }, [form.stages])
 
   const save = useMutation({
     mutationFn: () => {
@@ -419,6 +566,7 @@ function TunnelEditor({
       return post<TunnelInfo>('/api/tunnels', payload)
     },
     onSuccess: async (saved) => {
+      setDirty(false)
       await onSaved(saved)
     },
     onError: (err) => setError(err instanceof Error ? err.message : '保存失败'),
@@ -435,12 +583,12 @@ function TunnelEditor({
     >
       <FieldGrid>
         <Field label="名称">
-          <input value={form.name} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} />
+          <input value={form.name} onChange={(event) => updateForm((current) => ({ ...current, name: event.target.value }))} />
         </Field>
         <Field label="类型">
           <select
             value={form.type}
-            onChange={(event) => setForm((current) => {
+            onChange={(event) => updateForm((current) => {
               const type = event.target.value as TunnelType
               return {
                 ...current,
@@ -458,7 +606,7 @@ function TunnelEditor({
           <select
             value={form.type === 'direct' ? 'direct' : form.transport}
             disabled={form.type === 'direct'}
-            onChange={(event) => setForm((current) => ({ ...current, transport: event.target.value as TunnelTransport }))}
+            onChange={(event) => updateForm((current) => ({ ...current, transport: event.target.value as TunnelTransport }))}
           >
             <option value="direct">Direct stream</option>
             <option value="tls">TLS</option>
@@ -469,15 +617,16 @@ function TunnelEditor({
         <Field label="入口地址" hint="可填域名或 IP；留空时使用入口层第一个节点的节点 IP / 域名。">
           <input
             value={form.entry_address}
-            onChange={(event) => setForm((current) => ({ ...current, entry_address: event.target.value }))}
+            onChange={(event) => updateForm((current) => ({ ...current, entry_address: event.target.value }))}
             placeholder="edge.example.com"
           />
         </Field>
         <ToggleField
           label="启用"
+          ariaLabel="启用隧道"
           description="保存后立即推送到相关节点。"
           checked={form.enabled}
-          onChange={(checked) => setForm((current) => ({ ...current, enabled: checked }))}
+          onChange={(checked) => updateForm((current) => ({ ...current, enabled: checked }))}
         />
       </FieldGrid>
       <section className="form-section">
@@ -487,7 +636,7 @@ function TunnelEditor({
             <button
               type="button"
               className="ghost"
-              onClick={() => setForm((current) => ({
+              onClick={() => updateForm((current) => ({
                 ...current,
                 stages: insertMiddleStage(current.stages),
               }))}
@@ -501,7 +650,7 @@ function TunnelEditor({
           {form.stages.map((stage, stageIndex) => {
             const label = stageLabel(form.type, stageIndex, form.stages.length)
             return (
-              <div key={stage.id || `${stageIndex}`} className="stage-editor">
+              <div key={stage.clientID} className="stage-editor">
                 <div className="stage-header">
                   <div className="stage-title">
                     <strong>{label}</strong>
@@ -511,7 +660,7 @@ function TunnelEditor({
                     <button
                       type="button"
                       className="ghost"
-                      onClick={() => setForm((current) => ({
+                      onClick={() => updateForm((current) => ({
                         ...current,
                         stages: current.stages.map((item, idx) => (
                           idx === stageIndex
@@ -527,7 +676,7 @@ function TunnelEditor({
                       <button
                         type="button"
                         className="ghost danger"
-                        onClick={() => setForm((current) => ({
+                        onClick={() => updateForm((current) => ({
                           ...current,
                           stages: current.stages.filter((_, idx) => idx !== stageIndex),
                         }))}
@@ -542,7 +691,7 @@ function TunnelEditor({
                   <Field label="TCP 策略">
                     <select
                       value={stage.tcp_strategy || stage.strategy || 'single'}
-                      onChange={(event) => setForm((current) => ({
+                      onChange={(event) => updateForm((current) => ({
                         ...current,
                         stages: current.stages.map((item, idx) => (
                           idx === stageIndex ? { ...item, tcp_strategy: event.target.value } : item
@@ -558,7 +707,7 @@ function TunnelEditor({
                   <Field label="UDP 策略">
                     <select
                       value={stage.udp_strategy || stage.strategy || 'single'}
-                      onChange={(event) => setForm((current) => ({
+                      onChange={(event) => updateForm((current) => ({
                         ...current,
                         stages: current.stages.map((item, idx) => (
                           idx === stageIndex ? { ...item, udp_strategy: event.target.value } : item
@@ -579,7 +728,8 @@ function TunnelEditor({
                   {stage.nodes.map((nodeForm, nodeIndex) => (
                     <div
                       className={`hop candidate-row${draggingCandidate?.stageIndex === stageIndex && draggingCandidate.nodeIndex === nodeIndex ? ' dragging' : ''}`}
-                      key={nodeForm.id || `${stageIndex}-${nodeIndex}`}
+                      key={nodeForm.clientID}
+                      ref={(element) => { candidateRefs.current[nodeForm.clientID] = element }}
                       onDragOver={(event) => {
                         if (!draggingCandidate || draggingCandidate.stageIndex !== stageIndex) return
                         event.preventDefault()
@@ -592,7 +742,7 @@ function TunnelEditor({
                           setDraggingCandidate(null)
                           return
                         }
-                        setForm((current) => ({
+                        updateForm((current) => ({
                           ...current,
                           stages: current.stages.map((item, idx) => (
                             idx === stageIndex
@@ -623,7 +773,7 @@ function TunnelEditor({
                       <select
                         aria-label={`候选节点 ${stageIndex + 1}-${nodeIndex + 1}`}
                         value={nodeForm.node_id}
-                        onChange={(event) => setForm((current) => ({
+                        onChange={(event) => updateForm((current) => ({
                           ...current,
                           stages: current.stages.map((item, idx) => (
                             idx === stageIndex
@@ -651,7 +801,7 @@ function TunnelEditor({
                           type="number"
                           min={1}
                           value={String(nodeForm.weight)}
-                          onChange={(event) => setForm((current) => ({
+                          onChange={(event) => updateForm((current) => ({
                             ...current,
                             stages: current.stages.map((item, idx) => (
                               idx === stageIndex
@@ -677,7 +827,7 @@ function TunnelEditor({
                             <input
                               type="checkbox"
                               checked={nodeForm.protocols.includes(protocol)}
-                              onChange={(event) => setForm((current) => ({
+                              onChange={(event) => updateForm((current) => ({
                                 ...current,
                                 stages: current.stages.map((item, idx) => (
                                   idx === stageIndex
@@ -704,7 +854,7 @@ function TunnelEditor({
                         type="button"
                         className="ghost danger"
                         disabled={stage.nodes.length === 1}
-                        onClick={() => setForm((current) => ({
+                        onClick={() => updateForm((current) => ({
                           ...current,
                           stages: current.stages.map((item, idx) => (
                             idx === stageIndex
@@ -737,6 +887,7 @@ function TunnelEditor({
 
 function emptyNodeForm(): TunnelNodeForm {
   return {
+    clientID: newFormClientID('candidate'),
     id: '',
     node_id: '',
     weight: 1,
@@ -746,6 +897,7 @@ function emptyNodeForm(): TunnelNodeForm {
 
 function emptyStageForm(): TunnelStageForm {
   return {
+    clientID: newFormClientID('stage'),
     id: '',
     strategy: 'single',
     tcp_strategy: 'single',
@@ -775,17 +927,26 @@ function normalizeStagesForType(type: TunnelType, stages: TunnelStageForm[]): Tu
 function normalizeStage(stage: TunnelStageForm): TunnelStageForm {
   const nodes = stage.nodes.length > 0 ? stage.nodes : [emptyNodeForm()]
   return {
+    clientID: stage.clientID,
     id: stage.id,
     strategy: stage.strategy || 'single',
     tcp_strategy: stage.tcp_strategy || stage.strategy || 'single',
     udp_strategy: stage.udp_strategy || stage.strategy || 'single',
     nodes: nodes.map((node) => ({
+      clientID: node.clientID,
       id: node.id,
       node_id: node.node_id,
       weight: node.weight > 0 ? node.weight : 1,
       protocols: normalizeNodeProtocols(node.protocols),
     })),
   }
+}
+
+let nextFormClientID = 0
+
+function newFormClientID(prefix: string) {
+  nextFormClientID += 1
+  return `${prefix}-${nextFormClientID}`
 }
 
 function stageLabel(type: TunnelType, index: number, stageCount: number): string {
