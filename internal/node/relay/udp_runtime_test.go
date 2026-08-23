@@ -207,6 +207,18 @@ func TestUDPChainSessionReusesSocketAndSupportsAsyncResponses(t *testing.T) {
 }
 
 func TestWSTLSUDPChainSessionReusesSocket(t *testing.T) {
+	testTLSUDPChainSession(t, model.TunnelTransportWSTLS, "ws-udp-session", true)
+}
+
+func TestTLSUDPChainSessionReusesSocket(t *testing.T) {
+	testTLSUDPChainSession(t, model.TunnelTransportTLS, "tls-udp-session", false)
+}
+
+func TestMTLSUDPChainSessionReusesSocket(t *testing.T) {
+	testTLSUDPChainSession(t, model.TunnelTransportMTLS, "mtls-udp-session", true)
+}
+
+func testTLSUDPChainSession(t *testing.T, transport model.TunnelTransport, certificateName string, includeClientCertificate bool) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	targetAddr, packets, closeTarget := startObservedUDPServer(t, udpResponseHandler)
@@ -214,7 +226,7 @@ func TestWSTLSUDPChainSessionReusesSocket(t *testing.T) {
 
 	entryListen := freeUDPAddr(t)
 	stageListen := freeTCPAddr(t)
-	certs, err := sharedcrypto.GenerateTunnelCertificates("ws-udp-session", "127.0.0.1")
+	certs, err := sharedcrypto.GenerateTunnelCertificates(certificateName, "127.0.0.1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,10 +236,12 @@ func TestWSTLSUDPChainSessionReusesSocket(t *testing.T) {
 		"ca_cert":     certs.CACert,
 		"server_cert": certs.ServerCert,
 		"server_key":  certs.ServerKey,
-		"client_cert": certs.ClientCert,
-		"client_key":  certs.ClientKey,
 	}
-	tunnel := twoNodeTunnel(model.TunnelTransportWSTLS, stageListen, settings)
+	if includeClientCertificate {
+		settings["client_cert"] = certs.ClientCert
+		settings["client_key"] = certs.ClientKey
+	}
+	tunnel := twoNodeTunnel(transport, stageListen, settings)
 	exitService := New(testLogger(), "node_exit")
 	exitForward := chainForward(entryListen, targetAddr, model.ForwardProtocolUDP)
 	if err := exitService.Apply(ctx, model.RelayConfig{NodeID: "node_exit", Revision: 1, Tunnels: []model.TunnelRuntime{tunnel}, Forwards: []model.ForwardRuntime{exitForward}}); err != nil {
@@ -243,17 +257,27 @@ func TestWSTLSUDPChainSessionReusesSocket(t *testing.T) {
 
 	client := newUDPTestClient(t, entryListen)
 	defer client.close()
-	writeUDPTestPayload(t, client, "one")
-	if got := readUDPTestResponse(t, client); got != "one" {
-		t.Fatalf("ws udp first response = %q", got)
+	writeUDPTestPayload(t, client, "silent")
+	silent := waitObservedPacket(t, packets, "silent")
+	writeUDPTestPayload(t, client, "echo")
+	if got := readUDPTestResponse(t, client); got != "echo" {
+		t.Fatalf("%s udp echo response = %q", transport, got)
 	}
-	first := waitObservedPacket(t, packets, "one")
-	writeUDPTestPayload(t, client, "two")
-	if got := readUDPTestResponse(t, client); got != "two" {
-		t.Fatalf("ws udp second response = %q", got)
+	echo := waitObservedPacket(t, packets, "echo")
+	if silent.remote.Port != echo.remote.Port {
+		t.Fatalf("%s UDP source port changed: first=%d second=%d", transport, silent.remote.Port, echo.remote.Port)
 	}
-	second := waitObservedPacket(t, packets, "two")
-	if first.remote.Port != second.remote.Port {
-		t.Fatalf("ws UDP source port changed: first=%d second=%d", first.remote.Port, second.remote.Port)
+
+	writeUDPTestPayload(t, client, "delayed")
+	if got := readUDPTestResponse(t, client); got != "delayed-response" {
+		t.Fatalf("%s udp delayed response = %q", transport, got)
 	}
+	_ = waitObservedPacket(t, packets, "delayed")
+
+	writeUDPTestPayload(t, client, "multi")
+	responses := map[string]bool{readUDPTestResponse(t, client): true, readUDPTestResponse(t, client): true}
+	if !responses["response-one"] || !responses["response-two"] {
+		t.Fatalf("%s udp multiple responses = %v", transport, responses)
+	}
+	_ = waitObservedPacket(t, packets, "multi")
 }
