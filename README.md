@@ -7,7 +7,7 @@ NyaRelay is a private multi-hop relay panel for personal VPS fleets. It is desig
 ```text
 Caddy HTTPS
   -> controller Docker container
-     -> SQLite volume
+     -> SQLite database in the project-root data/ directory
 
 node VPS
   -> nyarelay-node systemd service
@@ -99,6 +99,28 @@ sudo chmod 600 /etc/nyarelay/controller-secrets.key
 
 The controller refuses to start without this key. It encrypts TOTP secrets, its configuration signing private key, and tunnel credentials before storing them in SQLite. Back up this key separately; losing it makes those stored secrets unrecoverable.
 
+The Compose deployment uses the fixed container name `nya-server-relay-1` and mounts the repository's `data/` directory into `/data`. The directory is resolved from `deploy/docker/docker-compose.yml`, so the expected layout is:
+
+```text
+NyaRelay/
+  data/
+  deploy/docker/docker-compose.yml
+```
+
+For an existing deployment that still uses the old Docker volume, migrate the database before starting the new container. Do not use `down -v`, because it removes the source volume. First stop the old container, then identify its actual volume name (it is commonly `docker_nyarelay-data` when the old Compose project was named `docker`):
+
+```bash
+docker stop docker-controller-1
+docker volume ls --filter name=nyarelay-data
+mkdir -p data
+docker run --rm \
+  -v docker_nyarelay-data:/from:ro \
+  -v "$PWD/data:/to" \
+  alpine:3.22 sh -c 'cp -a /from/. /to/'
+```
+
+Replace `docker_nyarelay-data` with the volume name returned on that server. After verifying that `data/nyarelay.db` exists, start the current Compose configuration. Keep the old volume until the new deployment has been verified; it can then be removed manually.
+
 Run or update the controller:
 
 ```bash
@@ -133,7 +155,7 @@ Node binary updates are panel-approved and controller-bundled. The controller on
 
 SQLite is the default store. It is enough for a personal relay panel when metrics are aggregated before writes. The store package is isolated so a future Postgres driver can be added without changing route or node logic.
 
-Postgres is intentionally not required for the first version. Keeping the controller as one container plus one persistent volume reduces deployment work and removes a database service from the public-facing stack.
+Postgres is intentionally not required for the first version. Keeping the controller as one container plus one project-local data directory reduces deployment work and removes a database service from the public-facing stack.
 
 ## Security Notes
 

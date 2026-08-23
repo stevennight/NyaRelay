@@ -88,7 +88,6 @@ COPY --from=web /src/.tmp-webdist /app/.tmp-webdist
 COPY deploy/docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 EXPOSE 8080
-VOLUME ["/data"]
 ENV NYARELAY_DATA=/data
 ENV NYARELAY_NODE_BINARY=/usr/local/bin/nyarelay-node
 ENV NYARELAY_NODE_BINARY_DIR=/usr/local/lib/nyarelay

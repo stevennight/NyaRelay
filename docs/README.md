@@ -2,7 +2,7 @@
 
 ## Runtime
 
-- `controller`: Docker container behind Caddy, stores state in SQLite, serves the admin UI.
+- `controller`: Docker container behind Caddy, stores state in SQLite under the project-root `data/` bind mount, and serves the admin UI.
 - `node`: systemd service on each relay VPS, runs the agent and relay runtime together.
 
 ## Troubleshooting
@@ -45,7 +45,7 @@ Main routes:
 
 ## History Retention
 
-The controller stores configuration, audit events, and traffic metrics in `/data/nyarelay.db`. It prunes old history periodically by default:
+The controller stores configuration, audit events, and traffic metrics in `/data/nyarelay.db` (the deployment maps this to the project-root `data/` directory). It prunes old history periodically by default:
 
 - metrics: 7 days (`NYARELAY_METRICS_RETENTION=168h`)
 - audit events: 90 days (`NYARELAY_AUDIT_RETENTION=2160h`)
