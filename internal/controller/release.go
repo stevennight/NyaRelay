@@ -6,13 +6,23 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	sharedcrypto "nyarelay/internal/shared/crypto"
 	"nyarelay/internal/shared/model"
 	sharedversion "nyarelay/internal/shared/version"
+)
+
+const nodeReleaseCacheTTL = time.Minute
+
+const (
+	maxNodeReleaseManifestBytes = 1 << 20
+	maxNodeReleaseMetadataBytes = 16 << 10
+	maxNodeReleaseArtifactBytes = 128 << 20
 )
 
 const (
@@ -22,8 +32,24 @@ const (
 )
 
 func (s *Server) nodeRelease() model.SignedNodeRelease {
+	s.releaseMu.Lock()
+	defer s.releaseMu.Unlock()
+	if !s.releaseCachedAt.IsZero() && time.Since(s.releaseCachedAt) < nodeReleaseCacheTTL {
+		return s.releaseCache
+	}
+	release := s.nodeReleaseUncached()
+	s.releaseCache = release
+	s.releaseCachedAt = time.Now()
+	return release
+}
+
+func (s *Server) nodeReleaseUncached() model.SignedNodeRelease {
 	release := model.SignedNodeRelease{
 		UpdateEnabled: false,
+	}
+	if strings.TrimSpace(s.cfg.NodeBinaryDir) == "" {
+		release.DisabledReason = "node release directory is not configured"
+		return release
 	}
 	manifest, err := s.nodeReleaseManifest()
 	if err != nil {
@@ -75,7 +101,7 @@ func (s *Server) nodeRelease() model.SignedNodeRelease {
 
 func (s *Server) nodeReleaseManifest() (model.NodeReleaseManifest, error) {
 	path := filepath.Join(s.cfg.NodeBinaryDir, nodeReleaseManifestFilename)
-	payload, err := os.ReadFile(path)
+	payload, err := readNodeReleaseFile(path, maxNodeReleaseManifestBytes)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return model.NodeReleaseManifest{}, errors.New("node release manifest is not bundled")
@@ -90,22 +116,52 @@ func (s *Server) nodeReleaseManifest() (model.NodeReleaseManifest, error) {
 }
 
 func nodeReleaseArtifact(path, targetOS, targetArch string) (model.NodeReleaseArtifact, error) {
-	payload, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if err != nil {
 		return model.NodeReleaseArtifact{}, err
 	}
-	sum := sha256.Sum256(payload)
+	defer func() { _ = file.Close() }()
+	info, err := file.Stat()
+	if err != nil {
+		return model.NodeReleaseArtifact{}, err
+	}
+	if info.IsDir() || info.Size() <= 0 || info.Size() > maxNodeReleaseArtifactBytes {
+		return model.NodeReleaseArtifact{}, errors.New("node release artifact has invalid size")
+	}
+	hash := sha256.New()
+	readBytes, err := io.Copy(hash, io.LimitReader(file, maxNodeReleaseArtifactBytes+1))
+	if err != nil {
+		return model.NodeReleaseArtifact{}, err
+	}
+	if readBytes <= 0 || readBytes > maxNodeReleaseArtifactBytes || readBytes != info.Size() {
+		return model.NodeReleaseArtifact{}, errors.New("node release artifact changed while reading")
+	}
+	sum := hash.Sum(nil)
 	return model.NodeReleaseArtifact{
 		OS:     targetOS,
 		Arch:   targetArch,
-		SHA256: hex.EncodeToString(sum[:]),
-		Size:   int64(len(payload)),
+		SHA256: hex.EncodeToString(sum),
+		Size:   readBytes,
 	}, nil
 }
 
 func (s *Server) verifyNodeReleaseArtifacts(manifest model.NodeReleaseManifest) error {
 	for _, artifact := range manifest.Artifacts {
-		path := filepath.Join(s.cfg.NodeBinaryDir, fmt.Sprintf("nyarelay-node-%s-%s", artifact.OS, artifact.Arch))
+		targetOS, targetArch, err := normalizeNodeBinaryTarget(artifact.OS, artifact.Arch)
+		if err != nil || targetOS != artifact.OS || targetArch != artifact.Arch {
+			return fmt.Errorf("node release artifact %s/%s has invalid target", artifact.OS, artifact.Arch)
+		}
+		if artifact.Size <= 0 || artifact.Size > maxNodeReleaseArtifactBytes {
+			return fmt.Errorf("node release artifact %s/%s has invalid size", artifact.OS, artifact.Arch)
+		}
+		path := filepath.Join(s.cfg.NodeBinaryDir, fmt.Sprintf("nyarelay-node-%s-%s", targetOS, targetArch))
+		info, err := os.Stat(path)
+		if err != nil || info.IsDir() {
+			return fmt.Errorf("node release artifact %s/%s is not available", artifact.OS, artifact.Arch)
+		}
+		if info.Size() > maxNodeReleaseArtifactBytes {
+			return fmt.Errorf("node release artifact %s/%s is too large", artifact.OS, artifact.Arch)
+		}
 		actual, err := nodeReleaseArtifact(path, artifact.OS, artifact.Arch)
 		if err != nil {
 			return fmt.Errorf("node release artifact %s/%s is not available", artifact.OS, artifact.Arch)
@@ -118,7 +174,7 @@ func (s *Server) verifyNodeReleaseArtifacts(manifest model.NodeReleaseManifest) 
 }
 
 func readTrimmedFile(path, missingMessage string) (string, error) {
-	payload, err := os.ReadFile(path)
+	payload, err := readNodeReleaseFile(path, maxNodeReleaseMetadataBytes)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return "", errors.New(missingMessage)
@@ -126,6 +182,22 @@ func readTrimmedFile(path, missingMessage string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(string(payload)), nil
+}
+
+func readNodeReleaseFile(path string, maxBytes int64) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = file.Close() }()
+	payload, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(payload)) > maxBytes {
+		return nil, fmt.Errorf("file %s is too large", path)
+	}
+	return payload, nil
 }
 
 func nodeNeedsUpdate(currentVersion, desiredVersion string) bool {

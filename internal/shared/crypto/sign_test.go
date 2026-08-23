@@ -20,3 +20,24 @@ func TestSignAndVerifyJSON(t *testing.T) {
 		t.Fatal("expected modified value to fail verification")
 	}
 }
+
+func TestSignAndVerifyBytes(t *testing.T) {
+	pub, priv, err := GenerateSigningKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("node binary payload")
+	sig, err := SignBytes(priv, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyBytes(pub, payload, sig); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyBytes(pub, []byte("modified payload"), sig); err == nil {
+		t.Fatal("expected modified payload to fail verification")
+	}
+	if err := VerifyBytes(pub, payload, "bad"); err == nil {
+		t.Fatal("expected invalid signature to fail verification")
+	}
+}

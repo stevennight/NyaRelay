@@ -33,8 +33,17 @@ func TOTPURL(issuer, account, secret string) string {
 
 func VerifyTOTP(secret, code string, now time.Time) bool {
 	code = strings.TrimSpace(code)
+	if len(code) != 6 {
+		return false
+	}
+	for _, digit := range code {
+		if digit < '0' || digit > '9' {
+			return false
+		}
+	}
 	for offset := -1; offset <= 1; offset++ {
-		if GenerateTOTPCode(secret, now.Add(time.Duration(offset)*30*time.Second)) == code {
+		generated := GenerateTOTPCode(secret, now.Add(time.Duration(offset)*30*time.Second))
+		if generated != "" && generated == code {
 			return true
 		}
 	}

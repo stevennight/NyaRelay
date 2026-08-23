@@ -1,7 +1,10 @@
 package relay
 
 import (
+	"bufio"
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -16,23 +19,37 @@ import (
 	"nyarelay/internal/node/metrics"
 	"nyarelay/internal/shared/model"
 	"nyarelay/internal/shared/protocol"
+	sharedvalidate "nyarelay/internal/shared/validate"
 )
 
 type Service struct {
-	log        *slog.Logger
-	nodeID     string
-	forwards   *metrics.Counters
-	tunnels    *metrics.Counters
-	selector   *candidateSelector
-	targets    *targetSelector
-	udp        *udpCandidateSessions
-	udpTargets *udpCandidateSessions
-	mu         sync.Mutex
-	cancel     context.CancelFunc
-	revision   int64
-	config     model.RelayConfig
-	servers    []io.Closer
+	log          *slog.Logger
+	nodeID       string
+	forwards     *metrics.Counters
+	tunnels      *metrics.Counters
+	selector     *candidateSelector
+	targets      *targetSelector
+	udp          *udpCandidateSessions
+	udpTargets   *udpCandidateSessions
+	mu           sync.RWMutex
+	cancel       context.CancelFunc
+	expireCancel context.CancelFunc
+	runtimeCtx   context.Context
+	revision     int64
+	config       model.RelayConfig
+	servers      []io.Closer
+	connSlots    chan struct{}
+	udpSlots     chan struct{}
 }
+
+const (
+	maxRelayConnections = 4096
+	maxUDPPacketWorkers = 1024
+	relayDialTimeout    = 10 * time.Second
+	relayDialBudget     = 30 * time.Second
+	relayHelloTimeout   = 10 * time.Second
+	wsStageReadTimeout  = 15 * time.Second
+)
 
 func New(log *slog.Logger, nodeID string) *Service {
 	return &Service{
@@ -44,31 +61,38 @@ func New(log *slog.Logger, nodeID string) *Service {
 		targets:    newTargetSelector(),
 		udp:        newUDPCandidateSessions(),
 		udpTargets: newUDPCandidateSessions(),
+		connSlots:  make(chan struct{}, maxRelayConnections),
+		udpSlots:   make(chan struct{}, maxUDPPacketWorkers),
 	}
 }
 
 func (s *Service) Apply(ctx context.Context, cfg model.RelayConfig) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if cfg.Revision != 0 && cfg.Revision == s.revision {
+	if !cfg.ExpiresAt.IsZero() && !time.Now().Before(cfg.ExpiresAt) {
+		return errors.New("relay config has expired")
+	}
+	if cfg.Revision != 0 && cfg.Revision == s.revision && s.cancel != nil {
+		if s.expireCancel != nil {
+			s.expireCancel()
+			s.expireCancel = nil
+		}
+		if !cfg.ExpiresAt.IsZero() {
+			expireCtx, expireCancel := context.WithCancel(s.runtimeCtx)
+			s.expireCancel = expireCancel
+			go s.expireConfig(expireCtx, cfg.Revision, cfg.ExpiresAt)
+		}
+		s.config = cfg
 		return nil
 	}
 	previousConfig := s.config
 	previousRevision := s.revision
-	if s.cancel != nil {
-		s.cancel()
-	}
-	for _, closer := range s.servers {
-		_ = closer.Close()
-	}
-	s.udp.clear()
-	s.udpTargets.clear()
-	s.selector.reset()
-	s.targets.reset()
+	s.stopRuntimeLocked()
 	s.selector.setFailTimeout(failureCooldownFromConfig(cfg))
 	s.targets.setFailTimeout(failureCooldownFromConfig(cfg))
 	runCtx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
+	s.runtimeCtx = runCtx
 	s.servers = nil
 	s.config = cfg
 	s.revision = cfg.Revision
@@ -80,6 +104,31 @@ func (s *Service) Apply(ctx context.Context, cfg model.RelayConfig) error {
 }
 
 func (s *Service) restorePreviousConfig(ctx context.Context, previousConfig model.RelayConfig, previousRevision int64) {
+	s.stopRuntimeLocked()
+	s.selector.setFailTimeout(failureCooldownFromConfig(previousConfig))
+	s.targets.setFailTimeout(failureCooldownFromConfig(previousConfig))
+	s.config = previousConfig
+	s.revision = previousRevision
+	if previousRevision == 0 && len(previousConfig.Forwards) == 0 && len(previousConfig.Tunnels) == 0 {
+		return
+	}
+	restoreCtx, restoreCancel := context.WithCancel(ctx)
+	s.cancel = restoreCancel
+	s.runtimeCtx = restoreCtx
+	s.servers = nil
+	s.config = previousConfig
+	s.revision = previousRevision
+	if err := s.startConfigLocked(restoreCtx, previousConfig); err != nil {
+		s.log.Error("restore previous config failed", "revision", previousRevision, "error", err)
+		s.stopRuntimeLocked()
+	}
+}
+
+func (s *Service) stopRuntimeLocked() {
+	if s.expireCancel != nil {
+		s.expireCancel()
+		s.expireCancel = nil
+	}
 	if s.cancel != nil {
 		s.cancel()
 	}
@@ -90,29 +139,17 @@ func (s *Service) restorePreviousConfig(ctx context.Context, previousConfig mode
 	s.udpTargets.clear()
 	s.selector.reset()
 	s.targets.reset()
-	s.selector.setFailTimeout(failureCooldownFromConfig(previousConfig))
-	s.targets.setFailTimeout(failureCooldownFromConfig(previousConfig))
 	s.cancel = nil
+	s.runtimeCtx = nil
 	s.servers = nil
-	s.config = previousConfig
-	s.revision = previousRevision
-	if previousRevision == 0 && len(previousConfig.Forwards) == 0 && len(previousConfig.Tunnels) == 0 {
-		return
-	}
-	restoreCtx, restoreCancel := context.WithCancel(ctx)
-	s.cancel = restoreCancel
-	s.servers = nil
-	s.config = previousConfig
-	s.revision = previousRevision
-	if err := s.startConfigLocked(restoreCtx, previousConfig); err != nil {
-		s.log.Error("restore previous config failed", "revision", previousRevision, "error", err)
-		restoreCancel()
-		s.cancel = nil
-		s.servers = nil
-	}
 }
 
 func (s *Service) startConfigLocked(ctx context.Context, cfg model.RelayConfig) error {
+	if !cfg.ExpiresAt.IsZero() {
+		expireCtx, expireCancel := context.WithCancel(ctx)
+		s.expireCancel = expireCancel
+		go s.expireConfig(expireCtx, cfg.Revision, cfg.ExpiresAt)
+	}
 	go s.udp.gcLoop(ctx)
 	go s.udpTargets.gcLoop(ctx)
 	for _, tunnel := range cfg.Tunnels {
@@ -133,7 +170,7 @@ func (s *Service) startConfigLocked(ctx context.Context, cfg model.RelayConfig) 
 		if !forward.Enabled {
 			continue
 		}
-		tunnel, ok := s.findTunnel(forward.TunnelID)
+		tunnel, ok := findTunnelInConfig(cfg, forward.TunnelID)
 		if !ok || !s.isEntryNode(tunnel) {
 			continue
 		}
@@ -151,6 +188,25 @@ func (s *Service) startConfigLocked(ctx context.Context, cfg model.RelayConfig) 
 		}
 	}
 	return nil
+}
+
+func (s *Service) expireConfig(ctx context.Context, revision int64, expiresAt time.Time) {
+	timer := time.NewTimer(time.Until(expiresAt))
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-timer.C:
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.revision != revision || s.cancel == nil {
+		return
+	}
+	s.stopRuntimeLocked()
+	s.config = model.RelayConfig{Revision: revision, NodeID: s.nodeID, ExpiresAt: expiresAt}
+	s.log.Warn("relay config expired; stopped runtime", "revision", revision)
 }
 
 func (s *Service) ForwardStats() []model.TrafficStat {
@@ -216,13 +272,22 @@ func (s *Service) listenWSStage(ctx context.Context, tunnel model.TunnelRuntime,
 	server := &http.Server{
 		Addr:              node.ListenAddr,
 		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       wsStageReadTimeout,
+		ReadHeaderTimeout: wsStageReadTimeout,
+		WriteTimeout:      wsStageReadTimeout,
+		IdleTimeout:       wsStageReadTimeout,
+		MaxHeaderBytes:    64 * 1024,
 	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Upgrade") != "nyarelay" {
 			http.NotFound(w, r)
 			return
 		}
+		if !s.tryAcquireConnection() {
+			http.Error(w, "relay connection limit reached", http.StatusServiceUnavailable)
+			return
+		}
+		defer s.releaseConnection()
 		hj, ok := w.(http.Hijacker)
 		if !ok {
 			http.Error(w, "hijacking is not supported", http.StatusInternalServerError)
@@ -265,7 +330,46 @@ func (s *Service) acceptLoop(ctx context.Context, ln net.Listener, handle func(n
 				continue
 			}
 		}
-		go handle(conn)
+		if !s.tryAcquireConnection() {
+			_ = conn.Close()
+			continue
+		}
+		go func() {
+			defer s.releaseConnection()
+			handle(conn)
+		}()
+	}
+}
+
+func (s *Service) tryAcquireConnection() bool {
+	select {
+	case s.connSlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Service) releaseConnection() {
+	select {
+	case <-s.connSlots:
+	default:
+	}
+}
+
+func (s *Service) tryAcquireUDPPacket() bool {
+	select {
+	case s.udpSlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Service) releaseUDPPacket() {
+	select {
+	case <-s.udpSlots:
+	default:
 	}
 }
 
@@ -279,16 +383,18 @@ func (s *Service) handleTCPForward(ctx context.Context, forward model.ForwardRun
 		return
 	}
 	defer s.closeConn(outbound, "tcp forward outbound")
-	s.pipe(inbound, outbound, counter, s.tunnels.Get(statID))
+	s.pipe(ctx, inbound, outbound, counter, s.tunnels.Get(statID))
 }
 
 func (s *Service) handleStageConn(ctx context.Context, tunnel model.TunnelRuntime, stage model.TunnelRuntimeStage, node model.TunnelRuntimeNode, inbound net.Conn) {
 	defer s.closeConn(inbound, "stage inbound")
+	_ = inbound.SetReadDeadline(time.Now().Add(relayHelloTimeout))
 	hello, err := protocol.ReadHello(inbound)
 	if err != nil {
 		s.log.Warn("invalid relay hello", "tunnel", tunnel.Name, "stage", stage.Index, "error", err)
 		return
 	}
+	_ = inbound.SetReadDeadline(time.Time{})
 	if err := s.validateHello(tunnel, stage, node, hello); err != nil {
 		s.log.Warn("relay hello rejected", "tunnel", tunnel.Name, "stage", stage.Index, "error", err)
 		return
@@ -311,7 +417,7 @@ func (s *Service) handleStageConn(ctx context.Context, tunnel model.TunnelRuntim
 			return
 		}
 		defer s.closeConn(outbound, "stage target outbound")
-		s.pipe(inbound, outbound, counter, s.tunnels.Get(statID))
+		s.pipe(ctx, inbound, outbound, counter, s.tunnels.Get(statID))
 		return
 	}
 	if hello.Network == "udp" {
@@ -324,10 +430,19 @@ func (s *Service) handleStageConn(ctx context.Context, tunnel model.TunnelRuntim
 		return
 	}
 	defer s.closeConn(next, "stage next outbound")
-	s.pipe(inbound, next, counter, s.tunnels.Get(statID))
+	s.pipe(ctx, inbound, next, counter, s.tunnels.Get(statID))
 }
 
 func (s *Service) validateHello(tunnel model.TunnelRuntime, stage model.TunnelRuntimeStage, node model.TunnelRuntimeNode, hello protocol.RelayHello) error {
+	if len(hello.TunnelID) > sharedvalidate.MaxIDBytes || len(hello.ForwardID) > sharedvalidate.MaxIDBytes {
+		return errors.New("relay hello identifier is too large")
+	}
+	if len(hello.Secret) > 256 {
+		return errors.New("relay hello secret is too large")
+	}
+	if stage.Index <= 0 || stage.Role == model.TunnelStageEntry {
+		return errors.New("invalid relay listener stage")
+	}
 	if hello.TunnelID != tunnel.ID {
 		return errors.New("tunnel id mismatch")
 	}
@@ -340,20 +455,35 @@ func (s *Service) validateHello(tunnel model.TunnelRuntime, stage model.TunnelRu
 	if hello.Network != "tcp" && hello.Network != "udp" {
 		return fmt.Errorf("unsupported network %q", hello.Network)
 	}
-	if node.Settings["secret"] != "" && hello.Secret != node.Settings["secret"] {
+	secret := node.Settings["secret"]
+	if secret == "" {
+		return errors.New("relay secret is missing")
+	}
+	wantSecret := sha256.Sum256([]byte(secret))
+	gotSecret := sha256.Sum256([]byte(hello.Secret))
+	if subtle.ConstantTimeCompare(wantSecret[:], gotSecret[:]) != 1 {
 		return errors.New("secret mismatch")
 	}
 	forward, ok := s.findForward(hello.ForwardID)
-	if !ok {
+	if !ok || !forward.Enabled {
 		return errors.New("forward not found")
+	}
+	if forward.TunnelID != tunnel.ID {
+		return errors.New("forward tunnel mismatch")
 	}
 	if !forwardSupports(forward, model.ForwardProtocol(hello.Network)) {
 		return errors.New("forward protocol mismatch")
+	}
+	if !runtimeNodeSupportsProtocol(node, model.ForwardProtocol(hello.Network)) {
+		return errors.New("stage node protocol mismatch")
 	}
 	return nil
 }
 
 func (s *Service) dialForwardNext(ctx context.Context, tunnel model.TunnelRuntime, forward model.ForwardRuntime, fromStageIndex int, network, sessionID string) (net.Conn, string, error) {
+	dialCtx, cancel := context.WithTimeout(ctx, relayDialBudget)
+	defer cancel()
+	ctx = dialCtx
 	if tunnel.Type == model.TunnelDirect {
 		conn, statID, _, err := s.dialForwardTarget(ctx, forward, network, sessionID)
 		return conn, statID, err
@@ -389,13 +519,16 @@ func (s *Service) dialForwardNext(ctx context.Context, tunnel model.TunnelRuntim
 }
 
 func (s *Service) dialForwardTarget(ctx context.Context, forward model.ForwardRuntime, network, sessionID string) (net.Conn, string, string, error) {
+	dialCtx, cancel := context.WithTimeout(ctx, relayDialBudget)
+	defer cancel()
+	ctx = dialCtx
 	var sessionKey string
 	if network == "udp" && sessionID != "" {
 		sessionKey = udpTargetSessionKey(forward.ID, sessionID)
 		if session, ok := s.udpTargets.get(sessionKey, time.Now()); ok {
 			if target, ok := forwardTargetAt(forward, session.candidateIndex); ok {
 				if target.ID == session.candidateNodeID && target.Enabled && targetSupportsProtocol(target.Protocols, model.ForwardProtocolUDP) {
-					conn, err := (&net.Dialer{}).DialContext(ctx, network, target.Address)
+					conn, err := dialRelayContext(ctx, network, target.Address)
 					if err == nil {
 						s.targets.recordSuccess(forward.ID, target.ID, network)
 						return conn, targetStatID(forward.ID, target.ID), target.ID, nil
@@ -420,7 +553,7 @@ func (s *Service) dialForwardTarget(ctx context.Context, forward model.ForwardRu
 		if !ok {
 			continue
 		}
-		conn, err := (&net.Dialer{}).DialContext(ctx, network, target.Address)
+		conn, err := dialRelayContext(ctx, network, target.Address)
 		if err != nil {
 			s.targets.recordFailure(forward.ID, target.ID, network)
 			lastErr = err
@@ -528,10 +661,12 @@ func (s *Service) dialStage(ctx context.Context, tunnel model.TunnelRuntime, nod
 	if addr == "" {
 		return nil, errors.New("stage has no connect address")
 	}
-	dialer := &net.Dialer{}
+	dialCtx, cancel := context.WithTimeout(ctx, relayDialTimeout)
+	defer cancel()
+	dialer := &net.Dialer{Timeout: relayDialTimeout, KeepAlive: 30 * time.Second}
 	switch tunnel.Transport {
 	case model.TunnelTransportTLS, model.TunnelTransportMTLS:
-		raw, err := dialer.DialContext(ctx, "tcp", addr)
+		raw, err := dialer.DialContext(dialCtx, "tcp", addr)
 		if err != nil {
 			return nil, err
 		}
@@ -545,15 +680,17 @@ func (s *Service) dialStage(ctx context.Context, tunnel model.TunnelRuntime, nod
 			return nil, err
 		}
 		tlsConn := tls.Client(raw, clientTLS)
-		if err := tlsConn.HandshakeContext(ctx); err != nil {
+		_ = tlsConn.SetDeadline(time.Now().Add(relayDialTimeout))
+		if err := tlsConn.HandshakeContext(dialCtx); err != nil {
 			if closeErr := tlsConn.Close(); closeErr != nil {
 				err = errors.Join(err, closeErr)
 			}
 			return nil, err
 		}
+		_ = tlsConn.SetDeadline(time.Time{})
 		return tlsConn, nil
 	case model.TunnelTransportWSTLS:
-		raw, err := dialer.DialContext(ctx, "tcp", addr)
+		raw, err := dialer.DialContext(dialCtx, "tcp", addr)
 		if err != nil {
 			return nil, err
 		}
@@ -561,13 +698,18 @@ func (s *Service) dialStage(ctx context.Context, tunnel model.TunnelRuntime, nod
 		if host == "" {
 			host = hostOnly(addr)
 		}
+		if strings.ContainsAny(host, "\r\n\t ") {
+			_ = raw.Close()
+			return nil, errors.New("invalid websocket host")
+		}
 		clientTLS, err := s.clientTLSConfig(tunnel, node, host)
 		if err != nil {
 			_ = raw.Close()
 			return nil, err
 		}
 		tlsConn := tls.Client(raw, clientTLS)
-		if err := tlsConn.HandshakeContext(ctx); err != nil {
+		_ = tlsConn.SetDeadline(time.Now().Add(relayDialTimeout))
+		if err := tlsConn.HandshakeContext(dialCtx); err != nil {
 			if closeErr := tlsConn.Close(); closeErr != nil {
 				err = errors.Join(err, closeErr)
 			}
@@ -578,24 +720,43 @@ func (s *Service) dialStage(ctx context.Context, tunnel model.TunnelRuntime, nod
 			_ = tlsConn.Close()
 			return nil, err
 		}
-		buf := make([]byte, 1024)
-		n, err := tlsConn.Read(buf)
+		response, err := http.ReadResponse(bufio.NewReader(tlsConn), &http.Request{Method: http.MethodGet})
 		if err != nil {
 			_ = tlsConn.Close()
 			return nil, err
 		}
-		if !strings.Contains(string(buf[:n]), "101") {
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusSwitchingProtocols ||
+			!strings.EqualFold(response.Header.Get("Upgrade"), "nyarelay") ||
+			!headerContainsToken(response.Header.Get("Connection"), "upgrade") {
 			_ = tlsConn.Close()
 			return nil, errors.New("websocket-style upgrade rejected")
 		}
+		_ = tlsConn.SetDeadline(time.Time{})
 		return tlsConn, nil
 	default:
-		return dialer.DialContext(ctx, "tcp", addr)
+		return dialer.DialContext(dialCtx, "tcp", addr)
 	}
 }
 
-func (s *Service) pipe(a, b net.Conn, forwardCounter *metrics.Counter, tunnelCounter *metrics.Counter) {
+func dialRelayContext(ctx context.Context, network, address string) (net.Conn, error) {
+	dialCtx, cancel := context.WithTimeout(ctx, relayDialTimeout)
+	defer cancel()
+	return (&net.Dialer{Timeout: relayDialTimeout, KeepAlive: 30 * time.Second}).DialContext(dialCtx, network, address)
+}
+
+func (s *Service) pipe(ctx context.Context, a, b net.Conn, forwardCounter *metrics.Counter, tunnelCounter *metrics.Counter) {
 	done := make(chan struct{}, 2)
+	stop := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = a.Close()
+			_ = b.Close()
+		case <-stop:
+		}
+	}()
+	defer close(stop)
 	copySide := func(dst, src net.Conn, addForward func(int64), addTunnel func(int64)) {
 		buf := make([]byte, 32*1024)
 		for {
@@ -637,7 +798,13 @@ func (s *Service) closeConn(conn net.Conn, name string) {
 }
 
 func (s *Service) findTunnel(id string) (model.TunnelRuntime, bool) {
-	for _, tunnel := range s.config.Tunnels {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return findTunnelInConfig(s.config, id)
+}
+
+func findTunnelInConfig(config model.RelayConfig, id string) (model.TunnelRuntime, bool) {
+	for _, tunnel := range config.Tunnels {
 		if tunnel.ID == id {
 			return tunnel, true
 		}
@@ -646,6 +813,8 @@ func (s *Service) findTunnel(id string) (model.TunnelRuntime, bool) {
 }
 
 func (s *Service) findForward(id string) (model.ForwardRuntime, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	for _, forward := range s.config.Forwards {
 		if forward.ID == id {
 			return forward, true
@@ -717,6 +886,15 @@ func trimEnclosingBrackets(value string) string {
 		return value[1 : len(value)-1]
 	}
 	return value
+}
+
+func headerContainsToken(value, token string) bool {
+	for _, part := range strings.Split(value, ",") {
+		if strings.EqualFold(strings.TrimSpace(part), token) {
+			return true
+		}
+	}
+	return false
 }
 
 type closerFunc func() error

@@ -7,7 +7,10 @@ import (
 	"io"
 )
 
-const MaxUDPPacket = 64 * 1024
+const (
+	MaxUDPPacket          = 64 * 1024
+	MaxUDPIdentifierBytes = 1024
+)
 
 type UDPDatagramFrame struct {
 	ForwardID string `json:"forward_id"`
@@ -16,6 +19,9 @@ type UDPDatagramFrame struct {
 }
 
 func WriteUDPDatagramFrame(w io.Writer, frame UDPDatagramFrame) error {
+	if len(frame.ForwardID) > MaxUDPIdentifierBytes || len(frame.SessionID) > MaxUDPIdentifierBytes {
+		return errors.New("udp frame identifier is too large")
+	}
 	payload, err := json.Marshal(frame)
 	if err != nil {
 		return err
@@ -48,6 +54,9 @@ func ReadUDPDatagramFrame(r io.Reader) (UDPDatagramFrame, error) {
 	var frame UDPDatagramFrame
 	if err := json.Unmarshal(payload, &frame); err != nil {
 		return UDPDatagramFrame{}, err
+	}
+	if len(frame.ForwardID) > MaxUDPIdentifierBytes || len(frame.SessionID) > MaxUDPIdentifierBytes {
+		return UDPDatagramFrame{}, errors.New("udp frame identifier is too large")
 	}
 	if len(frame.Payload) > MaxUDPPacket {
 		return UDPDatagramFrame{}, errors.New("udp payload is too large")

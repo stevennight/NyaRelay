@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	sharedcrypto "nyarelay/internal/shared/crypto"
@@ -172,6 +173,46 @@ func TestPerformUpdateVerifiesManifestAndReplacesBinary(t *testing.T) {
 	}
 	if string(got) != string(updatePayload) {
 		t.Fatalf("binary = %q", got)
+	}
+}
+
+func TestValidateUpdateRequestBindsRequestToNodeConfiguration(t *testing.T) {
+	cfg := Config{
+		ControllerURL: "https://relay.example.com/",
+		NodeID:        "node-1",
+		NodeToken:     "node-token",
+	}
+	base := model.NodeUpdateRequest{
+		ControllerURL: cfg.ControllerURL,
+		NodeID:        cfg.NodeID,
+		NodeToken:     cfg.NodeToken,
+		TargetVersion: "v0.1.4",
+		OS:            runtime.GOOS,
+		Arch:          runtime.GOARCH,
+		SHA256:        strings.Repeat("a", sha256.Size*2),
+	}
+	if err := validateUpdateRequest(cfg, base); err != nil {
+		t.Fatalf("valid update request rejected: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*model.NodeUpdateRequest)
+	}{
+		{name: "controller", mutate: func(req *model.NodeUpdateRequest) { req.ControllerURL = "https://attacker.example.com" }},
+		{name: "node id", mutate: func(req *model.NodeUpdateRequest) { req.NodeID = "node-2" }},
+		{name: "node token", mutate: func(req *model.NodeUpdateRequest) { req.NodeToken = "other-token" }},
+		{name: "platform", mutate: func(req *model.NodeUpdateRequest) { req.Arch = "other-arch" }},
+		{name: "digest", mutate: func(req *model.NodeUpdateRequest) { req.SHA256 = "not-a-digest" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := base
+			tt.mutate(&req)
+			if err := validateUpdateRequest(cfg, req); err == nil {
+				t.Fatal("expected update request to be rejected")
+			}
+		})
 	}
 }
 

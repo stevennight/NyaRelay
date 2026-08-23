@@ -147,7 +147,7 @@ describe('node pages', () => {
           token: 'node-token-123',
           script_url: 'https://relay.example.com/install.sh',
           binary_url: 'https://relay.example.com/downloads/nyarelay-node',
-          command: 'curl -fsSL https://relay.example.com/install.sh | sudo sh -s -- --controller https://relay.example.com --id node-2 --token node-token-123 --signing-key pub-key',
+          command: 'curl -fsS https://relay.example.com/install.sh | sudo sh -s -- --controller https://relay.example.com --id node-2 --token node-token-123 --signing-key pub-key',
         }),
       },
       {
@@ -172,7 +172,7 @@ describe('node pages', () => {
     fireEvent.click(screen.getByRole('button', { name: '生成节点凭据' }))
 
     expect(await screen.findByText('节点安装命令')).toBeInTheDocument()
-    expect(screen.getByText(/curl -fsSL https:\/\/relay\.example\.com\/install\.sh/)).toBeInTheDocument()
+    expect(screen.getByText(/curl -fsS https:\/\/relay\.example\.com\/install\.sh/)).toBeInTheDocument()
     expect(screen.getByText('下载脚本')).toBeInTheDocument()
     expect(screen.getByRole('link', { name: '节点详情' })).toHaveAttribute('href', '/nodes/node-2')
 
@@ -206,7 +206,7 @@ describe('node pages', () => {
           token: 'node-token-123',
           script_url: 'https://relay.example.com/install.sh',
           binary_url: 'https://relay.example.com/downloads/nyarelay-node',
-          command: 'curl -fsSL https://relay.example.com/install.sh | sudo sh -s -- --controller https://relay.example.com --id node-2 --token node-token-123 --signing-key pub-key',
+          command: 'curl -fsS https://relay.example.com/install.sh | sudo sh -s -- --controller https://relay.example.com --id node-2 --token node-token-123 --signing-key pub-key',
         }),
       },
       {
@@ -257,7 +257,7 @@ describe('node pages', () => {
           token: 'node-token-123',
           script_url: 'https://relay.example.com/install.sh',
           binary_url: 'https://relay.example.com/downloads/nyarelay-node',
-          command: 'curl -fsSL https://relay.example.com/install.sh | sudo sh -s -- --controller https://relay.example.com --id node-1 --token node-token-123 --signing-key pub-key',
+          command: 'curl -fsS https://relay.example.com/install.sh | sudo sh -s -- --controller https://relay.example.com --id node-1 --token node-token-123 --signing-key pub-key',
         }),
       },
       {
@@ -296,7 +296,7 @@ describe('node pages', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '安装命令' }))
     expect(await screen.findByText('节点安装命令')).toBeInTheDocument()
-    expect(screen.getByText(/curl -fsSL https:\/\/relay\.example\.com\/install\.sh/)).toBeInTheDocument()
+    expect(screen.getByText(/curl -fsS https:\/\/relay\.example\.com\/install\.sh/)).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: '吊销' }))
 

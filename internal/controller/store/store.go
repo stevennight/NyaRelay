@@ -2,10 +2,20 @@ package store
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -17,9 +27,21 @@ import (
 
 const singleCandidateStrategyMigrationSetting = "migration_single_candidate_strategies_v1"
 
+const (
+	nodeTokenKeyBytes       = 32
+	maxNodeTokenCipherBytes = 4096
+	secretKeyBytes          = 32
+	maxSecretCipherBytes    = 1 << 20
+	secretCipherPrefix      = "nyarelay-secret-v1:"
+)
+
 type Store struct {
-	db *sql.DB
+	db        *sql.DB
+	tokenKey  []byte
+	secretKey []byte
 }
+
+var ErrSetupComplete = errors.New("setup is already complete")
 
 type User struct {
 	ID           int64     `json:"id"`
@@ -30,13 +52,43 @@ type User struct {
 }
 
 func Open(ctx context.Context, path string) (*Store, error) {
+	// Open is kept for embedded callers and tests. The controller uses
+	// OpenWithSecretKey so its encrypted values survive a restart.
+	secretKey, err := newNodeTokenKey()
+	if err != nil {
+		return nil, err
+	}
+	return OpenWithSecretKey(ctx, path, secretKey)
+}
+
+func OpenWithSecretKey(ctx context.Context, path string, secretKey []byte) (*Store, error) {
+	if len(secretKey) != secretKeyBytes {
+		return nil, fmt.Errorf("store secret key must be exactly %d bytes", secretKeyBytes)
+	}
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	s := &Store{db: db}
+	tokenKey, err := loadNodeTokenKey(path)
+	if err != nil {
+		closeDB(db)
+		return nil, err
+	}
+	s := &Store{db: db, tokenKey: tokenKey, secretKey: append([]byte(nil), secretKey...)}
 	if err := s.migrate(ctx); err != nil {
+		closeDB(db)
+		return nil, err
+	}
+	if err := s.migrateNodeTokens(ctx); err != nil {
+		closeDB(db)
+		return nil, err
+	}
+	if err := s.migrateSensitiveSecrets(ctx); err != nil {
+		closeDB(db)
+		return nil, err
+	}
+	if err := secureSQLiteFiles(path); err != nil {
 		closeDB(db)
 		return nil, err
 	}
@@ -44,7 +96,14 @@ func Open(ctx context.Context, path string) (*Store, error) {
 }
 
 func (s *Store) Close() error {
-	return s.db.Close()
+	err := s.db.Close()
+	for i := range s.tokenKey {
+		s.tokenKey[i] = 0
+	}
+	for i := range s.secretKey {
+		s.secretKey[i] = 0
+	}
+	return err
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -66,6 +125,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			id TEXT PRIMARY KEY,
 			name TEXT NOT NULL,
 			token TEXT NOT NULL,
+			token_encrypted TEXT NOT NULL DEFAULT '',
 			status TEXT NOT NULL,
 			version TEXT NOT NULL DEFAULT '',
 			desired_version TEXT NOT NULL DEFAULT '',
@@ -230,6 +290,7 @@ func (s *Store) ensureNodeColumns(ctx context.Context) error {
 		{name: "update_error", sql: `ALTER TABLE nodes ADD COLUMN update_error TEXT NOT NULL DEFAULT ''`},
 		{name: "update_requested_at", sql: `ALTER TABLE nodes ADD COLUMN update_requested_at TEXT NOT NULL DEFAULT ''`},
 		{name: "update_finished_at", sql: `ALTER TABLE nodes ADD COLUMN update_finished_at TEXT NOT NULL DEFAULT ''`},
+		{name: "token_encrypted", sql: `ALTER TABLE nodes ADD COLUMN token_encrypted TEXT NOT NULL DEFAULT ''`},
 	} {
 		if !columns[column.name] {
 			if _, err := s.db.ExecContext(ctx, column.sql); err != nil {
@@ -387,6 +448,240 @@ func (s *Store) tableColumns(ctx context.Context, table string) (map[string]bool
 	return columns, rows.Err()
 }
 
+func (s *Store) migrateNodeTokens(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, token, token_encrypted FROM nodes`)
+	if err != nil {
+		return err
+	}
+	type nodeToken struct {
+		id        string
+		encrypted string
+	}
+	var pending []nodeToken
+	for rows.Next() {
+		var id, legacy, encrypted string
+		if err := rows.Scan(&id, &legacy, &encrypted); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if encrypted != "" {
+			if _, err := s.decryptNodeToken(id, encrypted); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("decrypt node token %s: %w", id, err)
+			}
+		}
+		if legacy != "" {
+			if encrypted == "" {
+				encrypted, err = s.encryptNodeToken(id, legacy)
+				if err != nil {
+					_ = rows.Close()
+					return err
+				}
+			}
+			pending = append(pending, nodeToken{id: id, encrypted: encrypted})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer rollbackTx(tx)
+	for _, token := range pending {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE nodes SET token = '', token_encrypted = ? WHERE id = ?`,
+			token.encrypted, token.id,
+		); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return s.compactDatabase(ctx)
+}
+
+// migrateSensitiveSecrets removes legacy plaintext values and validates all
+// encrypted values with the configured controller key before the server uses
+// the database.
+func (s *Store) migrateSensitiveSecrets(ctx context.Context) error {
+	type valueUpdate struct {
+		query string
+		args  []any
+		value string
+	}
+	var updates []valueUpdate
+
+	rows, err := s.db.QueryContext(ctx, `SELECT id, totp_secret FROM users`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var userID int64
+		var secret string
+		if err := rows.Scan(&userID, &secret); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if secret == "" {
+			continue
+		}
+		protected, err := s.encryptSecretValue(secret, fmt.Sprintf("user:%d:totp", userID))
+		if err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("migrate TOTP secret for user %d: %w", userID, err)
+		}
+		if protected != secret {
+			updates = append(updates, valueUpdate{
+				query: `UPDATE users SET totp_secret = ? WHERE id = ?`,
+				args:  []any{userID},
+				value: protected,
+			})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	rows, err = s.db.QueryContext(ctx, `SELECT key, value FROM settings WHERE key = 'config_signing_private_key'`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		protected, err := s.encryptSettingValue(key, value)
+		if err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("migrate setting %s: %w", key, err)
+		}
+		if protected != value {
+			updates = append(updates, valueUpdate{
+				query: `UPDATE settings SET value = ? WHERE key = ?`,
+				args:  []any{key},
+				value: protected,
+			})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	rows, err = s.db.QueryContext(ctx, `SELECT id, settings_json FROM tunnels`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var id, raw string
+		if err := rows.Scan(&id, &raw); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		protected, changed, err := s.migrateSettingsJSON(raw, "tunnel:"+id)
+		if err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("migrate tunnel settings %s: %w", id, err)
+		}
+		if changed {
+			updates = append(updates, valueUpdate{
+				query: `UPDATE tunnels SET settings_json = ? WHERE id = ?`,
+				args:  []any{id},
+				value: protected,
+			})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	rows, err = s.db.QueryContext(ctx, `SELECT id, settings_json FROM tunnel_stage_nodes`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var id, raw string
+		if err := rows.Scan(&id, &raw); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		protected, changed, err := s.migrateSettingsJSON(raw, "stage-node:"+id)
+		if err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("migrate tunnel stage settings %s: %w", id, err)
+		}
+		if changed {
+			updates = append(updates, valueUpdate{
+				query: `UPDATE tunnel_stage_nodes SET settings_json = ? WHERE id = ?`,
+				args:  []any{id},
+				value: protected,
+			})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	for _, update := range updates {
+		args := append([]any{update.value}, update.args...)
+		if _, err := s.db.ExecContext(ctx, update.query, args...); err != nil {
+			return err
+		}
+	}
+	if len(updates) > 0 {
+		if err := s.compactDatabase(ctx); err != nil {
+			return fmt.Errorf("compact migrated secrets: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) migrateSettingsJSON(raw, aad string) (string, bool, error) {
+	var settings map[string]string
+	if err := json.Unmarshal([]byte(raw), &settings); err != nil {
+		return "", false, err
+	}
+	protected, changed, err := s.protectSettings(settings, aad)
+	if err != nil {
+		return "", false, err
+	}
+	if !changed {
+		return raw, false, nil
+	}
+	payload, err := json.Marshal(protected)
+	if err != nil {
+		return "", false, err
+	}
+	return string(payload), true, nil
+}
+
 func (s *Store) UserCount(ctx context.Context) (int, error) {
 	var count int
 	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&count)
@@ -404,6 +699,42 @@ func (s *Store) CreateUser(ctx context.Context, username, passwordHash string) (
 	}
 	id, err := res.LastInsertId()
 	if err != nil {
+		return User{}, err
+	}
+	return User{ID: id, Username: username, PasswordHash: passwordHash, CreatedAt: now}, nil
+}
+
+// CreateInitialUser inserts the first user only while holding the database
+// transaction, so two concurrent setup requests cannot both become admins.
+func (s *Store) CreateInitialUser(ctx context.Context, username, passwordHash string) (User, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return User{}, err
+	}
+	defer rollbackTx(tx)
+
+	now := time.Now().UTC()
+	res, err := tx.ExecContext(ctx,
+		`INSERT INTO users (username, password_hash, created_at)
+		 SELECT ?, ?, ?
+		 WHERE NOT EXISTS (SELECT 1 FROM users)`,
+		username, passwordHash, now.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return User{}, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return User{}, err
+	}
+	if rows == 0 {
+		return User{}, ErrSetupComplete
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return User{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return User{}, err
 	}
 	return User{ID: id, Username: username, PasswordHash: passwordHash, CreatedAt: now}, nil
@@ -432,11 +763,19 @@ func (s *Store) TOTPSecret(ctx context.Context, userID int64) (string, bool, err
 	if err != nil {
 		return "", false, err
 	}
+	secret, err = s.decryptSecretValue(secret, fmt.Sprintf("user:%d:totp", userID))
+	if err != nil {
+		return "", false, err
+	}
 	return secret, enabled == 1, nil
 }
 
 func (s *Store) SetTOTPSecret(ctx context.Context, userID int64, secret string, enabled bool) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE users SET totp_secret = ?, totp_enabled = ? WHERE id = ?`, secret, boolInt(enabled), userID)
+	encrypted, err := s.encryptSecretValue(secret, fmt.Sprintf("user:%d:totp", userID))
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `UPDATE users SET totp_secret = ?, totp_enabled = ? WHERE id = ?`, encrypted, boolInt(enabled), userID)
 	return err
 }
 
@@ -446,6 +785,10 @@ func (s *Store) GetSetting(ctx context.Context, key string) (string, bool, error
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}
+	if err != nil {
+		return "", false, err
+	}
+	value, err = s.decryptSettingValue(key, value)
 	if err != nil {
 		return "", false, err
 	}
@@ -464,13 +807,21 @@ func (s *Store) SettingsPrefix(ctx context.Context, prefix string) (map[string]s
 		if err := rows.Scan(&key, &value); err != nil {
 			return nil, err
 		}
+		value, err = s.decryptSettingValue(key, value)
+		if err != nil {
+			return nil, err
+		}
 		out[key] = value
 	}
 	return out, rows.Err()
 }
 
 func (s *Store) SetSetting(ctx context.Context, key, value string) error {
-	_, err := s.db.ExecContext(ctx,
+	value, err := s.encryptSettingValue(key, value)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx,
 		`INSERT INTO settings (key, value) VALUES (?, ?)
 		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
 		key, value,
@@ -479,12 +830,20 @@ func (s *Store) SetSetting(ctx context.Context, key, value string) error {
 }
 
 func (s *Store) SetSettings(ctx context.Context, values map[string]string) error {
+	encryptedValues := make(map[string]string, len(values))
+	for key, value := range values {
+		encrypted, err := s.encryptSettingValue(key, value)
+		if err != nil {
+			return err
+		}
+		encryptedValues[key] = encrypted
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer rollbackTx(tx)
-	for key, value := range values {
+	for key, value := range encryptedValues {
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO settings (key, value) VALUES (?, ?)
 			 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
@@ -517,14 +876,20 @@ func (s *Store) UpsertNode(ctx context.Context, node model.Node, token string) e
 	if !node.UpdateFinishedAt.IsZero() {
 		updateFinishedAt = node.UpdateFinishedAt.UTC().Format(time.RFC3339Nano)
 	}
-	_, err := s.db.ExecContext(ctx,
+	encryptedToken, err := s.encryptNodeToken(node.ID, token)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx,
 		`INSERT INTO nodes
-		 (id, name, token, status, version, desired_version, update_status, update_error, update_requested_at, update_finished_at,
-		  labels_json, public_host, port_min, port_max, approved, revoked, last_seen, created_at, updated_at, system_json)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(id) DO UPDATE SET
-		   name = excluded.name,
-		   status = excluded.status,
+			 (id, name, token, token_encrypted, status, version, desired_version, update_status, update_error, update_requested_at, update_finished_at,
+			  labels_json, public_host, port_min, port_max, approved, revoked, last_seen, created_at, updated_at, system_json)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(id) DO UPDATE SET
+			   name = excluded.name,
+			   token = excluded.token,
+			   token_encrypted = excluded.token_encrypted,
+			   status = excluded.status,
 		   version = excluded.version,
 		   desired_version = excluded.desired_version,
 		   update_status = excluded.update_status,
@@ -540,7 +905,7 @@ func (s *Store) UpsertNode(ctx context.Context, node model.Node, token string) e
 		   last_seen = excluded.last_seen,
 		   updated_at = excluded.updated_at,
 		   system_json = excluded.system_json`,
-		node.ID, node.Name, token, string(node.Status), node.Version, node.DesiredVersion, string(node.UpdateStatus), node.UpdateError,
+		node.ID, node.Name, "", encryptedToken, string(node.Status), node.Version, node.DesiredVersion, string(node.UpdateStatus), node.UpdateError,
 		updateRequestedAt, updateFinishedAt, string(labels), node.PublicHost, node.PortMin, node.PortMax,
 		boolInt(node.Approved), boolInt(node.Revoked), lastSeen,
 		node.CreatedAt.UTC().Format(time.RFC3339Nano), node.UpdatedAt.UTC().Format(time.RFC3339Nano), string(system),
@@ -571,7 +936,9 @@ func (s *Store) AuthenticateNode(ctx context.Context, id, token string) (model.N
 	if err != nil {
 		return model.Node{}, err
 	}
-	if storedToken != token || node.Revoked || !node.Approved {
+	storedDigest := sha256.Sum256([]byte(storedToken))
+	providedDigest := sha256.Sum256([]byte(token))
+	if subtle.ConstantTimeCompare(storedDigest[:], providedDigest[:]) != 1 || node.Revoked || !node.Approved {
 		return model.Node{}, errors.New("node is not authorized")
 	}
 	return node, nil
@@ -579,16 +946,16 @@ func (s *Store) AuthenticateNode(ctx context.Context, id, token string) (model.N
 
 func (s *Store) GetNodeWithToken(ctx context.Context, id string) (model.Node, string, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, name, token, status, version, desired_version, update_status, update_error, update_requested_at, update_finished_at,
+		`SELECT id, name, token, token_encrypted, status, version, desired_version, update_status, update_error, update_requested_at, update_finished_at,
 		        labels_json, public_host, port_min, port_max, approved, revoked, last_seen, created_at, updated_at, system_json
 		 FROM nodes WHERE id = ?`, id,
 	)
-	return scanNode(row)
+	return s.scanNode(row)
 }
 
 func (s *Store) ListNodes(ctx context.Context) ([]model.Node, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, name, token, status, version, desired_version, update_status, update_error, update_requested_at, update_finished_at,
+		`SELECT id, name, token, token_encrypted, status, version, desired_version, update_status, update_error, update_requested_at, update_finished_at,
 		        labels_json, public_host, port_min, port_max, approved, revoked, last_seen, created_at, updated_at, system_json
 		 FROM nodes WHERE revoked = 0 ORDER BY created_at DESC`,
 	)
@@ -598,7 +965,7 @@ func (s *Store) ListNodes(ctx context.Context) ([]model.Node, error) {
 	defer closeRows(rows)
 	var out []model.Node
 	for rows.Next() {
-		node, _, err := scanNode(rows)
+		node, _, err := s.scanNode(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -609,11 +976,11 @@ func (s *Store) ListNodes(ctx context.Context) ([]model.Node, error) {
 
 func (s *Store) GetNode(ctx context.Context, id string) (model.Node, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, name, token, status, version, desired_version, update_status, update_error, update_requested_at, update_finished_at,
+		`SELECT id, name, token, token_encrypted, status, version, desired_version, update_status, update_error, update_requested_at, update_finished_at,
 		        labels_json, public_host, port_min, port_max, approved, revoked, last_seen, created_at, updated_at, system_json
 		 FROM nodes WHERE id = ?`, id,
 	)
-	node, _, err := scanNode(row)
+	node, _, err := s.scanNode(row)
 	return node, err
 }
 
@@ -715,11 +1082,17 @@ func (s *Store) MarkNodeOffline(ctx context.Context, id string) error {
 
 func (s *Store) RevokeNode(ctx context.Context, id string) error {
 	now := time.Now().UTC()
-	_, err := s.db.ExecContext(ctx,
+	res, err := s.db.ExecContext(ctx,
 		`UPDATE nodes SET revoked = 1, status = ?, updated_at = ? WHERE id = ?`,
 		string(model.NodeRevoked), now.Format(time.RFC3339Nano), id,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
+		return errors.New("node not found")
+	}
+	return nil
 }
 
 func (s *Store) SaveTunnel(ctx context.Context, tunnel model.Tunnel, allocations []model.PortAllocation) (int64, error) {
@@ -733,7 +1106,14 @@ func (s *Store) SaveTunnel(ctx context.Context, tunnel model.Tunnel, allocations
 		tunnel.CreatedAt = now
 	}
 	tunnel.UpdatedAt = now
-	settings, _ := json.Marshal(emptyMap(tunnel.Settings))
+	protectedSettings, _, err := s.protectSettings(emptyMap(tunnel.Settings), "tunnel:"+tunnel.ID)
+	if err != nil {
+		return 0, err
+	}
+	settings, err := json.Marshal(protectedSettings)
+	if err != nil {
+		return 0, err
+	}
 	_, err = tx.ExecContext(ctx,
 		`INSERT INTO tunnels (id, name, type, transport, entry_address, enabled, settings_json, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -790,7 +1170,14 @@ func (s *Store) SaveTunnel(ctx context.Context, tunnel model.Tunnel, allocations
 				node.Weight = 1
 			}
 			protocols, _ := json.Marshal(node.Protocols)
-			nodeSettings, _ := json.Marshal(emptyMap(node.Settings))
+			protectedNodeSettings, _, err := s.protectSettings(emptyMap(node.Settings), "stage-node:"+node.ID)
+			if err != nil {
+				return 0, err
+			}
+			nodeSettings, err := json.Marshal(protectedNodeSettings)
+			if err != nil {
+				return 0, err
+			}
 			if _, err := tx.ExecContext(ctx,
 				`INSERT INTO tunnel_stage_nodes
 				 (id, tunnel_id, stage_id, node_id, listen_addr, public_addr, connect_addr, weight, protocols_json, settings_json, created_at, updated_at)
@@ -823,7 +1210,7 @@ func (s *Store) ListTunnels(ctx context.Context) ([]model.Tunnel, error) {
 	defer closeRows(rows)
 	var out []model.Tunnel
 	for rows.Next() {
-		tunnel, err := scanTunnel(rows)
+		tunnel, err := s.scanTunnel(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -848,7 +1235,7 @@ func (s *Store) GetTunnel(ctx context.Context, id string) (model.Tunnel, error) 
 		`SELECT id, name, type, transport, entry_address, enabled, settings_json, created_at, updated_at
 		 FROM tunnels WHERE id = ?`, id,
 	)
-	tunnel, err := scanTunnel(row)
+	tunnel, err := s.scanTunnel(row)
 	if err != nil {
 		return model.Tunnel{}, err
 	}
@@ -982,7 +1369,7 @@ func (s *Store) listStageNodes(ctx context.Context, stageID string) ([]model.Tun
 	defer closeRows(rows)
 	var out []model.TunnelStageNode
 	for rows.Next() {
-		node, err := scanTunnelStageNode(rows)
+		node, err := s.scanTunnelStageNode(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -1281,7 +1668,7 @@ func (s *Store) MetricSummary(ctx context.Context, limit int) ([]MetricSummary, 
 		limit = 100
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT stat_id, stat_kind, SUM(bytes_in), SUM(bytes_out), SUM(connections), MAX(observed_at)
+		`SELECT stat_id, stat_kind, total(bytes_in), total(bytes_out), total(connections), MAX(observed_at)
 		 FROM metrics
 		 GROUP BY stat_id, stat_kind
 		 ORDER BY MAX(observed_at) DESC
@@ -1294,12 +1681,27 @@ func (s *Store) MetricSummary(ctx context.Context, limit int) ([]MetricSummary, 
 	var out []MetricSummary
 	for rows.Next() {
 		var item MetricSummary
-		if err := rows.Scan(&item.StatID, &item.Kind, &item.BytesIn, &item.BytesOut, &item.Connections, &item.LastSeen); err != nil {
+		var bytesIn, bytesOut, connections float64
+		if err := rows.Scan(&item.StatID, &item.Kind, &bytesIn, &bytesOut, &connections, &item.LastSeen); err != nil {
 			return nil, err
 		}
+		item.BytesIn = saturatingMetricTotal(bytesIn)
+		item.BytesOut = saturatingMetricTotal(bytesOut)
+		item.Connections = saturatingMetricTotal(connections)
 		out = append(out, item)
 	}
 	return out, rows.Err()
+}
+
+func saturatingMetricTotal(value float64) int64 {
+	if math.IsNaN(value) || value <= 0 {
+		return 0
+	}
+	const maxInt64AsFloat = float64(1<<63 - 1)
+	if math.IsInf(value, 1) || value >= maxInt64AsFloat {
+		return int64(^uint64(0) >> 1)
+	}
+	return int64(value)
 }
 
 func (s *Store) BumpRevision(ctx context.Context) (int64, error) {
@@ -1368,14 +1770,14 @@ type scanner interface {
 	Scan(dest ...any) error
 }
 
-func scanNode(row scanner) (model.Node, string, error) {
+func (s *Store) scanNode(row scanner) (model.Node, string, error) {
 	var node model.Node
-	var token, status, updateStatus, labelsJSON, publicHost, lastSeen, created, updated, systemJSON string
+	var token, encryptedToken, status, updateStatus, labelsJSON, publicHost, lastSeen, created, updated, systemJSON string
 	var updateRequestedAt, updateFinishedAt string
 	var portMin, portMax int
 	var approved, revoked int
 	err := row.Scan(
-		&node.ID, &node.Name, &token, &status, &node.Version, &node.DesiredVersion, &updateStatus, &node.UpdateError,
+		&node.ID, &node.Name, &token, &encryptedToken, &status, &node.Version, &node.DesiredVersion, &updateStatus, &node.UpdateError,
 		&updateRequestedAt, &updateFinishedAt, &labelsJSON, &publicHost, &portMin, &portMax, &approved, &revoked,
 		&lastSeen, &created, &updated, &systemJSON,
 	)
@@ -1396,10 +1798,14 @@ func scanNode(row scanner) (model.Node, string, error) {
 	node.UpdatedAt = parseTime(updated)
 	_ = json.Unmarshal([]byte(labelsJSON), &node.Labels)
 	_ = json.Unmarshal([]byte(systemJSON), &node.System)
-	return node, token, nil
+	resolvedToken, err := s.resolveNodeToken(node.ID, token, encryptedToken)
+	if err != nil {
+		return model.Node{}, "", err
+	}
+	return node, resolvedToken, nil
 }
 
-func scanTunnel(row scanner) (model.Tunnel, error) {
+func (s *Store) scanTunnel(row scanner) (model.Tunnel, error) {
 	var tunnel model.Tunnel
 	var tunnelType, transport, settingsJSON, created, updated string
 	var enabled int
@@ -1412,7 +1818,13 @@ func scanTunnel(row scanner) (model.Tunnel, error) {
 	tunnel.Enabled = enabled == 1
 	tunnel.CreatedAt = parseTime(created)
 	tunnel.UpdatedAt = parseTime(updated)
-	_ = json.Unmarshal([]byte(settingsJSON), &tunnel.Settings)
+	if err := json.Unmarshal([]byte(settingsJSON), &tunnel.Settings); err != nil {
+		return model.Tunnel{}, fmt.Errorf("decode tunnel settings: %w", err)
+	}
+	tunnel.Settings, err = s.unprotectSettings(tunnel.Settings, "tunnel:"+tunnel.ID)
+	if err != nil {
+		return model.Tunnel{}, err
+	}
 	return tunnel, nil
 }
 
@@ -1429,7 +1841,7 @@ func scanTunnelStage(row scanner) (model.TunnelStage, error) {
 	return stage, nil
 }
 
-func scanTunnelStageNode(row scanner) (model.TunnelStageNode, error) {
+func (s *Store) scanTunnelStageNode(row scanner) (model.TunnelStageNode, error) {
 	var node model.TunnelStageNode
 	var protocolsJSON, settingsJSON, created, updated string
 	err := row.Scan(&node.ID, &node.TunnelID, &node.StageID, &node.NodeID, &node.ListenAddr, &node.PublicAddr,
@@ -1439,8 +1851,16 @@ func scanTunnelStageNode(row scanner) (model.TunnelStageNode, error) {
 	}
 	node.CreatedAt = parseTime(created)
 	node.UpdatedAt = parseTime(updated)
-	_ = json.Unmarshal([]byte(protocolsJSON), &node.Protocols)
-	_ = json.Unmarshal([]byte(settingsJSON), &node.Settings)
+	if err := json.Unmarshal([]byte(protocolsJSON), &node.Protocols); err != nil {
+		return model.TunnelStageNode{}, fmt.Errorf("decode tunnel stage protocols: %w", err)
+	}
+	if err := json.Unmarshal([]byte(settingsJSON), &node.Settings); err != nil {
+		return model.TunnelStageNode{}, fmt.Errorf("decode tunnel stage settings: %w", err)
+	}
+	node.Settings, err = s.unprotectSettings(node.Settings, "stage-node:"+node.ID)
+	if err != nil {
+		return model.TunnelStageNode{}, err
+	}
 	return node, nil
 }
 
@@ -1536,6 +1956,189 @@ func parseTime(value string) time.Time {
 	return t
 }
 
+func (s *Store) resolveNodeToken(nodeID, legacy, encrypted string) (string, error) {
+	if encrypted != "" {
+		return s.decryptNodeToken(nodeID, encrypted)
+	}
+	return legacy, nil
+}
+
+func (s *Store) encryptNodeToken(nodeID, token string) (string, error) {
+	if token == "" {
+		return "", nil
+	}
+	if len(s.tokenKey) != nodeTokenKeyBytes {
+		return "", errors.New("node token encryption key is unavailable")
+	}
+	block, err := aes.NewCipher(s.tokenKey)
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return "", err
+	}
+	sealed := gcm.Seal(nil, nonce, []byte(token), []byte(nodeID))
+	payload := make([]byte, 0, len(nonce)+len(sealed))
+	payload = append(payload, nonce...)
+	payload = append(payload, sealed...)
+	return base64.RawURLEncoding.EncodeToString(payload), nil
+}
+
+func (s *Store) decryptNodeToken(nodeID, encrypted string) (string, error) {
+	if encrypted == "" {
+		return "", nil
+	}
+	if len(encrypted) > maxNodeTokenCipherBytes {
+		return "", errors.New("encrypted node token is too large")
+	}
+	if len(s.tokenKey) != nodeTokenKeyBytes {
+		return "", errors.New("node token encryption key is unavailable")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(encrypted)
+	if err != nil {
+		return "", errors.New("invalid encrypted node token")
+	}
+	block, err := aes.NewCipher(s.tokenKey)
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	if len(payload) < gcm.NonceSize()+gcm.Overhead() {
+		return "", errors.New("invalid encrypted node token")
+	}
+	plain, err := gcm.Open(nil, payload[:gcm.NonceSize()], payload[gcm.NonceSize():], []byte(nodeID))
+	if err != nil {
+		return "", errors.New("invalid encrypted node token")
+	}
+	return string(plain), nil
+}
+
+func (s *Store) encryptSecretValue(value, aad string) (string, error) {
+	if value == "" {
+		return "", nil
+	}
+	if strings.HasPrefix(value, secretCipherPrefix) {
+		if _, err := s.decryptSecretValue(value, aad); err != nil {
+			return "", err
+		}
+		return value, nil
+	}
+	if len(value) > maxSecretCipherBytes {
+		return "", errors.New("secret value is too large")
+	}
+	if len(s.secretKey) != secretKeyBytes {
+		return "", errors.New("store secret key is unavailable")
+	}
+	block, err := aes.NewCipher(s.secretKey)
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return "", err
+	}
+	sealed := gcm.Seal(nil, nonce, []byte(value), []byte(aad))
+	payload := make([]byte, 0, len(nonce)+len(sealed))
+	payload = append(payload, nonce...)
+	payload = append(payload, sealed...)
+	return secretCipherPrefix + base64.RawURLEncoding.EncodeToString(payload), nil
+}
+
+func (s *Store) decryptSecretValue(value, aad string) (string, error) {
+	if value == "" || !strings.HasPrefix(value, secretCipherPrefix) {
+		return value, nil
+	}
+	if len(value) > maxSecretCipherBytes {
+		return "", errors.New("encrypted secret value is too large")
+	}
+	if len(s.secretKey) != secretKeyBytes {
+		return "", errors.New("store secret key is unavailable")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(value, secretCipherPrefix))
+	if err != nil {
+		return "", errors.New("invalid encrypted secret value")
+	}
+	block, err := aes.NewCipher(s.secretKey)
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	if len(payload) < gcm.NonceSize()+gcm.Overhead() {
+		return "", errors.New("invalid encrypted secret value")
+	}
+	plain, err := gcm.Open(nil, payload[:gcm.NonceSize()], payload[gcm.NonceSize():], []byte(aad))
+	if err != nil {
+		return "", errors.New("invalid encrypted secret value")
+	}
+	if len(plain) > maxSecretCipherBytes {
+		return "", errors.New("decrypted secret value is too large")
+	}
+	return string(plain), nil
+}
+
+func (s *Store) encryptSettingValue(key, value string) (string, error) {
+	if key != "config_signing_private_key" {
+		return value, nil
+	}
+	return s.encryptSecretValue(value, "setting:"+key)
+}
+
+func (s *Store) decryptSettingValue(key, value string) (string, error) {
+	if key != "config_signing_private_key" {
+		return value, nil
+	}
+	return s.decryptSecretValue(value, "setting:"+key)
+}
+
+func (s *Store) protectSettings(settings map[string]string, aad string) (map[string]string, bool, error) {
+	if len(settings) == 0 {
+		return settings, false, nil
+	}
+	out := make(map[string]string, len(settings))
+	changed := false
+	for key, value := range settings {
+		protected, err := s.encryptSecretValue(value, aad+":"+key)
+		if err != nil {
+			return nil, false, err
+		}
+		out[key] = protected
+		if protected != value {
+			changed = true
+		}
+	}
+	return out, changed, nil
+}
+
+func (s *Store) unprotectSettings(settings map[string]string, aad string) (map[string]string, error) {
+	if len(settings) == 0 {
+		return settings, nil
+	}
+	out := make(map[string]string, len(settings))
+	for key, value := range settings {
+		plain, err := s.decryptSecretValue(value, aad+":"+key)
+		if err != nil {
+			return nil, err
+		}
+		out[key] = plain
+	}
+	return out, nil
+}
+
 func boolInt(v bool) int {
 	if v {
 		return 1
@@ -1552,6 +2155,91 @@ func emptyMap(m map[string]string) map[string]string {
 
 func closeDB(db *sql.DB) {
 	_ = db.Close()
+}
+
+func secureSQLiteFiles(path string) error {
+	if path == ":memory:" || strings.HasPrefix(path, "file:") {
+		return nil
+	}
+	for _, candidate := range []string{path, path + "-wal", path + "-shm"} {
+		if err := os.Chmod(candidate, 0o600); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("secure sqlite file %s: %w", candidate, err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) compactDatabase(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE);`); err != nil {
+		return fmt.Errorf("checkpoint sqlite WAL: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `VACUUM`); err != nil {
+		return fmt.Errorf("compact sqlite database: %w", err)
+	}
+	return nil
+}
+
+func loadNodeTokenKey(path string) ([]byte, error) {
+	if path == ":memory:" || strings.HasPrefix(path, "file:") {
+		return newNodeTokenKey()
+	}
+	keyPath := filepath.Clean(path) + ".token-key"
+	for attempt := 0; attempt < 2; attempt++ {
+		info, err := os.Lstat(keyPath)
+		if err == nil {
+			if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+				return nil, fmt.Errorf("node token key %s is not a regular file", keyPath)
+			}
+			key, err := os.ReadFile(keyPath)
+			if err != nil {
+				return nil, err
+			}
+			if len(key) != nodeTokenKeyBytes {
+				return nil, fmt.Errorf("node token key %s has invalid length", keyPath)
+			}
+			if err := os.Chmod(keyPath, 0o600); err != nil {
+				return nil, err
+			}
+			return key, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		key, err := newNodeTokenKey()
+		if err != nil {
+			return nil, err
+		}
+		file, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			if errors.Is(err, os.ErrExist) {
+				continue
+			}
+			return nil, err
+		}
+		_, writeErr := file.Write(key)
+		if writeErr == nil {
+			writeErr = file.Sync()
+		}
+		closeErr := file.Close()
+		if writeErr != nil {
+			_ = os.Remove(keyPath)
+			return nil, writeErr
+		}
+		if closeErr != nil {
+			_ = os.Remove(keyPath)
+			return nil, closeErr
+		}
+		return key, nil
+	}
+	return nil, errors.New("node token key was created concurrently")
+}
+
+func newNodeTokenKey() ([]byte, error) {
+	key := make([]byte, nodeTokenKeyBytes)
+	if _, err := io.ReadFull(rand.Reader, key); err != nil {
+		return nil, err
+	}
+	return key, nil
 }
 
 func closeRows(rows *sql.Rows) {

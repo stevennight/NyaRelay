@@ -50,9 +50,14 @@ The build writes to `.tmp-webdist` at the repo root. The controller serves that 
 Run controller:
 
 ```powershell
+$secretKey = New-Object byte[] 32
+[Security.Cryptography.RandomNumberGenerator]::Fill($secretKey)
+$env:NYARELAY_SECRETS_KEY = [Convert]::ToBase64String($secretKey)
 go run ./cmd/controller --listen :8080 --data ./data
 go run ./cmd/controller --version
 ```
+
+Keep the generated key in the environment for the lifetime of a development database, or use `--secrets-key-file` for a persistent key file.
 
 Run node:
 
@@ -61,7 +66,7 @@ go run ./cmd/node --controller http://127.0.0.1:8080 --id <node-id> --token <nod
 go run ./cmd/node --version
 ```
 
-The node caches the last valid signed configuration under its data directory. Existing routes continue to run when the controller is temporarily unavailable.
+The node caches the last valid signed configuration under its data directory. Existing routes continue to run while the configuration lease is valid; if the controller remains unavailable past the lease, the node stops its relay listeners until it receives a fresh signed configuration.
 
 ## Deployment
 
@@ -77,11 +82,22 @@ Edit `deploy/docker/.env` on each server:
 
 ```dotenv
 NYARELAY_IMAGE=ghcr.io/<owner>/nyarelay
-NYARELAY_VERSION=v0.1.3
+NYARELAY_VERSION=v0.1.22
 NYARELAY_PUBLIC_URL=https://relay.example.com
+NYARELAY_SECRETS_KEY_FILE=/etc/nyarelay/controller-secrets.key
 NYARELAY_BIND_ADDR=127.0.0.1
 NYARELAY_HOST_PORT=8080
 ```
+
+Before starting the controller, create the secrets key outside the repository and restrict it to the container operator:
+
+```bash
+sudo install -d -m 700 /etc/nyarelay
+openssl rand -base64 32 | sudo tee /etc/nyarelay/controller-secrets.key >/dev/null
+sudo chmod 600 /etc/nyarelay/controller-secrets.key
+```
+
+The controller refuses to start without this key. It encrypts TOTP secrets, its configuration signing private key, and tunnel credentials before storing them in SQLite. Back up this key separately; losing it makes those stored secrets unrecoverable.
 
 Run or update the controller:
 
@@ -100,16 +116,16 @@ For local source builds, add the build override:
 docker compose --env-file deploy/docker/.env -f deploy/docker/docker-compose.yml -f deploy/docker/docker-compose.build.yml up -d --build
 ```
 
-Release a version by pushing a tag such as `v0.1.3`. The release workflow publishes `ghcr.io/<owner>/nyarelay:v0.1.3` and Linux node binaries for amd64 and arm64. Deploying a version is just changing `NYARELAY_VERSION` in the server `.env` and running the compose commands above.
+Release a version by pushing a tag such as `v0.1.22`. The release workflow publishes `ghcr.io/<owner>/nyarelay:v0.1.22` and Linux node binaries for amd64 and arm64. Deploying a version is just changing `NYARELAY_VERSION` in the server `.env` and running the compose commands above.
 
-The release workflow should be configured with these repository secrets when node update approval is needed from the panel:
+The release workflow must be configured with these repository secrets for signed node installation and node update approval from the panel:
 
 ```text
 NYARELAY_UPDATE_SIGNING_KEY=<base64url Ed25519 private key>
 NYARELAY_UPDATE_PUBLIC_KEY=<matching base64url Ed25519 public key>
 ```
 
-Node installation is one command from the panel. Create a node, copy the generated install command, and run it on the node machine as a sudo-capable user. The script downloads itself from the controller, detects the node machine architecture, downloads the matching `nyarelay-node` binary from `/downloads/nyarelay-node` with gzip compression, prints each install stage, writes `/etc/nyarelay/node.env`, installs the systemd unit, and starts `nyarelay-node`. You do not need to manually download or copy the node binary.
+Node installation is one command from the panel. Create a node, copy the generated install command, and run it on the node machine as a sudo-capable user. The script downloads itself from the controller, detects the node machine architecture, downloads the matching `nyarelay-node` binary from `/downloads/nyarelay-node` with gzip compression, verifies its Ed25519 signature, prints each install stage, writes `/etc/nyarelay/node.env`, installs the systemd unit, and starts `nyarelay-node`. You do not need to manually download or copy the node binary.
 
 Node binary updates are panel-approved and controller-bundled. The controller only offers the node binaries packaged inside its own image, with a signed release manifest and SHA-256 digest for each target. A node verifies the Ed25519 manifest signature against its embedded trusted update public key, downloads the matching gzip binary from the controller, checks the digest, replaces `/usr/local/bin/nyarelay-node`, and restarts the systemd service. Local or development images without the update signing key still run normally, but node auto update is shown as disabled.
 
@@ -123,6 +139,8 @@ Postgres is intentionally not required for the first version. Keeping the contro
 
 - Do not mount `/var/run/docker.sock` into the controller container.
 - Put the controller behind Caddy HTTPS.
+- Keep `NYARELAY_TRUST_PROXY_HEADERS` disabled unless needed; when enabled, also set `NYARELAY_TRUSTED_PROXY_CIDRS` to the exact reverse-proxy IPs or networks. Forwarded headers from other peers are ignored.
 - Use TOTP after initial setup.
+- Install the node systemd unit with the dedicated `nyarelay` service account; only the updater needs root to replace the binary.
 - Prefer `mtls` for node-to-node links and `ws-tls` when you need HTTPS/Caddy-friendly transport.
 - Routes are transparent payload forwarding; NyaRelay does not parse VLESS, Shadowsocks, Trojan, or application protocols.

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	neturl "net/url"
@@ -24,6 +25,8 @@ type client struct {
 	http    *http.Client
 }
 
+const maxControllerJSONBytes = 4 << 20
+
 func newClient(cfg Config) *client {
 	return &client{
 		baseURL: strings.TrimRight(cfg.ControllerURL, "/"),
@@ -31,6 +34,9 @@ func newClient(cfg Config) *client {
 		token:   cfg.NodeToken,
 		http: &http.Client{
 			Timeout: 30 * time.Second,
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
 	}
 }
@@ -48,7 +54,7 @@ func (c *client) metrics(ctx context.Context, report any) error {
 }
 
 func (c *client) connectWS(ctx context.Context) (*websocket.Conn, error) {
-	parsed, err := neturl.Parse(c.baseURL)
+	parsed, err := validateControllerURL(c.baseURL)
 	if err != nil {
 		return nil, err
 	}
@@ -61,10 +67,12 @@ func (c *client) connectWS(ctx context.Context) (*websocket.Conn, error) {
 		return nil, fmt.Errorf("unsupported controller scheme %q", parsed.Scheme)
 	}
 	parsed.Path = "/api/node/ws"
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
 	hdr := http.Header{}
 	hdr.Set("X-NyaRelay-Node-ID", c.nodeID)
 	hdr.Set("X-NyaRelay-Node-Token", c.token)
-	conn, resp, err := websocket.Dial(ctx, parsed.String(), &websocket.DialOptions{HTTPHeader: hdr})
+	conn, resp, err := websocket.Dial(ctx, parsed.String(), &websocket.DialOptions{HTTPClient: c.http, HTTPHeader: hdr})
 	if err != nil {
 		if closeErr := closeResponseBody(resp); closeErr != nil {
 			return nil, fmt.Errorf("%w; close response body: %v", err, closeErr)
@@ -85,7 +93,11 @@ func (c *client) doJSON(ctx context.Context, method, path string, body any, dest
 		}
 		reqBody = bytes.NewReader(payload)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reqBody)
+	requestURL, err := controllerURLWithPath(c.baseURL, path)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, method, requestURL, reqBody)
 	if err != nil {
 		return err
 	}
@@ -105,7 +117,7 @@ func (c *client) doJSON(ctx context.Context, method, path string, body any, dest
 		var apiErr struct {
 			Error string `json:"error"`
 		}
-		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
+		_ = json.NewDecoder(io.LimitReader(resp.Body, maxControllerJSONBytes)).Decode(&apiErr)
 		if apiErr.Error == "" {
 			apiErr.Error = resp.Status
 		}
@@ -114,7 +126,53 @@ func (c *client) doJSON(ctx context.Context, method, path string, body any, dest
 	if dest == nil {
 		return nil
 	}
-	return json.NewDecoder(resp.Body).Decode(dest)
+	return json.NewDecoder(io.LimitReader(resp.Body, maxControllerJSONBytes)).Decode(dest)
+}
+
+func validateControllerURL(raw string) (*neturl.URL, error) {
+	raw = strings.TrimSpace(raw)
+	u, err := neturl.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("unsupported controller scheme %q", u.Scheme)
+	}
+	if u.Host == "" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("invalid controller URL")
+	}
+	if u.Path != "" && u.Path != "/" {
+		return nil, fmt.Errorf("controller URL must not include a path")
+	}
+	if u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {
+		return nil, fmt.Errorf("unencrypted controller HTTP is only allowed on loopback")
+	}
+	u.Path = ""
+	u.RawPath = ""
+	return u, nil
+}
+
+func controllerURLWithPath(raw, path string) (string, error) {
+	base, err := validateControllerURL(raw)
+	if err != nil {
+		return "", err
+	}
+	pathURL, err := neturl.Parse(path)
+	if err != nil || pathURL.IsAbs() || pathURL.Host != "" {
+		return "", fmt.Errorf("invalid controller request path")
+	}
+	base.Path = pathURL.Path
+	base.RawPath = pathURL.RawPath
+	base.RawQuery = pathURL.RawQuery
+	return base.String(), nil
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func closeResponseBody(resp *http.Response) error {

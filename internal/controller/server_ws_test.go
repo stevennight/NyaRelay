@@ -59,7 +59,6 @@ func TestNodeWebSocketReceivesConfigPush(t *testing.T) {
 	if err := st.UpsertNode(ctx, node, "node-token"); err != nil {
 		t.Fatal(err)
 	}
-
 	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/api/node/ws"
 	headers := http.Header{}
 	headers.Set("X-NyaRelay-Node-ID", node.ID)
@@ -172,6 +171,101 @@ func TestRevokedNodeCannotConnectWebSocket(t *testing.T) {
 	headers.Set("X-NyaRelay-Node-Token", "node-token")
 	if _, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{HTTPHeader: headers}); err == nil {
 		t.Fatal("expected revoked node websocket dial to fail")
+	}
+}
+
+func TestRevokingConnectedNodeClosesWebSocket(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	st, err := store.Open(ctx, filepath.Join(dir, "nyarelay.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeTestStore(t, st)
+
+	s := &Server{
+		cfg:      Config{PublicURL: "https://panel.example"},
+		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:    st,
+		sessions: auth.NewSessions(time.Hour),
+		limiter:  auth.NewLoginLimiter(),
+		hub:      nodehub.New(),
+		mux:      http.NewServeMux(),
+	}
+	if err := s.ensureSigningKey(ctx); err != nil {
+		t.Fatal(err)
+	}
+	s.routes()
+	ts := httptest.NewServer(secureHeaders(s.mux))
+	defer ts.Close()
+
+	node := model.Node{
+		ID:        "node_3",
+		Name:      "node-3",
+		Status:    model.NodeOffline,
+		Approved:  true,
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := st.UpsertNode(ctx, node, "node-token"); err != nil {
+		t.Fatal(err)
+	}
+	upsertTunnel(t, s, directTunnelRequest("tun_revoke", node.ID))
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/api/node/ws"
+	headers := http.Header{}
+	headers.Set("X-NyaRelay-Node-ID", node.ID)
+	headers.Set("X-NyaRelay-Node-Token", "node-token")
+	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{HTTPHeader: headers})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "done") }()
+
+	if err := wsjson.Write(ctx, conn, sharedprotocol.ControlMessage{
+		Type:    "hello",
+		NodeID:  node.ID,
+		Version: "1.0.0",
+		System:  model.NodeSystem{Hostname: "node-3", OS: "linux", Arch: "amd64"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var initial sharedprotocol.ControlMessage
+	if err := wsjson.Read(ctx, conn, &initial); err != nil {
+		t.Fatal(err)
+	}
+
+	revokeReq := httptest.NewRequest(http.MethodPost, "/api/nodes/revoke", strings.NewReader(`{"id":"node_3"}`))
+	revokeRec := httptest.NewRecorder()
+	s.handleRevokeNode(revokeRec, revokeReq, auth.Session{UserID: 1, Username: "admin"})
+	if revokeRec.Code != http.StatusOK {
+		t.Fatalf("revoke failed: %d %s", revokeRec.Code, revokeRec.Body.String())
+	}
+
+	readCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var revokedConfig sharedprotocol.ControlMessage
+	if err := wsjson.Read(readCtx, conn, &revokedConfig); err != nil {
+		t.Fatalf("revoked node did not receive empty config: %v", err)
+	}
+	if revokedConfig.Type != "config" || revokedConfig.Config == nil {
+		t.Fatalf("unexpected revoke message: %#v", revokedConfig)
+	}
+	if revokedConfig.Config.Config.Revision <= initial.Config.Config.Revision {
+		t.Fatalf("revocation revision did not advance: %d -> %d", initial.Config.Config.Revision, revokedConfig.Config.Config.Revision)
+	}
+	if len(revokedConfig.Config.Config.Tunnels) != 0 || len(revokedConfig.Config.Config.Forwards) != 0 {
+		t.Fatalf("revoked node received active runtime: %#v", revokedConfig.Config.Config)
+	}
+	var afterRevoke sharedprotocol.ControlMessage
+	if err := wsjson.Read(readCtx, conn, &afterRevoke); err == nil {
+		t.Fatal("revoked node websocket remained readable after empty config")
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && len(s.hub.NodeIDs()) != 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := s.hub.NodeIDs(); len(got) != 0 {
+		t.Fatalf("revoked node remained registered: %v", got)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/coder/websocket"
 )
@@ -52,5 +53,51 @@ func TestUnregisterSocketDoesNotRemoveReplacement(t *testing.T) {
 	}
 	if got := hub.NodeIDs(); len(got) != 0 {
 		t.Fatalf("socket remained registered after current connection closed: %v", got)
+	}
+}
+
+func TestWaitCleansCanceledWatcherAndNotifiesAllWaiters(t *testing.T) {
+	hub := New()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		hub.Wait(ctx, "node-1", 0, time.Minute)
+		close(done)
+	}()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("canceled watcher did not return")
+	}
+
+	hub.mu.Lock()
+	if len(hub.watchers) != 0 {
+		hub.mu.Unlock()
+		t.Fatalf("canceled watcher remained: %#v", hub.watchers)
+	}
+	hub.mu.Unlock()
+
+	firstDone := make(chan int64, 1)
+	secondDone := make(chan int64, 1)
+	go func() { firstDone <- hub.Wait(context.Background(), "node-1", 0, time.Minute) }()
+	go func() { secondDone <- hub.Wait(context.Background(), "node-1", 0, time.Minute) }()
+	time.Sleep(10 * time.Millisecond)
+	hub.SetRevision(4)
+	select {
+	case got := <-firstDone:
+		if got != 4 {
+			t.Fatalf("first waiter revision = %d, want 4", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first waiter was not notified")
+	}
+	select {
+	case got := <-secondDone:
+		if got != 4 {
+			t.Fatalf("second waiter revision = %d, want 4", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second waiter was not notified")
 	}
 }

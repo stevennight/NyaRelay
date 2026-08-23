@@ -2,18 +2,34 @@ services:
   controller:
     image: "${NYARELAY_IMAGE:?set in deploy/docker/.env}:${NYARELAY_VERSION:?set in deploy/docker/.env}"
     restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev
     environment:
       NYARELAY_LISTEN: ${NYARELAY_LISTEN:-:8080}
       NYARELAY_DATA: ${NYARELAY_DATA:-/data}
+      NYARELAY_SECRETS_KEY_FILE: /run/secrets/nyarelay_secrets_key
       NYARELAY_PUBLIC_URL: ${NYARELAY_PUBLIC_URL:?set in deploy/docker/.env}
+      NYARELAY_TRUST_PROXY_HEADERS: ${NYARELAY_TRUST_PROXY_HEADERS:-false}
+      NYARELAY_TRUSTED_PROXY_CIDRS: ${NYARELAY_TRUSTED_PROXY_CIDRS:-}
       NYARELAY_METRICS_RETENTION: ${NYARELAY_METRICS_RETENTION:-168h}
       NYARELAY_AUDIT_RETENTION: ${NYARELAY_AUDIT_RETENTION:-2160h}
       NYARELAY_CLEANUP_INTERVAL: ${NYARELAY_CLEANUP_INTERVAL:-1h}
       NYARELAY_FAILURE_COOLDOWN: ${NYARELAY_FAILURE_COOLDOWN:-5s}
     volumes:
       - nyarelay-data:/data
+    secrets:
+      - source: nyarelay_secrets_key
+        target: nyarelay_secrets_key
+        mode: 0444
     ports:
       - "${NYARELAY_BIND_ADDR:-127.0.0.1}:${NYARELAY_HOST_PORT:-8080}:8080"
 
 volumes:
   nyarelay-data:
+
+secrets:
+  nyarelay_secrets_key:
+    file: "${NYARELAY_SECRETS_KEY_FILE:?set in deploy/docker/.env}"

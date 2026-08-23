@@ -8,7 +8,9 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,18 +29,24 @@ import (
 var Version = sharedversion.Version
 
 // Keep control messages bounded while allowing node-scoped configs with many relays.
-const controlWebSocketReadLimit int64 = 256 * 1024
+const (
+	controlWebSocketReadLimit int64 = 256 * 1024
+	maxSignedConfigLifetime         = 30 * time.Minute
+	maxSignedConfigClockSkew        = 5 * time.Minute
+)
 
 type controlLoopOptions struct {
-	heartbeatInterval time.Duration
-	writeTimeout      time.Duration
-	pingTimeout       time.Duration
+	heartbeatInterval     time.Duration
+	configRefreshInterval time.Duration
+	writeTimeout          time.Duration
+	pingTimeout           time.Duration
 }
 
 var defaultControlLoopOptions = controlLoopOptions{
-	heartbeatInterval: 20 * time.Second,
-	writeTimeout:      10 * time.Second,
-	pingTimeout:       10 * time.Second,
+	heartbeatInterval:     20 * time.Second,
+	configRefreshInterval: 5 * time.Minute,
+	writeTimeout:          10 * time.Second,
+	pingTimeout:           10 * time.Second,
 }
 
 type configProvider interface {
@@ -62,10 +70,13 @@ func Run(ctx context.Context, args []string) error {
 		return restartNodeService()
 	}
 	cfg := parseConfig(args)
-	if cfg.NodeID == "" || cfg.NodeToken == "" {
-		return errors.New("node id and token are required")
+	if cfg.NodeID == "" || cfg.NodeToken == "" || strings.TrimSpace(cfg.SigningKey) == "" {
+		return errors.New("node id, token, and signing key are required")
 	}
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
+		return err
+	}
+	if err := os.Chmod(cfg.DataDir, 0o700); err != nil {
 		return err
 	}
 
@@ -74,17 +85,13 @@ func Run(ctx context.Context, args []string) error {
 	relayService := relay.New(log, cfg.NodeID)
 
 	var currentRevision atomic.Int64
-	if cfg.SigningKey != "" {
-		log.Info("config signature verification enabled")
-	} else {
-		log.Warn("config signature verification disabled because signing key was not provided")
-	}
+	log.Info("config signature verification enabled")
 
 	applySignedConfig := func(ctx context.Context, signed model.SignedConfig, source string) error {
 		if err := verifySignedConfig(cfg.NodeID, cfg.SigningKey, signed); err != nil {
 			return err
 		}
-		if signed.Config.Revision <= currentRevision.Load() {
+		if signed.Config.Revision < currentRevision.Load() {
 			return nil
 		}
 		if err := relayService.Apply(ctx, signed.Config); err != nil {
@@ -180,7 +187,7 @@ func controlLoopWithOptions(ctx context.Context, client *client, cfg Config, log
 			continue
 		}
 		backoff = time.Second
-		log.Info("control websocket connected", "controller", cfg.ControllerURL)
+		log.Info("control websocket connected", "controller", controllerLogTarget(cfg.ControllerURL))
 		conn.SetReadLimit(controlWebSocketReadLimit)
 		connCtx, cancelConn := context.WithCancel(ctx)
 
@@ -210,11 +217,17 @@ func controlLoopWithOptions(ctx context.Context, client *client, cfg Config, log
 		hbDone := make(chan struct{})
 		go func() {
 			ticker := time.NewTicker(options.heartbeatInterval)
+			refreshInterval := options.configRefreshInterval
+			if refreshInterval <= 0 {
+				refreshInterval = defaultControlLoopOptions.configRefreshInterval
+			}
+			refreshTicker := time.NewTicker(refreshInterval)
 			defer ticker.Stop()
+			defer refreshTicker.Stop()
 			defer close(hbDone)
 			for {
 				select {
-				case <-ctx.Done():
+				case <-connCtx.Done():
 					return
 				case <-ticker.C:
 					msg := sharedprotocol.ControlMessage{
@@ -241,6 +254,16 @@ func controlLoopWithOptions(ctx context.Context, client *client, cfg Config, log
 						return
 					}
 					cancelPing()
+				case <-refreshTicker.C:
+					if err := write(sharedprotocol.ControlMessage{
+						Type:   "pull_config",
+						NodeID: cfg.NodeID,
+					}); err != nil {
+						logControlFailure(log, connCtx, "control websocket config refresh failed", "error", err)
+						cancelConn()
+						_ = conn.CloseNow()
+						return
+					}
 				}
 			}
 		}()
@@ -336,15 +359,46 @@ func restartNodeService() error {
 }
 
 func verifySignedConfig(nodeID string, signingKey string, signed model.SignedConfig) error {
-	if signingKey != "" {
-		if err := sharedcrypto.VerifyJSON(signingKey, signed.Config, signed.Signature); err != nil {
-			return fmt.Errorf("verify config: %w", err)
-		}
+	if strings.TrimSpace(signingKey) == "" {
+		return errors.New("config signing key is required")
+	}
+	if err := sharedcrypto.VerifyJSON(signingKey, signed.Config, signed.Signature); err != nil {
+		return fmt.Errorf("verify config: %w", err)
 	}
 	if signed.Config.NodeID != nodeID {
 		return fmt.Errorf("config belongs to %s, not %s", signed.Config.NodeID, nodeID)
 	}
+	if signed.Config.IssuedAt.IsZero() {
+		return errors.New("config issue time is missing")
+	}
+	if signed.Config.ExpiresAt.IsZero() {
+		return errors.New("config expiration is missing")
+	}
+	if signed.Config.ExpiresAt.Before(signed.Config.IssuedAt) {
+		return errors.New("config expiration is before issue time")
+	}
+	if signed.Config.ExpiresAt.Sub(signed.Config.IssuedAt) > maxSignedConfigLifetime {
+		return errors.New("config lease is too long")
+	}
+	now := time.Now()
+	if signed.Config.IssuedAt.After(now.Add(maxSignedConfigClockSkew)) {
+		return errors.New("config issue time is too far in the future")
+	}
+	if signed.Config.ExpiresAt.After(now.Add(maxSignedConfigLifetime + maxSignedConfigClockSkew)) {
+		return errors.New("config expiration is too far in the future")
+	}
+	if !now.Before(signed.Config.ExpiresAt) {
+		return errors.New("config has expired")
+	}
 	return nil
+}
+
+func controllerLogTarget(raw string) string {
+	u, err := validateControllerURL(raw)
+	if err != nil {
+		return "invalid"
+	}
+	return u.Scheme + "://" + u.Host
 }
 
 func saveConfig(path string, signed model.SignedConfig) error {
@@ -352,11 +406,11 @@ func saveConfig(path string, signed model.SignedConfig) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, payload, 0o600)
+	return writePrivateFileAtomic(path, payload)
 }
 
 func loadConfig(path string) (model.SignedConfig, error) {
-	payload, err := os.ReadFile(path)
+	payload, err := readFileLimited(path, 8<<20)
 	if err != nil {
 		return model.SignedConfig{}, err
 	}
@@ -365,6 +419,55 @@ func loadConfig(path string) (model.SignedConfig, error) {
 		return model.SignedConfig{}, err
 	}
 	return signed, nil
+}
+
+func readFileLimited(path string, maxBytes int64) ([]byte, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() > maxBytes {
+		return nil, fmt.Errorf("file %s is too large", path)
+	}
+	return os.ReadFile(path)
+}
+
+func writePrivateFileAtomic(path string, payload []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".nyarelay-private-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(payload); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err == nil {
+		return nil
+	} else if runtime.GOOS != "windows" {
+		return err
+	}
+	// Windows cannot replace an existing file with Rename. The temporary file
+	// still prevents readers from observing a partially written payload.
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
 
 func sleep(ctx context.Context, d time.Duration) bool {

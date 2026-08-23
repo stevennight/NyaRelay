@@ -153,7 +153,7 @@ type RelayConfig struct {
 	Revision               int64            `json:"revision"`
 	IssuedAt               time.Time        `json:"issued_at"`
 	NodeID                 string           `json:"node_id"`
-	Nodes                  []Node           `json:"nodes"`
+	Nodes                  []Node           `json:"nodes,omitempty"`
 	Tunnels                []TunnelRuntime  `json:"tunnels"`
 	Forwards               []ForwardRuntime `json:"forwards"`
 	FailureCooldownSeconds int64            `json:"failure_cooldown_seconds"`

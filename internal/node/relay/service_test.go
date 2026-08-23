@@ -297,10 +297,10 @@ func TestUDPMultiCandidateUsesSessionAffinityAndProtocolMask(t *testing.T) {
 						Protocols:  []model.ForwardProtocol{model.ForwardProtocolTCP},
 						PublicAddr: freeTCPAddr(t),
 						Weight:     1,
-						Settings:   map[string]string{},
+						Settings:   map[string]string{"secret": "secret-tcp-only"},
 					},
-					runtimeNode("node_exit_a", exitAListen, exitAListen, map[string]string{}),
-					runtimeNode("node_exit_b", exitBListen, exitBListen, map[string]string{}),
+					runtimeNode("node_exit_a", exitAListen, exitAListen, map[string]string{"secret": "secret-exit-a"}),
+					runtimeNode("node_exit_b", exitBListen, exitBListen, map[string]string{"secret": "secret-exit-b"}),
 				},
 			},
 		},
@@ -367,8 +367,8 @@ func TestUDPMultiCandidateExpiresSessionAffinity(t *testing.T) {
 				Strategy:    "failover",
 				UDPStrategy: "round_robin",
 				Nodes: []model.TunnelRuntimeNode{
-					runtimeNode("node_exit_a", exitAListen, exitAListen, map[string]string{}),
-					runtimeNode("node_exit_b", exitBListen, exitBListen, map[string]string{}),
+					runtimeNode("node_exit_a", exitAListen, exitAListen, map[string]string{"secret": "secret-exit-a"}),
+					runtimeNode("node_exit_b", exitBListen, exitBListen, map[string]string{"secret": "secret-exit-b"}),
 				},
 			},
 		},
@@ -430,8 +430,8 @@ func TestUDPMultiCandidateReselectsOnReadFailure(t *testing.T) {
 				Strategy:    "failover",
 				UDPStrategy: "failover",
 				Nodes: []model.TunnelRuntimeNode{
-					runtimeNode("node_exit_a", exitAListen, exitAListen, map[string]string{}),
-					runtimeNode("node_exit_b", exitBListen, exitBListen, map[string]string{}),
+					runtimeNode("node_exit_a", exitAListen, exitAListen, map[string]string{"secret": "secret-exit-a"}),
+					runtimeNode("node_exit_b", exitBListen, exitBListen, map[string]string{"secret": "secret-exit-b"}),
 				},
 			},
 		},
@@ -509,10 +509,201 @@ func TestApplyKeepsPreviousListenersWhenNewConfigFails(t *testing.T) {
 	assertTCPRoundTrip(t, listenAddr, "after-bad-update")
 }
 
+func TestSameRevisionRefreshesConfigExpiration(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	targetAddr, closeTarget := tcpEchoServer(t)
+	defer closeTarget()
+
+	listenAddr := freeTCPAddr(t)
+	service := New(testLogger(), "node_entry")
+	defer func() {
+		service.mu.Lock()
+		service.stopRuntimeLocked()
+		service.mu.Unlock()
+	}()
+
+	config := model.RelayConfig{
+		NodeID:   "node_entry",
+		Revision: 1,
+		Tunnels:  []model.TunnelRuntime{directTunnel()},
+		Forwards: []model.ForwardRuntime{{
+			ID:        "fwd_refresh",
+			Name:      "refresh",
+			TunnelID:  "tun_direct",
+			Protocols: []model.ForwardProtocol{model.ForwardProtocolTCP},
+			Listen:    listenAddr,
+			Target:    targetAddr,
+			Enabled:   true,
+		}},
+		ExpiresAt: time.Now().Add(150 * time.Millisecond),
+	}
+	if err := service.Apply(ctx, config); err != nil {
+		t.Fatal(err)
+	}
+
+	config.ExpiresAt = time.Now().Add(500 * time.Millisecond)
+	if err := service.Apply(ctx, config); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(250 * time.Millisecond)
+	assertTCPRoundTrip(t, listenAddr, "after-refresh")
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", listenAddr, 50*time.Millisecond)
+		if err != nil {
+			return
+		}
+		_ = conn.Close()
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatal("refreshed config listener remained available after expiration")
+}
+
+func TestSameRevisionClearsConfigExpiration(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	targetAddr, closeTarget := tcpEchoServer(t)
+	defer closeTarget()
+
+	listenAddr := freeTCPAddr(t)
+	service := New(testLogger(), "node_entry")
+	defer func() {
+		service.mu.Lock()
+		service.stopRuntimeLocked()
+		service.mu.Unlock()
+	}()
+
+	config := model.RelayConfig{
+		NodeID:    "node_entry",
+		Revision:  1,
+		ExpiresAt: time.Now().Add(100 * time.Millisecond),
+		Tunnels:   []model.TunnelRuntime{directTunnel()},
+		Forwards: []model.ForwardRuntime{{
+			ID:        "fwd_clear_expiry",
+			Name:      "clear-expiry",
+			TunnelID:  "tun_direct",
+			Protocols: []model.ForwardProtocol{model.ForwardProtocolTCP},
+			Listen:    listenAddr,
+			Target:    targetAddr,
+			Enabled:   true,
+		}},
+	}
+	if err := service.Apply(ctx, config); err != nil {
+		t.Fatal(err)
+	}
+
+	config.ExpiresAt = time.Time{}
+	if err := service.Apply(ctx, config); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(250 * time.Millisecond)
+	assertTCPRoundTrip(t, listenAddr, "after-clear")
+}
+
+func TestRestoreFailureClearsRuntimeState(t *testing.T) {
+	service := New(testLogger(), "node_entry")
+	service.mu.Lock()
+	service.restorePreviousConfig(context.Background(), model.RelayConfig{
+		NodeID:    "node_entry",
+		Revision:  7,
+		ExpiresAt: time.Now().Add(time.Hour),
+		Tunnels: []model.TunnelRuntime{{
+			ID:        "tun_invalid",
+			Type:      model.TunnelChain,
+			Transport: model.TunnelTransportDirect,
+			Stages: []model.TunnelRuntimeStage{{
+				Index: 1,
+				Role:  model.TunnelStageExit,
+				Nodes: []model.TunnelRuntimeNode{{
+					NodeID:     "node_entry",
+					ListenAddr: "invalid-listen-address",
+				}},
+			}},
+		}},
+	}, 7)
+	defer service.mu.Unlock()
+
+	if service.cancel != nil || service.expireCancel != nil || service.runtimeCtx != nil || len(service.servers) != 0 {
+		t.Fatalf("failed restore left runtime state: cancel=%v expire_cancel=%v runtime_ctx=%v servers=%d", service.cancel != nil, service.expireCancel != nil, service.runtimeCtx != nil, len(service.servers))
+	}
+}
+
 func TestHostOnlyHandlesIPv6(t *testing.T) {
 	if got := hostOnly("[2001:db8::1]:443"); got != "2001:db8::1" {
 		t.Fatalf("hostOnly = %q, want IPv6 host", got)
 	}
+}
+
+func TestValidateHelloRejectsCrossTunnelForwardAndMissingSecret(t *testing.T) {
+	service := New(testLogger(), "node_exit")
+	service.config = model.RelayConfig{
+		Forwards: []model.ForwardRuntime{{
+			ID:        "fwd_other",
+			TunnelID:  "tun_other",
+			Protocols: []model.ForwardProtocol{model.ForwardProtocolTCP},
+			Enabled:   true,
+		}},
+	}
+	tunnel := model.TunnelRuntime{ID: "tun_current", Type: model.TunnelChain}
+	stage := model.TunnelRuntimeStage{Index: 1, Role: model.TunnelStageExit}
+	node := model.TunnelRuntimeNode{NodeID: "node_exit", Settings: map[string]string{"secret": "shared-secret"}}
+	hello := protocol.RelayHello{
+		TunnelID:       tunnel.ID,
+		ForwardID:      "fwd_other",
+		FromStageIndex: 0,
+		ToStageIndex:   1,
+		Network:        "tcp",
+		Secret:         "shared-secret",
+	}
+	if err := service.validateHello(tunnel, stage, node, hello); err == nil {
+		t.Fatal("hello for a forward in another tunnel was accepted")
+	}
+
+	service.config.Forwards[0].TunnelID = tunnel.ID
+	node.Settings["secret"] = ""
+	if err := service.validateHello(tunnel, stage, node, hello); err == nil {
+		t.Fatal("hello without a configured relay secret was accepted")
+	}
+}
+
+func TestExpiredConfigStopsRuntime(t *testing.T) {
+	ctx := context.Background()
+	targetAddr, closeTarget := tcpEchoServer(t)
+	defer closeTarget()
+	listenAddr := freeTCPAddr(t)
+	service := New(testLogger(), "node_entry")
+	if err := service.Apply(ctx, model.RelayConfig{
+		NodeID:    "node_entry",
+		Revision:  1,
+		ExpiresAt: time.Now().Add(100 * time.Millisecond),
+		Tunnels:   []model.TunnelRuntime{directTunnel()},
+		Forwards: []model.ForwardRuntime{{
+			ID:        "fwd_expiry",
+			Name:      "expiry",
+			TunnelID:  "tun_direct",
+			Protocols: []model.ForwardProtocol{model.ForwardProtocolTCP},
+			Listen:    listenAddr,
+			Target:    targetAddr,
+			Enabled:   true,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", listenAddr, 50*time.Millisecond)
+		if err != nil {
+			return
+		}
+		_ = conn.Close()
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatal("expired config listener remained available")
 }
 
 func directTunnel() model.TunnelRuntime {

@@ -13,6 +13,9 @@ func TestScopeConfigForNodeLimitsTunnelSecrets(t *testing.T) {
 		Type:      model.TunnelChain,
 		Transport: model.TunnelTransportMTLS,
 		Enabled:   true,
+		Settings: map[string]string{
+			"secret": "top-level-secret",
+		},
 		Stages: []model.TunnelStage{
 			{
 				ID:       "stage_entry",
@@ -70,6 +73,9 @@ func TestScopeConfigForNodeLimitsTunnelSecrets(t *testing.T) {
 	entryTunnels, entryForwards := scopeConfigForNode("entry", []model.Tunnel{tunnel}, []model.Forward{forward})
 	if len(entryTunnels) != 1 || len(entryForwards) != 1 {
 		t.Fatalf("expected entry tunnel and forward")
+	}
+	if len(entryTunnels[0].Settings) != 0 {
+		t.Fatalf("top-level tunnel settings leaked to entry node: %#v", entryTunnels[0].Settings)
 	}
 	entryNext := entryTunnels[0].Stages[1].Nodes[0]
 	if entryNext.Settings["server_key"] != "" {

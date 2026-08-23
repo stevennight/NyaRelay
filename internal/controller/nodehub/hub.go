@@ -10,27 +10,33 @@ import (
 	"github.com/coder/websocket/wsjson"
 )
 
+const maxWatchersPerNode = 4
+
+var ErrNotConnected = errors.New("node is not connected")
+
 type Hub struct {
 	mu       sync.Mutex
 	revision int64
-	watchers map[string]chan int64
+	watchers map[string]map[chan int64]struct{}
 	sockets  map[string]*socketConn
 }
 
 func New() *Hub {
-	return &Hub{watchers: make(map[string]chan int64), sockets: make(map[string]*socketConn)}
+	return &Hub{watchers: make(map[string]map[chan int64]struct{}), sockets: make(map[string]*socketConn)}
 }
 
 func (h *Hub) SetRevision(revision int64) {
 	h.mu.Lock()
 	h.revision = revision
-	for id, ch := range h.watchers {
-		select {
-		case ch <- revision:
-		default:
+	for id, nodeWatchers := range h.watchers {
+		for ch := range nodeWatchers {
+			select {
+			case ch <- revision:
+			default:
+			}
+			close(ch)
 		}
 		delete(h.watchers, id)
-		close(ch)
 	}
 	h.mu.Unlock()
 }
@@ -48,19 +54,42 @@ func (h *Hub) Wait(ctx context.Context, nodeID string, knownRevision int64, maxW
 		h.mu.Unlock()
 		return current
 	}
+	if len(h.watchers[nodeID]) >= maxWatchersPerNode {
+		h.mu.Unlock()
+		return current
+	}
 	ch := make(chan int64, 1)
-	h.watchers[nodeID] = ch
+	if h.watchers[nodeID] == nil {
+		h.watchers[nodeID] = make(map[chan int64]struct{})
+	}
+	h.watchers[nodeID][ch] = struct{}{}
 	h.mu.Unlock()
 
 	timer := time.NewTimer(maxWait)
 	defer timer.Stop()
 	select {
 	case revision := <-ch:
+		h.removeWatcher(nodeID, ch)
 		return revision
 	case <-timer.C:
+		h.removeWatcher(nodeID, ch)
 		return h.Revision()
 	case <-ctx.Done():
+		h.removeWatcher(nodeID, ch)
 		return h.Revision()
+	}
+}
+
+func (h *Hub) removeWatcher(nodeID string, ch chan int64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	nodeWatchers := h.watchers[nodeID]
+	if nodeWatchers == nil {
+		return
+	}
+	delete(nodeWatchers, ch)
+	if len(nodeWatchers) == 0 {
+		delete(h.watchers, nodeID)
 	}
 }
 
@@ -84,6 +113,17 @@ func (h *Hub) UnregisterSocket(nodeID string, conn *websocket.Conn) bool {
 	return false
 }
 
+func (h *Hub) Close(nodeID string, code websocket.StatusCode, reason string) bool {
+	h.mu.Lock()
+	sock := h.sockets[nodeID]
+	h.mu.Unlock()
+	if sock == nil {
+		return false
+	}
+	_ = sock.Close(code, reason)
+	return true
+}
+
 func (h *Hub) NodeIDs() []string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -95,13 +135,17 @@ func (h *Hub) NodeIDs() []string {
 }
 
 func (h *Hub) Send(nodeID string, value any) error {
+	return h.SendContext(context.Background(), nodeID, value)
+}
+
+func (h *Hub) SendContext(ctx context.Context, nodeID string, value any) error {
 	h.mu.Lock()
 	sock := h.sockets[nodeID]
 	h.mu.Unlock()
 	if sock == nil {
-		return errors.New("node is not connected")
+		return ErrNotConnected
 	}
-	return sock.Send(value)
+	return sock.Send(ctx, value)
 }
 
 type socketConn struct {
@@ -109,10 +153,15 @@ type socketConn struct {
 	mu   sync.Mutex
 }
 
-func (c *socketConn) Send(value any) error {
+func (c *socketConn) Send(ctx context.Context, value any) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return wsjson.Write(context.Background(), c.conn, value)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	writeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	return wsjson.Write(writeCtx, c.conn, value)
 }
 
 func (c *socketConn) Close(code websocket.StatusCode, reason string) error {

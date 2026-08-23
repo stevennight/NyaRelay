@@ -149,6 +149,34 @@ func TestUpdateHistoryCleanupSettingsAPI(t *testing.T) {
 	}
 }
 
+func TestUpdateHistoryCleanupRejectsTooFrequentInterval(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	srv := &Server{
+		cfg:   Config{CleanupInterval: defaultCleanupInterval},
+		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store: st,
+		cleanupConfig: historyCleanupConfig{
+			CleanupInterval: defaultCleanupInterval,
+		},
+		cleanupWake: make(chan struct{}, 1),
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/controller/info", strings.NewReader(`{"cleanup_interval":"1s"}`))
+	rec := httptest.NewRecorder()
+	srv.handleUpdateControllerInfo(rec, req, auth.Session{Username: "admin"})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if got := srv.currentHistoryCleanupConfig().CleanupInterval; got != defaultCleanupInterval {
+		t.Fatalf("cleanup interval changed to %s", got)
+	}
+}
+
 func TestUpdateFailureCooldownSettingsAPI(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, ":memory:")

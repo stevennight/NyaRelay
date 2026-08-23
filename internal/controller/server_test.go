@@ -8,12 +8,16 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"nyarelay/internal/controller/auth"
 	"nyarelay/internal/controller/store"
 	"nyarelay/internal/shared/model"
+	sharedprotocol "nyarelay/internal/shared/protocol"
+	"nyarelay/internal/shared/validate"
 )
 
 func TestLoginLimitKeyIgnoresRemotePort(t *testing.T) {
@@ -27,13 +31,171 @@ func TestLoginLimitKeyIgnoresRemotePort(t *testing.T) {
 	}
 }
 
-func TestLoginLimitKeyPrefersForwardedAddress(t *testing.T) {
+func TestLoginLimitKeyIgnoresUntrustedForwardedAddress(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/auth/login", nil)
 	req.RemoteAddr = "10.0.0.10:40001"
 	req.Header.Set("X-Forwarded-For", "203.0.113.9, 10.0.0.10")
 
-	if got := loginLimitKey(req, "admin"); got != "203.0.113.9:admin" {
-		t.Fatalf("limit key = %q, want forwarded client ip", got)
+	if got := requestClientIPForProxy(req, false); got != "10.0.0.10" {
+		t.Fatalf("client ip = %q, want socket peer ip", got)
+	}
+}
+
+func TestLoginLimitKeysSeparateUsersAndShareIP(t *testing.T) {
+	s := &Server{}
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/login", nil)
+	req.RemoteAddr = "198.51.100.10:40001"
+
+	adminKeys := s.loginLimitKeys(req, "admin")
+	otherKeys := s.loginLimitKeys(req, "other")
+	if len(adminKeys) != 2 || len(otherKeys) != 2 {
+		t.Fatalf("login key counts = %d and %d, want 2", len(adminKeys), len(otherKeys))
+	}
+	if adminKeys[0] != otherKeys[0] {
+		t.Fatalf("IP limit keys differ: %q != %q", adminKeys[0], otherKeys[0])
+	}
+	if adminKeys[1] == otherKeys[1] {
+		t.Fatalf("user/IP limit keys should differ: %q", adminKeys[1])
+	}
+	if len(adminKeys[1]) > 128 {
+		t.Fatalf("user/IP limit key is unexpectedly large: %d", len(adminKeys[1]))
+	}
+}
+
+func TestRequestClientIPForProxyValidatesAndBoundsHeaders(t *testing.T) {
+	tests := []struct {
+		name   string
+		header string
+		value  string
+		want   string
+	}{
+		{name: "valid forwarded for", header: "X-Forwarded-For", value: "203.0.113.9, 10.0.0.10", want: "203.0.113.9"},
+		{name: "valid real ip", header: "X-Real-IP", value: "2001:db8::9", want: "2001:db8::9"},
+		{name: "invalid forwarded for", header: "X-Forwarded-For", value: "not-an-ip", want: "10.0.0.10"},
+		{name: "oversized forwarded for", header: "X-Forwarded-For", value: strings.Repeat("1", maxProxyHeaderBytes+1), want: "10.0.0.10"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/auth/login", nil)
+			req.RemoteAddr = "10.0.0.10:40001"
+			req.Header.Set(tt.header, tt.value)
+			if got := requestClientIPForProxy(req, true); got != tt.want {
+				t.Fatalf("client ip = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestServerProxyHeadersRequireTrustedPeer(t *testing.T) {
+	s := &Server{cfg: Config{
+		TrustProxyHeaders: true,
+		TrustedProxyCIDRs: "10.0.0.0/8, 2001:db8::10",
+	}}
+
+	request := httptest.NewRequest(http.MethodPost, "/api/auth/login", nil)
+	request.RemoteAddr = "192.0.2.10:40001"
+	request.Header.Set("X-Forwarded-For", "203.0.113.9")
+	if got := s.loginIPLimitKey(request); got != "192.0.2.10" {
+		t.Fatalf("untrusted proxy client ip = %q, want socket peer", got)
+	}
+
+	request.RemoteAddr = "10.0.0.10:40001"
+	if got := s.loginIPLimitKey(request); got != "203.0.113.9" {
+		t.Fatalf("trusted proxy client ip = %q, want forwarded address", got)
+	}
+}
+
+func TestWithNodeRejectsOversizedCredentialsBeforeStoreLookup(t *testing.T) {
+	s := &Server{store: func() *store.Store {
+		st, err := store.Open(context.Background(), ":memory:")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		return st
+	}()}
+	handler := s.withNode(func(http.ResponseWriter, *http.Request, model.Node) {
+		t.Fatal("oversized credentials reached node handler")
+	})
+	req := httptest.NewRequest(http.MethodGet, "/api/node/config", nil)
+	req.Header.Set("X-NyaRelay-Node-ID", strings.Repeat("n", validate.MaxIDBytes+1))
+	req.Header.Set("X-NyaRelay-Node-Token", "token")
+	rec := httptest.NewRecorder()
+	handler(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestWithNodeReturnsSameErrorForUnknownNodeAndInvalidToken(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	if err := st.UpsertNode(ctx, model.Node{ID: "node-auth", Name: "node-auth", Approved: true}, "valid-token"); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Server{store: st, nodeLimiter: auth.NewLoginLimiter()}
+	handler := s.withNode(func(http.ResponseWriter, *http.Request, model.Node) {
+		t.Fatal("invalid node credentials reached handler")
+	})
+	request := func(id, token string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/api/node/config", nil)
+		req.RemoteAddr = "198.51.100.20:40001"
+		req.Header.Set("X-NyaRelay-Node-ID", id)
+		req.Header.Set("X-NyaRelay-Node-Token", token)
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+		return rec
+	}
+
+	unknown := request("node-does-not-exist", "valid-token")
+	invalidToken := request("node-auth", "wrong-token")
+	if unknown.Code != http.StatusUnauthorized || invalidToken.Code != http.StatusUnauthorized {
+		t.Fatalf("statuses = %d/%d, want 401/401", unknown.Code, invalidToken.Code)
+	}
+	if unknown.Body.String() != invalidToken.Body.String() {
+		t.Fatalf("unknown-node and invalid-token responses differ: %q vs %q", unknown.Body.String(), invalidToken.Body.String())
+	}
+}
+
+func TestWithNodeRateLimitsRepeatedAuthenticationFailures(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	if err := st.UpsertNode(ctx, model.Node{ID: "node-rate", Name: "node-rate", Approved: true}, "valid-token"); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Server{store: st, nodeLimiter: auth.NewLoginLimiter()}
+	handler := s.withNode(func(http.ResponseWriter, *http.Request, model.Node) {
+		t.Fatal("invalid node credentials reached handler")
+	})
+	for attempt := 0; attempt < 5; attempt++ {
+		req := httptest.NewRequest(http.MethodGet, "/api/node/config", nil)
+		req.RemoteAddr = "198.51.100.30:40001"
+		req.Header.Set("X-NyaRelay-Node-ID", "node-rate")
+		req.Header.Set("X-NyaRelay-Node-Token", "wrong-token")
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d status = %d, want 401", attempt+1, rec.Code)
+		}
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/node/config", nil)
+	req.RemoteAddr = "198.51.100.30:40002"
+	req.Header.Set("X-NyaRelay-Node-ID", "node-rate")
+	req.Header.Set("X-NyaRelay-Node-Token", "wrong-token")
+	rec := httptest.NewRecorder()
+	handler(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("blocked status = %d, want 429", rec.Code)
 	}
 }
 
@@ -62,7 +224,7 @@ func TestValidateNodePortRangeRejectsInvalidPorts(t *testing.T) {
 	}
 }
 
-func TestSetSessionCookieUsesSecureWhenForwardedHTTPS(t *testing.T) {
+func TestSetSessionCookieIgnoresUntrustedForwardedHTTPS(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "http://panel.example/api/auth/login", nil)
 	req.Header.Set("X-Forwarded-Proto", "https")
 	rec := httptest.NewRecorder()
@@ -79,8 +241,53 @@ func TestSetSessionCookieUsesSecureWhenForwardedHTTPS(t *testing.T) {
 	if len(cookies) != 1 {
 		t.Fatalf("cookies = %d, want 1", len(cookies))
 	}
-	if !cookies[0].Secure {
-		t.Fatal("session cookie should be secure for https requests")
+	if cookies[0].Secure {
+		t.Fatal("session cookie should not trust an untrusted forwarded proto header")
+	}
+}
+
+func TestSetSessionCookieUsesSecureWhenProxyHeadersAreTrusted(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "http://panel.example/api/auth/login", nil)
+	req.Header.Set("X-Forwarded-Proto", "https")
+	rec := httptest.NewRecorder()
+	session := auth.Session{ID: "session-1", UserID: 1, Username: "admin", ExpiresAt: time.Now().Add(time.Hour)}
+
+	setSessionCookieWithProxy(rec, req, session, true)
+
+	cookies := rec.Result().Cookies()
+	if len(cookies) != 1 || !cookies[0].Secure {
+		t.Fatal("session cookie should be secure when proxy headers are explicitly trusted")
+	}
+}
+
+func TestControllerBaseURLDoesNotTrustRequestHost(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "http://attacker.example/api/nodes", nil)
+	if got := controllerBaseURL("", req); got != "" {
+		t.Fatalf("controller URL = %q, want empty without configured public URL", got)
+	}
+	if got := controllerBaseURL("https://relay.example.com", req); got != "https://relay.example.com" {
+		t.Fatalf("controller URL = %q", got)
+	}
+}
+
+func TestRequireSameOriginRejectsCrossOriginStateChange(t *testing.T) {
+	s := &Server{cfg: Config{PublicURL: "https://relay.example.com"}}
+	req := httptest.NewRequest(http.MethodPost, "https://relay.example.com/api/setup", nil)
+	req.Header.Set("Origin", "https://attacker.example")
+	rec := httptest.NewRecorder()
+	if s.requireSameOrigin(rec, req) {
+		t.Fatal("cross-origin request was accepted")
+	}
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusForbidden)
+	}
+}
+
+func TestNormalizeControllerURLRejectsUnsafeForms(t *testing.T) {
+	for _, value := range []string{"javascript:alert(1)", "https://user:pass@relay.example.com", "https://relay.example.com/path", "http://relay.example.com"} {
+		if _, err := normalizeControllerURL(value); err == nil {
+			t.Fatalf("expected URL %q to be rejected", value)
+		}
 	}
 }
 
@@ -139,6 +346,15 @@ func TestNodeBinaryPathForRequestUsesPlatformSpecificBinary(t *testing.T) {
 	}
 }
 
+func TestNodeBinaryPathForRequestRejectsMissingPlatformDirectory(t *testing.T) {
+	srv := &Server{cfg: Config{NodeBinaryPath: "nyarelay-node"}}
+	req := httptest.NewRequest(http.MethodGet, "/downloads/nyarelay-node?os=linux&arch=amd64", nil)
+
+	if _, _, err := srv.nodeBinaryPathForRequest(req); err == nil {
+		t.Fatal("expected missing node binary directory to fail")
+	}
+}
+
 func TestDownloadNodeBinaryCanStreamGzip(t *testing.T) {
 	dir := t.TempDir()
 	content := []byte("nyarelay-node-binary")
@@ -175,7 +391,7 @@ func TestDownloadNodeBinaryCanStreamGzip(t *testing.T) {
 	}
 }
 
-func TestDownloadNodeBinaryPrefersPrecompressedGzip(t *testing.T) {
+func TestDownloadNodeBinaryIgnoresStalePrecompressedGzip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "nyarelay-node-linux-amd64")
 	if err := os.WriteFile(path, []byte("raw-node-binary"), 0o644); err != nil {
@@ -196,10 +412,6 @@ func TestDownloadNodeBinaryPrefersPrecompressedGzip(t *testing.T) {
 	if err := gzFile.Close(); err != nil {
 		t.Fatal(err)
 	}
-	gzInfo, err := os.Stat(gzPath)
-	if err != nil {
-		t.Fatal(err)
-	}
 	srv := &Server{cfg: Config{
 		NodeBinaryPath: filepath.Join(dir, "nyarelay-node"),
 		NodeBinaryDir:  dir,
@@ -212,9 +424,6 @@ func TestDownloadNodeBinaryPrefersPrecompressedGzip(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("download failed: %d %s", rec.Code, rec.Body.String())
 	}
-	if int64(rec.Body.Len()) != gzInfo.Size() {
-		t.Fatalf("response size = %d, want precompressed size %d", rec.Body.Len(), gzInfo.Size())
-	}
 	reader, err := gzip.NewReader(rec.Body)
 	if err != nil {
 		t.Fatal(err)
@@ -224,8 +433,8 @@ func TestDownloadNodeBinaryPrefersPrecompressedGzip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(body) != "precompressed-node-binary" {
-		t.Fatalf("body = %q, want precompressed content", body)
+	if string(body) != "raw-node-binary" {
+		t.Fatalf("body = %q, want current raw binary", body)
 	}
 }
 
@@ -616,4 +825,57 @@ func testPrepareTunnelServer(t *testing.T) *Server {
 		}
 	})
 	return &Server{store: st}
+}
+
+func TestValidateNodeInputBoundsMetadata(t *testing.T) {
+	if err := validateNodeInput("node-1", map[string]string{"region": "cn"}, "node.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateNodeInput("node-1", nil, "https://node.example.com"); err == nil {
+		t.Fatal("expected URL-shaped public host to be rejected")
+	}
+	labels := make(map[string]string, maxNodeLabelEntries+1)
+	for index := 0; index <= maxNodeLabelEntries; index++ {
+		labels["label"+strconv.Itoa(index)] = "value"
+	}
+	if err := validateNodeInput("node-1", labels, ""); err == nil {
+		t.Fatal("expected oversized label map to be rejected")
+	}
+}
+
+func TestValidateNodeControlMessageRejectsSpoofedOrMalformedReports(t *testing.T) {
+	if err := validateNodeHello("node-1", sharedprotocol.ControlMessage{
+		Type:    "hello",
+		NodeID:  "node-2",
+		Version: "1.0.0",
+	}); err == nil {
+		t.Fatal("expected spoofed hello node id to be rejected")
+	}
+	if err := validateNodeControlMessage("node-1", sharedprotocol.ControlMessage{
+		Type:    "heartbeat",
+		NodeID:  "node-1",
+		Version: "1.0.0",
+		UpdateReport: &model.NodeUpdateReport{
+			Status: "unknown",
+		},
+	}); err == nil {
+		t.Fatal("expected unknown update status to be rejected")
+	}
+}
+
+func TestValidateMetricsReportRejectsUntrustedValues(t *testing.T) {
+	if err := validateMetricsReport(model.MetricsReport{
+		ObservedAt: time.Now().UTC(),
+		ForwardStats: []model.TrafficStat{{
+			ID:      "forward:fwd-1",
+			BytesIn: -1,
+		}},
+	}); err == nil {
+		t.Fatal("expected negative metric value to be rejected")
+	}
+	if err := validateMetricsReport(model.MetricsReport{
+		ObservedAt: time.Now().UTC().Add(25 * time.Hour),
+	}); err == nil {
+		t.Fatal("expected far-future metric timestamp to be rejected")
+	}
 }

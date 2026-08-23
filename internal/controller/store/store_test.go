@@ -2,11 +2,276 @@ package store
 
 import (
 	"context"
+	"errors"
+	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"nyarelay/internal/shared/model"
 )
+
+func TestCreateInitialUserIsAtomic(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			<-start
+			_, err := st.CreateInitialUser(ctx, "admin", "hash-"+string(rune('a'+index)))
+			results <- err
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	var successes, conflicts int
+	for err := range results {
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, ErrSetupComplete):
+			conflicts++
+		default:
+			t.Fatalf("unexpected setup error: %v", err)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		t.Fatalf("successes=%d conflicts=%d, want one of each", successes, conflicts)
+	}
+	count, err := st.UserCount(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("user count = %d, want 1", count)
+	}
+}
+
+func TestSensitiveValuesAreEncryptedAtRest(t *testing.T) {
+	ctx := context.Background()
+	key := []byte("01234567890123456789012345678901")
+	st, err := OpenWithSecretKey(ctx, ":memory:", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+
+	user, err := st.CreateUser(ctx, "admin", "password-hash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetTOTPSecret(ctx, user.ID, "JBSWY3DPEHPK3PXP", true); err != nil {
+		t.Fatal(err)
+	}
+	var rawTOTP string
+	if err := st.db.QueryRowContext(ctx, `SELECT totp_secret FROM users WHERE id = ?`, user.ID).Scan(&rawTOTP); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(rawTOTP, secretCipherPrefix) || strings.Contains(rawTOTP, "JBSWY3DPEHPK3PXP") {
+		t.Fatalf("TOTP secret is not encrypted: %q", rawTOTP)
+	}
+	secret, enabled, err := st.TOTPSecret(ctx, user.ID)
+	if err != nil || secret != "JBSWY3DPEHPK3PXP" || !enabled {
+		t.Fatalf("TOTP round trip = %q/%v/%v", secret, enabled, err)
+	}
+
+	if err := st.SetSetting(ctx, "config_signing_private_key", "private-key-material"); err != nil {
+		t.Fatal(err)
+	}
+	var rawSigningKey string
+	if err := st.db.QueryRowContext(ctx, `SELECT value FROM settings WHERE key = ?`, "config_signing_private_key").Scan(&rawSigningKey); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(rawSigningKey, secretCipherPrefix) || strings.Contains(rawSigningKey, "private-key-material") {
+		t.Fatalf("signing private key is not encrypted: %q", rawSigningKey)
+	}
+	value, ok, err := st.GetSetting(ctx, "config_signing_private_key")
+	if err != nil || !ok || value != "private-key-material" {
+		t.Fatalf("signing key round trip = %q/%v/%v", value, ok, err)
+	}
+
+	tunnel := model.Tunnel{
+		ID:       "tunnel-secrets",
+		Name:     "tunnel-secrets",
+		Settings: map[string]string{"secret": "relay-secret", "server_key": "server-private-key"},
+	}
+	if _, err := st.SaveTunnel(ctx, tunnel, nil); err != nil {
+		t.Fatal(err)
+	}
+	var rawSettings string
+	if err := st.db.QueryRowContext(ctx, `SELECT settings_json FROM tunnels WHERE id = ?`, tunnel.ID).Scan(&rawSettings); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(rawSettings, `"relay-secret"`) || strings.Contains(rawSettings, `"server-private-key"`) {
+		t.Fatalf("tunnel settings contain plaintext secrets: %s", rawSettings)
+	}
+	loaded, err := st.GetTunnel(ctx, tunnel.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Settings["secret"] != "relay-secret" || loaded.Settings["server_key"] != "server-private-key" {
+		t.Fatalf("tunnel settings round trip = %#v", loaded.Settings)
+	}
+}
+
+func TestSensitivePlaintextMigratesOnStartup(t *testing.T) {
+	ctx := context.Background()
+	key := []byte("01234567890123456789012345678901")
+	path := filepath.Join(t.TempDir(), "nyarelay.db")
+	st, err := OpenWithSecretKey(ctx, path, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := st.CreateUser(ctx, "admin", "password-hash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tunnel := model.Tunnel{ID: "legacy-tunnel", Name: "legacy-tunnel", Settings: map[string]string{"secret": "old-relay-secret"}}
+	if _, err := st.SaveTunnel(ctx, tunnel, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `UPDATE users SET totp_secret = ? WHERE id = ?`, "JBSWY3DPEHPK3PXP", user.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetSetting(ctx, "config_signing_private_key", "old-private-key"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `UPDATE settings SET value = ? WHERE key = ?`, "old-private-key", "config_signing_private_key"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `UPDATE tunnels SET settings_json = ? WHERE id = ?`, `{"secret":"old-relay-secret"}`, tunnel.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err = OpenWithSecretKey(ctx, path, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	var rawTOTP, rawSigningKey, rawSettings string
+	if err := st.db.QueryRowContext(ctx, `SELECT totp_secret FROM users WHERE id = ?`, user.ID).Scan(&rawTOTP); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.db.QueryRowContext(ctx, `SELECT value FROM settings WHERE key = ?`, "config_signing_private_key").Scan(&rawSigningKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.db.QueryRowContext(ctx, `SELECT settings_json FROM tunnels WHERE id = ?`, tunnel.ID).Scan(&rawSettings); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(rawTOTP, secretCipherPrefix) || !strings.HasPrefix(rawSigningKey, secretCipherPrefix) || strings.Contains(rawSettings, "old-relay-secret") {
+		t.Fatalf("legacy secrets were not migrated: totp=%q signing=%q settings=%q", rawTOTP, rawSigningKey, rawSettings)
+	}
+	if secret, _, err := st.TOTPSecret(ctx, user.ID); err != nil || secret != "JBSWY3DPEHPK3PXP" {
+		t.Fatalf("migrated TOTP = %q/%v", secret, err)
+	}
+	if value, _, err := st.GetSetting(ctx, "config_signing_private_key"); err != nil || value != "old-private-key" {
+		t.Fatalf("migrated signing key = %q/%v", value, err)
+	}
+	loaded, err := st.GetTunnel(ctx, tunnel.ID)
+	if err != nil || loaded.Settings["secret"] != "old-relay-secret" {
+		t.Fatalf("migrated tunnel settings = %#v/%v", loaded.Settings, err)
+	}
+}
+
+func TestNodeTokenIsEncryptedAtRestAndSurvivesRestart(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "nyarelay.db")
+	st, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := model.Node{ID: "node-token", Name: "node-token", Approved: true, CreatedAt: time.Now().UTC()}
+	if err := st.UpsertNode(ctx, node, "secret-token"); err != nil {
+		t.Fatal(err)
+	}
+	var plaintext, encrypted string
+	if err := st.db.QueryRowContext(ctx, `SELECT token, token_encrypted FROM nodes WHERE id = ?`, node.ID).Scan(&plaintext, &encrypted); err != nil {
+		t.Fatal(err)
+	}
+	if plaintext != "" || encrypted == "" {
+		t.Fatalf("stored token fields = plaintext %q, encrypted %q", plaintext, encrypted)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err = Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	if _, err := st.AuthenticateNode(ctx, node.ID, "secret-token"); err != nil {
+		t.Fatalf("token did not survive restart: %v", err)
+	}
+}
+
+func TestLegacyNodeTokenMigratesToEncryptedStorage(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "nyarelay.db")
+	st, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := model.Node{ID: "node-legacy-token", Name: "node-legacy-token", Approved: true, CreatedAt: time.Now().UTC()}
+	if err := st.UpsertNode(ctx, node, "legacy-secret"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `UPDATE nodes SET token = ?, token_encrypted = '' WHERE id = ?`, "legacy-secret", node.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err = Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	var plaintext, encrypted string
+	if err := st.db.QueryRowContext(ctx, `SELECT token, token_encrypted FROM nodes WHERE id = ?`, node.ID).Scan(&plaintext, &encrypted); err != nil {
+		t.Fatal(err)
+	}
+	if plaintext != "" || encrypted == "" {
+		t.Fatalf("legacy token was not migrated: plaintext %q, encrypted %q", plaintext, encrypted)
+	}
+	if _, err := st.AuthenticateNode(ctx, node.ID, "legacy-secret"); err != nil {
+		t.Fatalf("migrated token does not authenticate: %v", err)
+	}
+}
+
+func TestInvalidEncryptedNodeTokenPreventsStartup(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "nyarelay.db")
+	st, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := model.Node{ID: "node-invalid-token", Name: "node-invalid-token", Approved: true, CreatedAt: time.Now().UTC()}
+	if err := st.UpsertNode(ctx, node, "secret-token"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `UPDATE nodes SET token = '', token_encrypted = ? WHERE id = ?`, "corrupted", node.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(ctx, path); err == nil {
+		t.Fatal("expected startup to reject corrupted encrypted token")
+	}
+}
 
 func TestMarkNodeSeenCompletesPendingUpdateWhenReportedVersionIsNewer(t *testing.T) {
 	ctx := context.Background()
@@ -206,6 +471,29 @@ func TestPruneHistoryDeletesOnlyExpiredRows(t *testing.T) {
 	}
 	if metricsCount != 1 || auditCount != 1 {
 		t.Fatalf("remaining metrics/audit = %d/%d, want 1/1", metricsCount, auditCount)
+	}
+}
+
+func TestMetricSummarySaturatesLargeTotals(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	for i := 0; i < 16; i++ {
+		if _, err := st.db.ExecContext(ctx, `
+			INSERT INTO metrics (node_id, stat_id, stat_kind, bytes_in, bytes_out, connections, observed_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			"node-1", "forward:fwd-1", "forward", int64(1<<60), int64(1<<60), int64(1<<60), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	summary, err := st.MetricSummary(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary) != 1 {
+		t.Fatalf("summary count = %d, want 1", len(summary))
+	}
+	if summary[0].BytesIn != int64(^uint64(0)>>1) || summary[0].BytesOut != int64(^uint64(0)>>1) || summary[0].Connections != int64(^uint64(0)>>1) {
+		t.Fatalf("summary totals were not saturated: %#v", summary[0])
 	}
 }
 

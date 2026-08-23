@@ -13,6 +13,7 @@ import (
 const (
 	defaultCandidateMaxFails    = 1
 	defaultCandidateFailTimeout = 5 * time.Second
+	maxSelectionWeight          = 100
 )
 
 type candidateSelector struct {
@@ -360,10 +361,7 @@ func runtimeNodeSupportsProtocol(node model.TunnelRuntimeNode, protocol model.Fo
 func weightedCandidatePool(candidates []stageCandidate) []int {
 	pool := make([]int, 0, len(candidates))
 	for idx, candidate := range candidates {
-		weight := candidate.node.Weight
-		if weight <= 0 {
-			weight = 1
-		}
+		weight := boundedSelectionWeight(candidate.node.Weight)
 		for i := 0; i < weight; i++ {
 			pool = append(pool, idx)
 		}
@@ -436,15 +434,22 @@ func targetSupportsProtocol(protocols []model.ForwardProtocol, protocol model.Fo
 func weightedTargetPool(candidates []forwardTargetCandidate) []int {
 	pool := make([]int, 0, len(candidates))
 	for idx, candidate := range candidates {
-		weight := candidate.target.Weight
-		if weight <= 0 {
-			weight = 1
-		}
+		weight := boundedSelectionWeight(candidate.target.Weight)
 		for i := 0; i < weight; i++ {
 			pool = append(pool, idx)
 		}
 	}
 	return pool
+}
+
+func boundedSelectionWeight(weight int) int {
+	if weight <= 0 {
+		return 1
+	}
+	if weight > maxSelectionWeight {
+		return maxSelectionWeight
+	}
+	return weight
 }
 
 func normalizeForwardStrategy(strategy string) string {

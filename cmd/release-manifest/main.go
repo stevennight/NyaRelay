@@ -38,6 +38,7 @@ func main() {
 		Commit:    commit,
 		BuildDate: buildDate,
 	}
+	var payloads [][]byte
 	for _, target := range []struct {
 		os   string
 		arch string
@@ -50,6 +51,7 @@ func main() {
 		if err != nil {
 			fatal(err.Error())
 		}
+		payloads = append(payloads, payload)
 		sum := sha256.Sum256(payload)
 		manifest.Artifacts = append(manifest.Artifacts, model.NodeReleaseArtifact{
 			OS:     target.os,
@@ -93,6 +95,14 @@ func main() {
 		signature, err = sharedcrypto.SignJSON(privateKey, manifest)
 		if err != nil {
 			fatal(err.Error())
+		}
+		for index, artifact := range manifest.Artifacts {
+			artifactSignature, err := sharedcrypto.SignBytes(privateKey, payloads[index])
+			if err != nil {
+				fatal(err.Error())
+			}
+			artifactFilename := fmt.Sprintf("nyarelay-node-%s-%s.sig", artifact.OS, artifact.Arch)
+			writeText(filepath.Join(nodeDir, artifactFilename), artifactSignature+"\n")
 		}
 		if signatureOut != "" {
 			writeText(signatureOut, signature+"\n")

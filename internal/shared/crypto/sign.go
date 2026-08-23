@@ -55,6 +55,14 @@ func SignJSON(privateKey string, value any) (string, error) {
 	return EncodeKey(sig), nil
 }
 
+func SignBytes(privateKey string, payload []byte) (string, error) {
+	priv, err := DecodePrivateKey(privateKey)
+	if err != nil {
+		return "", err
+	}
+	return EncodeKey(ed25519.Sign(priv, payload)), nil
+}
+
 func VerifyJSON(publicKey string, value any, signature string) error {
 	pub, err := DecodePublicKey(publicKey)
 	if err != nil {
@@ -67,6 +75,24 @@ func VerifyJSON(publicKey string, value any, signature string) error {
 	payload, err := json.Marshal(value)
 	if err != nil {
 		return err
+	}
+	if !ed25519.Verify(pub, payload, sig) {
+		return errors.New("signature verification failed")
+	}
+	return nil
+}
+
+func VerifyBytes(publicKey string, payload []byte, signature string) error {
+	pub, err := DecodePublicKey(publicKey)
+	if err != nil {
+		return err
+	}
+	sig, err := base64.RawURLEncoding.DecodeString(signature)
+	if err != nil {
+		return err
+	}
+	if len(sig) != ed25519.SignatureSize {
+		return errors.New("invalid signature length")
 	}
 	if !ed25519.Verify(pub, payload, sig) {
 		return errors.New("signature verification failed")

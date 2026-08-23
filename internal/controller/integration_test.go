@@ -3,6 +3,7 @@ package controller
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"io"
@@ -21,8 +22,10 @@ import (
 	"nyarelay/internal/controller/nodehub"
 	"nyarelay/internal/controller/store"
 	"nyarelay/internal/node"
+	sharedcrypto "nyarelay/internal/shared/crypto"
 	"nyarelay/internal/shared/model"
 	"nyarelay/internal/shared/protocol"
+	sharedversion "nyarelay/internal/shared/version"
 )
 
 type controllerHarness struct {
@@ -50,7 +53,8 @@ func newControllerHarness(t *testing.T, listenAddr string) *controllerHarness {
 func newControllerHarnessInDir(t *testing.T, dir, listenAddr string) *controllerHarness {
 	t.Helper()
 	dbPath := filepath.Join(dir, "nyarelay.db")
-	st, err := store.Open(context.Background(), dbPath)
+	testSecretKey := sha256.Sum256([]byte("nyarelay-controller-test:" + dir))
+	st, err := store.OpenWithSecretKey(context.Background(), dbPath, testSecretKey[:])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -595,6 +599,13 @@ func TestControllerRestartAndNodeReconnectIntegration(t *testing.T) {
 func TestNodeInstallEndpointReturnsCommand(t *testing.T) {
 	h := newControllerHarness(t, "127.0.0.1:0")
 	_, _ = mustSigningKey(t, h.store), h
+	updatePublicKey, _, err := sharedcrypto.GenerateSigningKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	restoreUpdateKey := setUpdatePublicKeyForTest(t, updatePublicKey)
+	defer restoreUpdateKey()
+	h.server.cfg.PublicURL = "https://relay.example.com"
 
 	entry, token := createNode(t, h.server, "installer")
 	req := httptest.NewRequest(http.MethodGet, "/api/nodes/"+entry.ID+"/install", nil)
@@ -613,6 +624,28 @@ func TestNodeInstallEndpointReturnsCommand(t *testing.T) {
 	}
 	if resp.Command == "" || resp.ScriptURL == "" || resp.BinaryURL == "" {
 		t.Fatalf("missing install fields: %#v", resp)
+	}
+}
+
+func TestNodeInstallRejectsRemoteControllerWithoutUpdateKey(t *testing.T) {
+	h := newControllerHarness(t, "127.0.0.1:0")
+	h.server.cfg.PublicURL = "https://relay.example.com"
+	old := sharedversion.UpdatePublicKey
+	sharedversion.UpdatePublicKey = ""
+	t.Cleanup(func() { sharedversion.UpdatePublicKey = old })
+
+	req := httptest.NewRequest(http.MethodPost, "/api/nodes", bytes.NewReader([]byte(`{"name":"remote-installer"}`)))
+	rec := httptest.NewRecorder()
+	h.server.handleCreateNode(rec, req, auth.Session{UserID: 1, Username: "admin"})
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("create node status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	nodes, err := h.store.ListNodes(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 0 {
+		t.Fatalf("remote install failure created %d node(s)", len(nodes))
 	}
 }
 
@@ -764,7 +797,6 @@ func TestCompileConfigScopesAndRedactsTunnelSecrets(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-
 	tunnel := upsertTunnel(t, h.server, tunnelRequest{
 		ID:        "tun_scope",
 		Name:      "scope",
@@ -804,7 +836,6 @@ func TestCompileConfigScopesAndRedactsTunnelSecrets(t *testing.T) {
 			},
 		},
 	})
-
 	entrySigned, err := h.server.compileConfig(context.Background(), entry.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -884,6 +915,58 @@ func TestCompileConfigScopesAndRedactsTunnelSecrets(t *testing.T) {
 			assertRedactedTunnelSettings(t, stageNode.Settings)
 		}
 	}
+}
+
+func TestCompileConfigOmitsRevokedTunnelCandidates(t *testing.T) {
+	h := newControllerHarness(t, "127.0.0.1:0")
+
+	entry, _ := createNode(t, h.server, "entry-revocation")
+	exitA, _ := createNode(t, h.server, "exit-a-revocation")
+	exitB, _ := createNode(t, h.server, "exit-b-revocation")
+	for _, node := range []model.Node{entry, exitA, exitB} {
+		node.PublicHost = node.Name + ".example.com"
+		node.PortMin = 12000
+		node.PortMax = 12010
+		if err := h.store.UpdateNode(context.Background(), node); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tunnel := upsertTunnel(t, h.server, tunnelRequest{
+		ID:        "tun_revocation",
+		Name:      "revocation",
+		Type:      model.TunnelChain,
+		Transport: model.TunnelTransportDirect,
+		Enabled:   boolPtr(true),
+		Stages: []model.TunnelStage{
+			{ID: "stage_entry", Nodes: []model.TunnelStageNode{{ID: "node_entry", NodeID: entry.ID, Weight: 1}}},
+			{ID: "stage_exit", Nodes: []model.TunnelStageNode{
+				{ID: "node_exit_a", NodeID: exitA.ID, Weight: 1},
+				{ID: "node_exit_b", NodeID: exitB.ID, Weight: 1},
+			}},
+		},
+	})
+	if err := h.store.RevokeNode(context.Background(), exitB.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	signed, err := h.server.compileConfig(context.Background(), entry.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(signed.Config.Tunnels) != 1 {
+		t.Fatalf("entry config tunnels = %d, want 1", len(signed.Config.Tunnels))
+	}
+	var exitNodes []model.TunnelRuntimeNode
+	for _, stage := range signed.Config.Tunnels[0].Stages {
+		if stage.Role == model.TunnelStageExit {
+			exitNodes = stage.Nodes
+		}
+	}
+	if len(exitNodes) != 1 || exitNodes[0].NodeID != exitA.ID {
+		t.Fatalf("revoked exit candidate was not removed: %#v", exitNodes)
+	}
+	_ = tunnel
 }
 
 func mustSigningKey(t *testing.T, st *store.Store) string {

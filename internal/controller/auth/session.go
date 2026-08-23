@@ -20,6 +20,8 @@ type Sessions struct {
 	items    map[string]Session
 }
 
+const maxSessionEntries = 10000
+
 func NewSessions(lifetime time.Duration) *Sessions {
 	return &Sessions{
 		lifetime: lifetime,
@@ -40,6 +42,10 @@ func (s *Sessions) Create(userID int64, username string) (Session, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.pruneLocked(time.Now())
+	if len(s.items) >= maxSessionEntries {
+		s.evictSoonestExpiryLocked()
+	}
 	s.items[session.ID] = session
 	return session, nil
 }
@@ -62,4 +68,26 @@ func (s *Sessions) Delete(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.items, id)
+}
+
+func (s *Sessions) pruneLocked(now time.Time) {
+	for id, session := range s.items {
+		if !now.Before(session.ExpiresAt) {
+			delete(s.items, id)
+		}
+	}
+}
+
+func (s *Sessions) evictSoonestExpiryLocked() {
+	var oldestID string
+	var oldest time.Time
+	for id, session := range s.items {
+		if oldestID == "" || session.ExpiresAt.Before(oldest) {
+			oldestID = id
+			oldest = session.ExpiresAt
+		}
+	}
+	if oldestID != "" {
+		delete(s.items, oldestID)
+	}
 }

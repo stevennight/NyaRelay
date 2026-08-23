@@ -64,6 +64,13 @@ func ReadHello(r io.Reader) (RelayHello, error) {
 	if err := decoder.Decode(&hello); err != nil {
 		return RelayHello{}, err
 	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return RelayHello{}, errors.New("relay hello must contain one JSON value")
+		}
+		return RelayHello{}, err
+	}
 	if hello.Magic != Magic {
 		return RelayHello{}, errors.New("invalid relay hello magic")
 	}

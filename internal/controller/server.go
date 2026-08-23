@@ -3,20 +3,26 @@ package controller
 import (
 	"compress/gzip"
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
@@ -42,6 +48,32 @@ const (
 	historyAuditRetentionSetting   = "history_cleanup_audit_retention"
 	historyCleanupIntervalSetting  = "history_cleanup_interval"
 	failureCooldownSetting         = "relay_failure_cooldown"
+	maxUsernameBytes               = 64
+	controlWebSocketReadLimit      = 256 * 1024
+	controlWebSocketHelloTimeout   = 10 * time.Second
+	controlWebSocketIdleTimeout    = 90 * time.Second
+	nodeConfigLease                = 15 * time.Minute
+	maxNodeCredentialBytes         = 256
+	maxNodeNameBytes               = 256
+	maxNodeLabelEntries            = 64
+	maxNodeLabelKeyBytes           = 128
+	maxNodeLabelValueBytes         = 1024
+	maxNodeMetadataBytes           = 256
+	maxNodeVersionBytes            = 128
+	maxNodeUpdateErrorBytes        = 2048
+	maxMetricStats                 = 512
+	maxMetricIDBytes               = 256
+	maxAgentErrors                 = 64
+	maxAgentErrorScopeBytes        = 128
+	maxAgentErrorMessageBytes      = 2048
+	maxMetricValue                 = int64(1 << 60)
+	maxMetricGoroutines            = 1 << 20
+	maxMetricTimeSkew              = 24 * time.Hour
+	minNodeMetricsInterval         = 5 * time.Second
+	maxNodeMetricsRateEntries      = 10000
+	nodeMetricsRateEntryTTL        = 15 * time.Minute
+	maxProxyHeaderBytes            = 256
+	dummyPasswordHash              = "pbkdf2-sha256$210000$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 )
 
 type historyCleanupConfig struct {
@@ -56,6 +88,7 @@ type Server struct {
 	store           *store.Store
 	sessions        *auth.Sessions
 	limiter         *auth.LoginLimiter
+	nodeLimiter     *auth.LoginLimiter
 	hub             *nodehub.Hub
 	mux             *http.ServeMux
 	cleanupMu       sync.RWMutex
@@ -63,6 +96,12 @@ type Server struct {
 	cleanupWake     chan struct{}
 	failureMu       sync.RWMutex
 	failureCooldown time.Duration
+	nodeSocketMu    sync.Mutex
+	releaseMu       sync.Mutex
+	releaseCache    model.SignedNodeRelease
+	releaseCachedAt time.Time
+	metricsMu       sync.Mutex
+	metricsLast     map[string]time.Time
 }
 
 func Run(ctx context.Context, args []string) error {
@@ -74,7 +113,14 @@ func Run(ctx context.Context, args []string) error {
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return err
 	}
-	st, err := store.Open(ctx, cfg.DBPath)
+	if err := os.Chmod(cfg.DataDir, 0o700); err != nil {
+		return err
+	}
+	secretKey, err := loadControllerSecretsKey(cfg)
+	if err != nil {
+		return err
+	}
+	st, err := store.OpenWithSecretKey(ctx, cfg.DBPath, secretKey)
 	if err != nil {
 		return err
 	}
@@ -86,6 +132,7 @@ func Run(ctx context.Context, args []string) error {
 		store:           st,
 		sessions:        auth.NewSessions(cfg.SessionLifetime),
 		limiter:         auth.NewLoginLimiter(),
+		nodeLimiter:     auth.NewLoginLimiter(),
 		hub:             nodehub.New(),
 		mux:             http.NewServeMux(),
 		cleanupConfig:   historyCleanupConfigFromConfig(cfg),
@@ -109,7 +156,11 @@ func Run(ctx context.Context, args []string) error {
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           secureHeaders(s.mux),
+		ReadTimeout:       30 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      35 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 	errCh := make(chan error, 1)
 	go func() {
@@ -176,22 +227,58 @@ func (s *Server) routes() {
 
 	s.mux.HandleFunc("GET /install.sh", s.handleInstallScript)
 	s.mux.HandleFunc("GET /downloads/nyarelay-node/manifest", s.handleDownloadNodeReleaseManifest)
+	s.mux.HandleFunc("GET /downloads/nyarelay-node/signature", s.handleDownloadNodeBinarySignature)
 	s.mux.HandleFunc("GET /downloads/nyarelay-node", s.handleDownloadNodeBinary)
 	s.mux.HandleFunc("/", s.handleWeb)
 }
 
 func (s *Server) ensureSigningKey(ctx context.Context) error {
-	if _, ok, err := s.store.GetSetting(ctx, signingKeySetting); err != nil || ok {
+	privateValue, privateOK, err := s.store.GetSetting(ctx, signingKeySetting)
+	if err != nil {
 		return err
 	}
+	publicValue, publicOK, err := s.store.GetSetting(ctx, signingPubSetting)
+	if err != nil {
+		return err
+	}
+	if privateOK && !publicOK {
+		privateKey, err := sharedcrypto.DecodePrivateKey(privateValue)
+		if err != nil {
+			return fmt.Errorf("invalid persisted signing private key: %w", err)
+		}
+		publicKey, ok := privateKey.Public().(ed25519.PublicKey)
+		if !ok {
+			return errors.New("invalid persisted signing private key")
+		}
+		return s.store.SetSetting(ctx, signingPubSetting, sharedcrypto.EncodeKey(publicKey))
+	}
+	if !privateOK && publicOK {
+		return errors.New("persisted signing key pair is incomplete")
+	}
+	if privateOK && publicOK {
+		privateKey, err := sharedcrypto.DecodePrivateKey(privateValue)
+		if err != nil {
+			return fmt.Errorf("invalid persisted signing private key: %w", err)
+		}
+		publicKey, err := sharedcrypto.DecodePublicKey(publicValue)
+		if err != nil {
+			return fmt.Errorf("invalid persisted signing public key: %w", err)
+		}
+		derived, ok := privateKey.Public().(ed25519.PublicKey)
+		if !ok || string(derived) != string(publicKey) {
+			return errors.New("persisted signing key pair does not match")
+		}
+		return nil
+	}
+
 	pub, priv, err := sharedcrypto.GenerateSigningKey()
 	if err != nil {
 		return err
 	}
-	if err := s.store.SetSetting(ctx, signingKeySetting, priv); err != nil {
-		return err
-	}
-	return s.store.SetSetting(ctx, signingPubSetting, pub)
+	return s.store.SetSettings(ctx, map[string]string{
+		signingKeySetting: priv,
+		signingPubSetting: pub,
+	})
 }
 
 func (s *Server) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
@@ -207,15 +294,26 @@ func (s *Server) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
+	if !s.requireSameOrigin(w, r) {
+		return
+	}
 	count, err := s.store.UserCount(r.Context())
 	if err != nil {
 		writeError(w, err, http.StatusInternalServerError)
 		return
 	}
 	if count > 0 {
-		writeError(w, errors.New("setup is already complete"), http.StatusConflict)
+		writeError(w, store.ErrSetupComplete, http.StatusConflict)
 		return
 	}
+	setupKey := "setup:" + s.loginIPLimitKey(r)
+	if !s.limiter.Allow(setupKey) {
+		writeError(w, errors.New("too many setup attempts"), http.StatusTooManyRequests)
+		return
+	}
+	// Count the request before password hashing so unauthenticated setup cannot
+	// be used as an unbounded PBKDF2 workload. A successful setup clears it.
+	s.limiter.Fail(setupKey)
 	var req struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -224,27 +322,40 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err, http.StatusBadRequest)
 		return
 	}
+	username := strings.TrimSpace(req.Username)
+	if err := validateUsername(username); err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
 	hash, err := auth.HashPassword(req.Password)
 	if err != nil {
 		writeError(w, err, http.StatusBadRequest)
 		return
 	}
-	user, err := s.store.CreateUser(r.Context(), strings.TrimSpace(req.Username), hash)
+	user, err := s.store.CreateInitialUser(r.Context(), username, hash)
 	if err != nil {
+		if errors.Is(err, store.ErrSetupComplete) {
+			writeError(w, err, http.StatusConflict)
+			return
+		}
 		writeError(w, err, http.StatusBadRequest)
 		return
 	}
+	s.limiter.Success(setupKey)
 	_ = s.store.AddAudit(r.Context(), user.Username, "setup.complete", "controller", map[string]string{"username": user.Username})
 	session, err := s.sessions.Create(user.ID, user.Username)
 	if err != nil {
 		writeError(w, err, http.StatusInternalServerError)
 		return
 	}
-	setSessionCookie(w, r, session)
+	s.setSessionCookie(w, r, session)
 	writeJSON(w, map[string]any{"user": user})
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if !s.requireSameOrigin(w, r) {
+		return
+	}
 	var req struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -254,22 +365,42 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err, http.StatusBadRequest)
 		return
 	}
-	limitKey := loginLimitKey(r, req.Username)
-	if !s.limiter.Allow(limitKey) {
+	username := strings.TrimSpace(req.Username)
+	limitKeys := s.loginLimitKeys(r, username)
+	if !s.allowLogin(limitKeys) {
 		writeError(w, errors.New("too many failed login attempts"), http.StatusTooManyRequests)
 		return
 	}
-	user, err := s.store.FindUserByUsername(r.Context(), req.Username)
-	if err != nil || !auth.VerifyPassword(user.PasswordHash, req.Password) {
-		s.limiter.Fail(limitKey)
+	failLogin := func() {
+		for _, key := range limitKeys {
+			s.limiter.Fail(key)
+		}
+	}
+	successLogin := func() {
+		for _, key := range limitKeys {
+			s.limiter.Success(key)
+		}
+	}
+	if err := validateUsername(username); err != nil {
+		failLogin()
+		writeError(w, errors.New("invalid username or password"), http.StatusUnauthorized)
+		return
+	}
+	user, err := s.store.FindUserByUsername(r.Context(), username)
+	passwordHash := dummyPasswordHash
+	if err == nil {
+		passwordHash = user.PasswordHash
+	}
+	if err != nil || !auth.VerifyPassword(passwordHash, req.Password) {
+		failLogin()
 		writeError(w, errors.New("invalid username or password"), http.StatusUnauthorized)
 		return
 	}
 	if user.TOTPEnabled {
 		secret, _, err := s.store.TOTPSecret(r.Context(), user.ID)
 		if err != nil || !auth.VerifyTOTP(secret, req.TOTPCode, time.Now()) {
-			s.limiter.Fail(limitKey)
-			writeError(w, errors.New("invalid totp code"), http.StatusUnauthorized)
+			failLogin()
+			writeError(w, errors.New("invalid username or password"), http.StatusUnauthorized)
 			return
 		}
 	}
@@ -278,8 +409,8 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err, http.StatusInternalServerError)
 		return
 	}
-	s.limiter.Success(limitKey)
-	setSessionCookie(w, r, session)
+	successLogin()
+	s.setSessionCookie(w, r, session)
 	_ = s.store.AddAudit(r.Context(), user.Username, "auth.login", "controller", map[string]any{"ip": r.RemoteAddr})
 	writeJSON(w, map[string]any{"user": user})
 }
@@ -334,9 +465,17 @@ func (s *Server) handleTOTPDisable(w http.ResponseWriter, r *http.Request, sessi
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
-func (s *Server) handleLogout(w http.ResponseWriter, _ *http.Request, session auth.Session) {
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, session auth.Session) {
 	s.sessions.Delete(session.ID)
-	http.SetCookie(w, &http.Cookie{Name: sessionCookieName, Value: "", Path: "/", MaxAge: -1})
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   s.sessionCookieSecure(r),
+	})
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
@@ -423,7 +562,11 @@ func (s *Server) handleUpdateControllerInfo(w http.ResponseWriter, r *http.Reque
 	settings := make(map[string]string)
 	changes := make(map[string]string)
 	if req.PublicURL != nil {
-		value := strings.TrimSpace(*req.PublicURL)
+		value, err := normalizeControllerURL(*req.PublicURL)
+		if err != nil {
+			writeError(w, fmt.Errorf("public_url: %w", err), http.StatusBadRequest)
+			return
+		}
 		settings[controllerPublicURLSetting] = value
 		changes["public_url"] = value
 	}
@@ -448,7 +591,7 @@ func (s *Server) handleUpdateControllerInfo(w http.ResponseWriter, r *http.Reque
 		changes["audit_retention"] = formatNonNegativeDuration(parsed)
 	}
 	if req.CleanupInterval != nil {
-		parsed, err := parseNonNegativeDuration(*req.CleanupInterval)
+		parsed, err := parseCleanupInterval(*req.CleanupInterval)
 		if err != nil {
 			writeError(w, fmt.Errorf("cleanup_interval: %w", err), http.StatusBadRequest)
 			return
@@ -535,12 +678,17 @@ func (s *Server) handleGetNodeInstall(w http.ResponseWriter, r *http.Request, _ 
 		writeError(w, err, http.StatusInternalServerError)
 		return
 	}
+	updateSigningKey, err := installUpdateSigningKey(controllerURL)
+	if err != nil {
+		writeError(w, err, http.StatusServiceUnavailable)
+		return
+	}
 	writeJSON(w, NodeInstallInfo{
 		Node:      node,
 		Token:     token,
 		ScriptURL: installScriptURL(controllerURL),
 		BinaryURL: nodeBinaryURL(controllerURL),
-		Command:   installCommand(controllerURL, node.ID, token, pub),
+		Command:   installCommand(controllerURL, node.ID, token, pub, updateSigningKey),
 	})
 }
 
@@ -556,8 +704,8 @@ func (s *Server) handleCreateNode(w http.ResponseWriter, r *http.Request, sessio
 		writeError(w, err, http.StatusBadRequest)
 		return
 	}
-	if strings.TrimSpace(req.Name) == "" {
-		writeError(w, errors.New("node name is required"), http.StatusBadRequest)
+	if err := validateNodeInput(req.Name, req.Labels, req.PublicHost); err != nil {
+		writeError(w, err, http.StatusBadRequest)
 		return
 	}
 	if err := validateNodePortRange(req.PortMin, req.PortMax); err != nil {
@@ -568,6 +716,11 @@ func (s *Server) handleCreateNode(w http.ResponseWriter, r *http.Request, sessio
 	pub, _, err := s.store.GetSetting(r.Context(), signingPubSetting)
 	if err != nil {
 		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	updateSigningKey, err := installUpdateSigningKey(controllerURL)
+	if err != nil {
+		writeError(w, err, http.StatusServiceUnavailable)
 		return
 	}
 	token, err := randomToken()
@@ -594,7 +747,7 @@ func (s *Server) handleCreateNode(w http.ResponseWriter, r *http.Request, sessio
 	s.hub.SetRevision(rev)
 	s.pushConfigs(r.Context())
 	_ = s.store.AddAudit(r.Context(), session.Username, "node.create", node.ID, map[string]string{"name": node.Name})
-	writeJSON(w, buildNodeInstallInfo(controllerURL, pub, node, token))
+	writeJSON(w, buildNodeInstallInfo(controllerURL, pub, updateSigningKey, node, token))
 }
 
 func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request, session auth.Session) {
@@ -614,8 +767,8 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request, sessio
 		writeError(w, err, http.StatusBadRequest)
 		return
 	}
-	if strings.TrimSpace(req.Name) == "" {
-		writeError(w, errors.New("node name is required"), http.StatusBadRequest)
+	if err := validateNodeInput(req.Name, req.Labels, req.PublicHost); err != nil {
+		writeError(w, err, http.StatusBadRequest)
 		return
 	}
 	if err := validateNodePortRange(req.PortMin, req.PortMax); err != nil {
@@ -646,12 +799,35 @@ func (s *Server) handleRevokeNode(w http.ResponseWriter, r *http.Request, sessio
 		writeError(w, err, http.StatusBadRequest)
 		return
 	}
-	if err := s.store.RevokeNode(r.Context(), req.ID); err != nil {
+	if err := validateNodeText("node id", req.ID, validate.MaxIDBytes, false); err != nil {
 		writeError(w, err, http.StatusBadRequest)
 		return
 	}
-	rev, _ := s.store.BumpRevision(r.Context())
-	s.hub.SetRevision(rev)
+	s.nodeSocketMu.Lock()
+	revokeErr := s.store.RevokeNode(r.Context(), req.ID)
+	var revisionErr error
+	if revokeErr == nil {
+		var revision int64
+		revision, revisionErr = s.store.BumpRevision(r.Context())
+		if revisionErr == nil {
+			s.hub.SetRevision(revision)
+			// Push a higher-revision empty config before closing the control
+			// socket so an online node stops its data plane immediately.
+			if err := s.pushConfig(r.Context(), req.ID); err != nil && !errors.Is(err, nodehub.ErrNotConnected) {
+				s.log.Warn("send revoked node empty config failed", "node", req.ID, "error", err)
+			}
+		}
+		s.hub.Close(req.ID, websocket.StatusPolicyViolation, "node revoked")
+	}
+	s.nodeSocketMu.Unlock()
+	if revokeErr != nil {
+		writeError(w, revokeErr, http.StatusBadRequest)
+		return
+	}
+	if revisionErr != nil {
+		writeError(w, revisionErr, http.StatusInternalServerError)
+		return
+	}
 	s.pushConfigs(r.Context())
 	_ = s.store.AddAudit(r.Context(), session.Username, "node.revoke", req.ID, map[string]string{"id": req.ID})
 	writeJSON(w, map[string]bool{"ok": true})
@@ -917,6 +1093,17 @@ type forwardRequest struct {
 }
 
 func (s *Server) prepareTunnel(ctx context.Context, req tunnelRequest) (model.Tunnel, []model.PortAllocation, error) {
+	if len(req.Stages) > validate.MaxTunnelStages {
+		return model.Tunnel{}, nil, fmt.Errorf("tunnel has too many stages (maximum %d)", validate.MaxTunnelStages)
+	}
+	if req.Type == model.TunnelChain && len(req.MiddleNodes)+2 > validate.MaxTunnelStages {
+		return model.Tunnel{}, nil, fmt.Errorf("tunnel has too many stages (maximum %d)", validate.MaxTunnelStages)
+	}
+	for index, stage := range req.Stages {
+		if len(stage.Nodes) > validate.MaxStageNodes {
+			return model.Tunnel{}, nil, fmt.Errorf("stage %d has too many nodes (maximum %d)", index, validate.MaxStageNodes)
+		}
+	}
 	if strings.TrimSpace(req.ID) == "" {
 		req.ID = ids.New("tun")
 	}
@@ -1380,6 +1567,9 @@ func normalizeForwardTargets(forwardID, legacyTarget string, requested []model.F
 	if len(targets) == 0 {
 		return nil, errors.New("forward target is required")
 	}
+	if len(targets) > validate.MaxForwardTargets {
+		return nil, fmt.Errorf("forward has too many targets (maximum %d)", validate.MaxForwardTargets)
+	}
 	out := make([]model.ForwardTarget, 0, len(targets))
 	seenIDs := map[string]bool{}
 	for index, target := range targets {
@@ -1781,7 +1971,14 @@ func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request, nod
 		Version string           `json:"version"`
 		System  model.NodeSystem `json:"system"`
 	}
-	_ = readJSON(r, &req)
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
+	if err := validateNodeHeartbeat(req.Version, req.System); err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
 	if err := s.store.MarkNodeSeen(r.Context(), node.ID, req.System, req.Version); err != nil {
 		writeError(w, err, http.StatusInternalServerError)
 		return
@@ -1795,7 +1992,38 @@ func (s *Server) handleNodeWS(w http.ResponseWriter, r *http.Request, node model
 		return
 	}
 	defer closeWebSocket(conn, websocket.StatusNormalClosure, "bye")
+	conn.SetReadLimit(controlWebSocketReadLimit)
+
+	var hello sharedprotocol.ControlMessage
+	helloCtx, cancelHello := context.WithTimeout(r.Context(), controlWebSocketHelloTimeout)
+	err = wsjson.Read(helloCtx, conn, &hello)
+	cancelHello()
+	if err != nil {
+		logNodeWebSocketReadFailure(s.log, r.Context(), err, "node", node.ID, "phase", "hello")
+		return
+	}
+	if hello.Type != "hello" {
+		s.log.Warn("node websocket hello rejected", "node", node.ID, "type", hello.Type)
+		return
+	}
+	if err := validateNodeHello(node.ID, hello); err != nil {
+		s.log.Warn("node websocket hello rejected", "node", node.ID, "error", err)
+		return
+	}
+	s.nodeSocketMu.Lock()
+	current, err := s.store.GetNode(r.Context(), node.ID)
+	if err != nil || current.Revoked || !current.Approved {
+		s.nodeSocketMu.Unlock()
+		return
+	}
+	if err := s.store.MarkNodeSeen(r.Context(), node.ID, hello.System, hello.Version); err != nil {
+		s.nodeSocketMu.Unlock()
+		s.log.Error("mark node seen failed", "node", node.ID, "error", err)
+		return
+	}
+	s.log.Info("node online", "node", node.ID, "version", hello.Version)
 	s.hub.RegisterSocket(node.ID, conn)
+	s.nodeSocketMu.Unlock()
 	defer func() {
 		if s.hub.UnregisterSocket(node.ID, conn) {
 			if err := s.store.MarkNodeOffline(context.Background(), node.ID); err != nil {
@@ -1805,36 +2033,27 @@ func (s *Server) handleNodeWS(w http.ResponseWriter, r *http.Request, node model
 			}
 		}
 	}()
-
-	var hello sharedprotocol.ControlMessage
-	if err := wsjson.Read(r.Context(), conn, &hello); err != nil {
-		logNodeWebSocketReadFailure(s.log, r.Context(), err, "node", node.ID, "phase", "hello")
-		return
-	}
-	if hello.Type != "hello" {
-		s.log.Warn("node websocket hello rejected", "node", node.ID, "type", hello.Type)
-		_ = wsjson.Write(r.Context(), conn, sharedprotocol.ControlMessage{Type: "error", Error: "expected hello"})
-		return
-	}
-	if err := s.store.MarkNodeSeen(r.Context(), node.ID, hello.System, hello.Version); err != nil {
-		s.log.Error("mark node seen failed", "node", node.ID, "error", err)
-		return
-	}
-	s.log.Info("node online", "node", node.ID, "version", hello.Version)
-	if err := s.sendNodeConfig(r.Context(), node.ID, conn); err != nil {
+	if err := s.pushConfig(r.Context(), node.ID); err != nil {
 		s.log.Warn("send node config failed", "node", node.ID, "error", err)
 		return
 	}
 	if err := s.sendNodeUpdateIfNeeded(r.Context(), node.ID, func(msg sharedprotocol.ControlMessage) error {
-		return wsjson.Write(r.Context(), conn, msg)
+		return s.hub.SendContext(r.Context(), node.ID, msg)
 	}); err != nil {
 		logNodeWebSocketFailure(s.log, r.Context(), "send node update failed", err, "node", node.ID)
 	}
 
 	for {
 		var msg sharedprotocol.ControlMessage
-		if err := wsjson.Read(r.Context(), conn, &msg); err != nil {
+		readCtx, cancelRead := context.WithTimeout(r.Context(), controlWebSocketIdleTimeout)
+		err := wsjson.Read(readCtx, conn, &msg)
+		cancelRead()
+		if err != nil {
 			logNodeWebSocketReadFailure(s.log, r.Context(), err, "node", node.ID)
+			return
+		}
+		if err := validateNodeControlMessage(node.ID, msg); err != nil {
+			s.log.Warn("node websocket message rejected", "node", node.ID, "error", err)
 			return
 		}
 		switch msg.Type {
@@ -1851,7 +2070,7 @@ func (s *Server) handleNodeWS(w http.ResponseWriter, r *http.Request, node model
 				logNodeWebSocketFailure(s.log, r.Context(), "push node update failed", err, "node", node.ID)
 			}
 		case "pull_config":
-			if err := s.sendNodeConfig(r.Context(), node.ID, conn); err != nil {
+			if err := s.pushConfig(r.Context(), node.ID); err != nil {
 				s.log.Warn("send node config failed", "node", node.ID, "error", err)
 			}
 		case "update_status":
@@ -1899,6 +2118,10 @@ func (s *Server) handleNodeEvents(w http.ResponseWriter, r *http.Request, node m
 }
 
 func (s *Server) handleNodeMetrics(w http.ResponseWriter, r *http.Request, node model.Node) {
+	if !s.allowNodeMetrics(node.ID) {
+		writeError(w, errors.New("metrics reports are too frequent"), http.StatusTooManyRequests)
+		return
+	}
 	var report model.MetricsReport
 	if err := readJSON(r, &report); err != nil {
 		writeError(w, err, http.StatusBadRequest)
@@ -1908,6 +2131,10 @@ func (s *Server) handleNodeMetrics(w http.ResponseWriter, r *http.Request, node 
 	if report.ObservedAt.IsZero() {
 		report.ObservedAt = time.Now().UTC()
 	}
+	if err := validateMetricsReport(report); err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
 	if err := s.store.InsertMetrics(r.Context(), report); err != nil {
 		writeError(w, err, http.StatusInternalServerError)
 		return
@@ -1915,15 +2142,36 @@ func (s *Server) handleNodeMetrics(w http.ResponseWriter, r *http.Request, node 
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
-func (s *Server) sendNodeConfig(ctx context.Context, nodeID string, conn *websocket.Conn) error {
-	signed, err := s.compileConfig(ctx, nodeID)
-	if err != nil {
-		return err
+func (s *Server) allowNodeMetrics(nodeID string) bool {
+	now := time.Now()
+	s.metricsMu.Lock()
+	defer s.metricsMu.Unlock()
+	if s.metricsLast == nil {
+		s.metricsLast = make(map[string]time.Time)
 	}
-	return wsjson.Write(ctx, conn, sharedprotocol.ControlMessage{
-		Type:   "config",
-		Config: &signed,
-	})
+	if last, ok := s.metricsLast[nodeID]; ok && now.Sub(last) < minNodeMetricsInterval {
+		return false
+	}
+	for id, last := range s.metricsLast {
+		if now.Sub(last) > nodeMetricsRateEntryTTL {
+			delete(s.metricsLast, id)
+		}
+	}
+	if _, exists := s.metricsLast[nodeID]; !exists && len(s.metricsLast) >= maxNodeMetricsRateEntries {
+		var oldestID string
+		var oldest time.Time
+		for id, last := range s.metricsLast {
+			if oldestID == "" || last.Before(oldest) {
+				oldestID = id
+				oldest = last
+			}
+		}
+		if oldestID != "" {
+			delete(s.metricsLast, oldestID)
+		}
+	}
+	s.metricsLast[nodeID] = now
+	return true
 }
 
 func (s *Server) pushConfigs(ctx context.Context) {
@@ -1939,12 +2187,12 @@ func (s *Server) pushConfig(ctx context.Context, nodeID string) error {
 	if err != nil {
 		return err
 	}
-	return s.hub.Send(nodeID, sharedprotocol.ControlMessage{Type: "config", Config: &signed})
+	return s.hub.SendContext(ctx, nodeID, sharedprotocol.ControlMessage{Type: "config", Config: &signed})
 }
 
 func (s *Server) pushNodeUpdate(ctx context.Context, nodeID string) error {
 	return s.sendNodeUpdateIfNeeded(ctx, nodeID, func(msg sharedprotocol.ControlMessage) error {
-		return s.hub.Send(nodeID, msg)
+		return s.hub.SendContext(ctx, nodeID, msg)
 	})
 }
 
@@ -1982,6 +2230,12 @@ func (s *Server) compileConfig(ctx context.Context, nodeID string) (model.Signed
 	if err != nil {
 		return model.SignedConfig{}, err
 	}
+	activeNodeIDs := make(map[string]bool, len(nodes))
+	for _, node := range nodes {
+		if !node.Revoked {
+			activeNodeIDs[node.ID] = true
+		}
+	}
 	tunnels, err := s.store.ListTunnels(ctx)
 	if err != nil {
 		return model.SignedConfig{}, err
@@ -1994,18 +2248,16 @@ func (s *Server) compileConfig(ctx context.Context, nodeID string) (model.Signed
 	if err != nil {
 		return model.SignedConfig{}, err
 	}
-	nodes = activeNodes(nodes)
-	scopedTunnels, scopedForwards := scopeConfigForNode(nodeID, tunnels, forwards)
+	scopedTunnels, scopedForwards := scopeConfigForNodeWithActiveNodes(nodeID, activeNodeIDs, tunnels, forwards)
 	cfg := model.RelayConfig{
 		Revision:               rev,
 		IssuedAt:               time.Now().UTC(),
 		NodeID:                 nodeID,
-		Nodes:                  nodes,
 		Tunnels:                scopedTunnels,
 		Forwards:               scopedForwards,
 		FailureCooldownSeconds: int64(s.currentFailureCooldown() / time.Second),
-		ExpiresAt:              time.Now().UTC().Add(7 * 24 * time.Hour),
 	}
+	cfg.ExpiresAt = cfg.IssuedAt.Add(nodeConfigLease)
 	priv, _, err := s.store.GetSetting(ctx, signingKeySetting)
 	if err != nil {
 		return model.SignedConfig{}, err
@@ -2033,6 +2285,10 @@ func activeNodes(nodes []model.Node) []model.Node {
 }
 
 func scopeConfigForNode(nodeID string, tunnels []model.Tunnel, forwards []model.Forward) ([]model.TunnelRuntime, []model.ForwardRuntime) {
+	return scopeConfigForNodeWithActiveNodes(nodeID, nil, tunnels, forwards)
+}
+
+func scopeConfigForNodeWithActiveNodes(nodeID string, activeNodeIDs map[string]bool, tunnels []model.Tunnel, forwards []model.Forward) ([]model.TunnelRuntime, []model.ForwardRuntime) {
 	forwardsByTunnel := make(map[string][]model.Forward)
 	for _, forward := range forwards {
 		forwardsByTunnel[forward.TunnelID] = append(forwardsByTunnel[forward.TunnelID], forward)
@@ -2040,6 +2296,13 @@ func scopeConfigForNode(nodeID string, tunnels []model.Tunnel, forwards []model.
 	var scopedTunnels []model.TunnelRuntime
 	var scopedForwards []model.ForwardRuntime
 	for _, tunnel := range tunnels {
+		if activeNodeIDs != nil {
+			var ok bool
+			tunnel, ok = filterActiveTunnelNodes(tunnel, activeNodeIDs)
+			if !ok {
+				continue
+			}
+		}
 		if !tunnel.Enabled || !nodeParticipatesInTunnel(nodeID, tunnel) {
 			continue
 		}
@@ -2057,13 +2320,31 @@ func scopeConfigForNode(nodeID string, tunnels []model.Tunnel, forwards []model.
 	return scopedTunnels, scopedForwards
 }
 
+func filterActiveTunnelNodes(tunnel model.Tunnel, activeNodeIDs map[string]bool) (model.Tunnel, bool) {
+	filtered := tunnel
+	filtered.Stages = make([]model.TunnelStage, 0, len(tunnel.Stages))
+	for _, stage := range tunnel.Stages {
+		originalNodes := stage.Nodes
+		stage.Nodes = make([]model.TunnelStageNode, 0, len(stage.Nodes))
+		for _, node := range originalNodes {
+			if activeNodeIDs[node.NodeID] {
+				stage.Nodes = append(stage.Nodes, node)
+			}
+		}
+		if len(stage.Nodes) == 0 {
+			return model.Tunnel{}, false
+		}
+		filtered.Stages = append(filtered.Stages, stage)
+	}
+	return filtered, len(filtered.Stages) > 0
+}
+
 func scopeTunnelRuntime(nodeID string, tunnel model.Tunnel) model.TunnelRuntime {
 	runtime := model.TunnelRuntime{
 		ID:        tunnel.ID,
 		Name:      tunnel.Name,
 		Type:      tunnel.Type,
 		Transport: tunnel.Transport,
-		Settings:  copyStringMap(tunnel.Settings),
 	}
 	for stageIndex, stage := range tunnel.Stages {
 		runtimeStage := model.TunnelRuntimeStage{
@@ -2219,19 +2500,11 @@ func copySetting(dst map[string]string, src map[string]string, key string) {
 	}
 }
 
-func copyStringMap(src map[string]string) map[string]string {
-	if len(src) == 0 {
-		return nil
-	}
-	dst := make(map[string]string, len(src))
-	for key, value := range src {
-		dst[key] = value
-	}
-	return dst
-}
-
 func (s *Server) withAuth(next func(http.ResponseWriter, *http.Request, auth.Session)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if stateChangingMethod(r.Method) && !s.requireSameOrigin(w, r) {
+			return
+		}
 		cookie, err := r.Cookie(sessionCookieName)
 		if err != nil {
 			writeError(w, errors.New("authentication required"), http.StatusUnauthorized)
@@ -2250,58 +2523,231 @@ func (s *Server) withNode(next func(http.ResponseWriter, *http.Request, model.No
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := r.Header.Get("X-NyaRelay-Node-ID")
 		token := r.Header.Get("X-NyaRelay-Node-Token")
+		limiter := s.nodeAuthLimiter()
+		limitKeys := s.nodeAuthLimitKeys(r, id)
+		if !allowLimiterKeys(limiter, limitKeys) {
+			writeError(w, errors.New("too many node authentication attempts"), http.StatusTooManyRequests)
+			return
+		}
+		failAuth := func() {
+			failLimiterKeys(limiter, limitKeys)
+		}
+		succeedAuth := func() {
+			successLimiterKeys(limiter, limitKeys)
+		}
 		if id == "" || token == "" {
+			failAuth()
 			writeError(w, errors.New("node credentials are required"), http.StatusUnauthorized)
+			return
+		}
+		if len(id) > validate.MaxIDBytes || len(token) > maxNodeCredentialBytes {
+			failAuth()
+			writeError(w, errors.New("node credentials are invalid"), http.StatusUnauthorized)
+			return
+		}
+		if err := validateNodeText("node id", id, validate.MaxIDBytes, false); err != nil {
+			failAuth()
+			writeError(w, errors.New("node credentials are invalid"), http.StatusUnauthorized)
 			return
 		}
 		node, err := s.store.AuthenticateNode(r.Context(), id, token)
 		if err != nil {
-			writeError(w, err, http.StatusUnauthorized)
+			failAuth()
+			// Keep missing-node and invalid-token responses indistinguishable.
+			writeError(w, errors.New("node credentials are invalid"), http.StatusUnauthorized)
 			return
 		}
+		succeedAuth()
 		next(w, r, node)
 	}
 }
 
 func setSessionCookie(w http.ResponseWriter, r *http.Request, session auth.Session) {
+	setSessionCookieWithProxy(w, r, session, false)
+}
+
+func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request, session auth.Session) {
+	setSessionCookieWithProxy(w, r, session, s.sessionCookieSecure(r))
+}
+
+func setSessionCookieWithProxy(w http.ResponseWriter, r *http.Request, session auth.Session, secure bool) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    session.ID,
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   requestIsSecure(r),
+		Secure:   secure || requestIsSecure(r),
 		Expires:  session.ExpiresAt,
 	})
 }
 
+func (s *Server) sessionCookieSecure(r *http.Request) bool {
+	if requestIsSecureForProxy(r, s.proxyHeadersTrusted(r)) {
+		return true
+	}
+	publicURL := s.cfg.PublicURL
+	if s.store != nil {
+		publicURL = s.controllerPublicURL(r.Context())
+	}
+	u, err := url.Parse(publicURL)
+	return err == nil && strings.EqualFold(u.Scheme, "https")
+}
+
 func loginLimitKey(r *http.Request, username string) string {
-	return requestClientIP(r) + ":" + strings.TrimSpace(username)
+	return loginUserIPLimitKey(requestClientIP(r), username)
+}
+
+func (s *Server) loginLimitKey(r *http.Request, username string) string {
+	return loginUserIPLimitKey(s.loginIPLimitKey(r), username)
+}
+
+func (s *Server) loginIPLimitKey(r *http.Request) string {
+	return requestClientIPForProxy(r, s.proxyHeadersTrusted(r))
+}
+
+func (s *Server) loginLimitKeys(r *http.Request, username string) []string {
+	ip := s.loginIPLimitKey(r)
+	return []string{
+		"login:ip:" + ip,
+		loginUserIPLimitKey(ip, username),
+	}
+}
+
+func loginUserIPLimitKey(ip, username string) string {
+	digest := sha256.Sum256([]byte(username + "\x00" + ip))
+	return fmt.Sprintf("login:user-ip:%x", digest)
+}
+
+func (s *Server) allowLogin(keys []string) bool {
+	return allowLimiterKeys(s.limiter, keys)
+}
+
+func (s *Server) nodeAuthLimiter() *auth.LoginLimiter {
+	if s.nodeLimiter != nil {
+		return s.nodeLimiter
+	}
+	return s.limiter
+}
+
+func (s *Server) nodeAuthLimitKeys(r *http.Request, nodeID string) []string {
+	ip := s.loginIPLimitKey(r)
+	digest := sha256.Sum256([]byte(nodeID + "\x00" + ip))
+	return []string{
+		"node-auth:ip:" + ip,
+		fmt.Sprintf("node-auth:node-ip:%x", digest),
+	}
+}
+
+func (s *Server) proxyHeadersTrusted(r *http.Request) bool {
+	if !s.cfg.TrustProxyHeaders || r == nil {
+		return false
+	}
+	peer := net.ParseIP(requestClientIP(r))
+	if peer == nil {
+		return false
+	}
+	for _, raw := range strings.Split(s.cfg.TrustedProxyCIDRs, ",") {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		if ip := net.ParseIP(raw); ip != nil {
+			if peer.Equal(ip) {
+				return true
+			}
+			continue
+		}
+		_, network, err := net.ParseCIDR(raw)
+		if err == nil && network.Contains(peer) {
+			return true
+		}
+	}
+	return false
+}
+
+func allowLimiterKeys(limiter *auth.LoginLimiter, keys []string) bool {
+	if limiter == nil {
+		return true
+	}
+	for _, key := range keys {
+		if !limiter.Allow(key) {
+			return false
+		}
+	}
+	return true
+}
+
+func failLimiterKeys(limiter *auth.LoginLimiter, keys []string) {
+	if limiter == nil {
+		return
+	}
+	for _, key := range keys {
+		limiter.Fail(key)
+	}
+}
+
+func successLimiterKeys(limiter *auth.LoginLimiter, keys []string) {
+	if limiter == nil {
+		return
+	}
+	for _, key := range keys {
+		limiter.Success(key)
+	}
 }
 
 func requestClientIP(r *http.Request) string {
-	for _, candidate := range []string{
-		forwardedHeaderValue(r.Header.Get("X-Forwarded-For")),
-		strings.TrimSpace(r.Header.Get("X-Real-IP")),
-		remoteAddrHost(r.RemoteAddr),
-	} {
-		if candidate != "" {
+	if r == nil {
+		return ""
+	}
+	return normalizedIP(remoteAddrHost(r.RemoteAddr))
+}
+
+func requestClientIPForProxy(r *http.Request, trustProxyHeaders bool) string {
+	peer := requestClientIP(r)
+	if !trustProxyHeaders || r == nil {
+		return peer
+	}
+	if value := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); value != "" {
+		if candidate := normalizedForwardedIP(value); candidate != "" {
+			return candidate
+		}
+		return peer
+	}
+	if value := strings.TrimSpace(r.Header.Get("X-Real-IP")); value != "" {
+		if candidate := normalizedIP(value); candidate != "" {
+			return candidate
+		}
+	}
+	return peer
+}
+
+func forwardedHeaderValue(value string) string {
+	if value == "" || len(value) > maxProxyHeaderBytes {
+		return ""
+	}
+	for _, part := range strings.Split(value, ",") {
+		if candidate := strings.TrimSpace(part); candidate != "" && len(candidate) <= maxProxyHeaderBytes {
 			return candidate
 		}
 	}
 	return ""
 }
 
-func forwardedHeaderValue(value string) string {
-	if value == "" {
+func normalizedForwardedIP(value string) string {
+	return normalizedIP(forwardedHeaderValue(value))
+}
+
+func normalizedIP(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > maxProxyHeaderBytes {
 		return ""
 	}
-	for _, part := range strings.Split(value, ",") {
-		if candidate := strings.TrimSpace(part); candidate != "" {
-			return candidate
-		}
+	ip := net.ParseIP(trimEnclosingBrackets(value))
+	if ip == nil {
+		return ""
 	}
-	return ""
+	return ip.String()
 }
 
 func remoteAddrHost(value string) string {
@@ -2313,13 +2759,66 @@ func remoteAddrHost(value string) string {
 }
 
 func requestIsSecure(r *http.Request) bool {
+	return requestIsSecureForProxy(r, false)
+}
+
+func requestIsSecureForProxy(r *http.Request, trustProxyHeaders bool) bool {
 	if r == nil {
 		return false
 	}
 	if r.TLS != nil {
 		return true
 	}
-	return strings.EqualFold(strings.TrimSpace(forwardedHeaderValue(r.Header.Get("X-Forwarded-Proto"))), "https")
+	return trustProxyHeaders && strings.EqualFold(strings.TrimSpace(forwardedHeaderValue(r.Header.Get("X-Forwarded-Proto"))), "https")
+}
+
+func stateChangingMethod(method string) bool {
+	switch method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) requireSameOrigin(w http.ResponseWriter, r *http.Request) bool {
+	if strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")), "cross-site") {
+		writeError(w, errors.New("cross-origin request rejected"), http.StatusForbidden)
+		return false
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		if referer := strings.TrimSpace(r.Header.Get("Referer")); referer != "" {
+			origin = referer
+		}
+	}
+	if origin == "" {
+		return true
+	}
+	requestedOrigin, err := originFromURL(origin)
+	if err != nil || !strings.EqualFold(requestedOrigin, s.expectedOrigin(r)) {
+		writeError(w, errors.New("cross-origin request rejected"), http.StatusForbidden)
+		return false
+	}
+	return true
+}
+
+func (s *Server) expectedOrigin(r *http.Request) string {
+	configured := strings.TrimSpace(s.cfg.PublicURL)
+	if s.store != nil {
+		configured = s.controllerPublicURL(r.Context())
+	}
+	if configured != "" {
+		if origin, err := originFromURL(configured); err == nil {
+			return origin
+		}
+	}
+	scheme := "http"
+	if requestIsSecureForProxy(r, s.proxyHeadersTrusted(r)) {
+		scheme = "https"
+	}
+	origin, _ := originFromURL(scheme + "://" + strings.TrimSpace(r.Host))
+	return origin
 }
 
 func hostOnly(value string) string {
@@ -2350,6 +2849,14 @@ func secureHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "same-origin")
 		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; form-action 'self'")
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			w.Header().Set("Cache-Control", "no-store")
+		}
+		if r.TLS != nil {
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000")
+		}
 		next.ServeHTTP(w, r)
 	})
 }
@@ -2362,7 +2869,17 @@ func readJSON(r *http.Request, dest any) (err error) {
 	}()
 	decoder := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
 	decoder.DisallowUnknownFields()
-	return decoder.Decode(dest)
+	if err := decoder.Decode(dest); err != nil {
+		return err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("request body must contain one JSON value")
+		}
+		return err
+	}
+	return nil
 }
 
 func writeJSON(w http.ResponseWriter, value any) {
@@ -2425,7 +2942,41 @@ func (s *Server) handleInstallScript(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) handleDownloadNodeReleaseManifest(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, s.nodeRelease())
+	release := s.nodeRelease()
+	if !release.UpdateEnabled {
+		// This endpoint is public so node bootstrapping can discover the
+		// release state. Do not expose local filesystem paths or read errors.
+		release.DisabledReason = "node release is unavailable"
+	}
+	writeJSON(w, release)
+}
+
+func (s *Server) handleDownloadNodeBinarySignature(w http.ResponseWriter, r *http.Request) {
+	targetOS, targetArch, err := normalizeNodeBinaryTarget(r.URL.Query().Get("os"), r.URL.Query().Get("arch"))
+	if err != nil {
+		writeError(w, err, http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(s.cfg.NodeBinaryDir) == "" {
+		writeError(w, errors.New("node binary directory is not configured"), http.StatusInternalServerError)
+		return
+	}
+	filename := fmt.Sprintf("nyarelay-node-%s-%s.sig", targetOS, targetArch)
+	path := filepath.Join(s.cfg.NodeBinaryDir, filename)
+	payload, err := readNodeReleaseFile(path, maxNodeReleaseMetadataBytes)
+	if err != nil {
+		writeError(w, errors.New("node binary signature not found"), http.StatusNotFound)
+		return
+	}
+	signature, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(string(payload)))
+	if err != nil || len(signature) != ed25519.SignatureSize {
+		writeError(w, errors.New("node binary signature not found"), http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(signature)
 }
 
 func closeStore(st *store.Store) {
@@ -2446,7 +2997,8 @@ func (s *Server) handleDownloadNodeBinary(w http.ResponseWriter, r *http.Request
 		writeError(w, errors.New("node binary path is not configured"), http.StatusInternalServerError)
 		return
 	}
-	if _, err := os.Stat(path); err != nil {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() || info.Size() <= 0 || info.Size() > maxNodeReleaseArtifactBytes {
 		writeError(w, errors.New("node binary not found"), http.StatusNotFound)
 		return
 	}
@@ -2460,14 +3012,6 @@ func (s *Server) handleDownloadNodeBinary(w http.ResponseWriter, r *http.Request
 }
 
 func serveGzippedFile(w http.ResponseWriter, r *http.Request, path, filename string) {
-	if gzPath := path + ".gz"; fileExists(gzPath) {
-		w.Header().Set("Content-Type", "application/gzip")
-		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.gz"`, filename))
-		w.Header().Set("Cache-Control", "no-store")
-		http.ServeFile(w, r, gzPath)
-		return
-	}
-
 	file, err := os.Open(path)
 	if err != nil {
 		writeError(w, errors.New("node binary not found"), http.StatusNotFound)
@@ -2485,16 +3029,14 @@ func serveGzippedFile(w http.ResponseWriter, r *http.Request, path, filename str
 	}
 }
 
-func fileExists(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && !info.IsDir()
-}
-
 func (s *Server) nodeBinaryPathForRequest(r *http.Request) (string, string, error) {
 	targetOS := r.URL.Query().Get("os")
 	targetArch := r.URL.Query().Get("arch")
 	if targetOS == "" && targetArch == "" {
 		return s.cfg.NodeBinaryPath, "nyarelay-node", nil
+	}
+	if strings.TrimSpace(s.cfg.NodeBinaryDir) == "" {
+		return "", "", errors.New("node binary directory is not configured")
 	}
 	targetOS, targetArch, err := normalizeNodeBinaryTarget(targetOS, targetArch)
 	if err != nil {
@@ -2523,26 +3065,309 @@ func normalizeNodeBinaryTarget(targetOS, targetArch string) (string, string, err
 }
 
 func controllerBaseURL(configured string, r *http.Request) string {
-	if configured != "" {
-		return configured
-	}
-	scheme := "http"
-	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
-		scheme = "https"
-	}
-	if host := r.Host; host != "" {
-		return scheme + "://" + host
+	_ = r
+	if normalized, err := normalizeControllerURL(configured); err == nil {
+		return normalized
 	}
 	return ""
 }
 
 func (s *Server) controllerPublicURL(ctx context.Context) string {
-	if value, ok, err := s.store.GetSetting(ctx, controllerPublicURLSetting); err == nil && ok {
-		if trimmed := strings.TrimSpace(value); trimmed != "" {
-			return trimmed
+	if s.store != nil {
+		if value, ok, err := s.store.GetSetting(ctx, controllerPublicURLSetting); err == nil && ok {
+			if normalized, err := normalizeControllerURL(value); err == nil && normalized != "" {
+				return normalized
+			}
 		}
 	}
-	return strings.TrimSpace(s.cfg.PublicURL)
+	if normalized, err := normalizeControllerURL(s.cfg.PublicURL); err == nil {
+		return normalized
+	}
+	return ""
+}
+
+func normalizeControllerURL(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	u, err := url.Parse(value)
+	if err != nil {
+		return "", errors.New("invalid controller URL")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", errors.New("controller URL must use http or https")
+	}
+	if u.Host == "" || u.Hostname() == "" {
+		return "", errors.New("controller URL must include a host")
+	}
+	if u.Scheme == "http" && !isLoopbackURLHost(u.Hostname()) {
+		return "", errors.New("remote controller URL must use https")
+	}
+	if u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" {
+		return "", errors.New("controller URL must not include credentials, query, or fragment")
+	}
+	if u.Path != "" && u.Path != "/" {
+		return "", errors.New("controller URL must not include a path")
+	}
+	u.Path = ""
+	u.RawPath = ""
+	return strings.TrimRight(u.String(), "/"), nil
+}
+
+func isLoopbackURLHost(host string) bool {
+	if strings.EqualFold(strings.TrimSuffix(host, "."), "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func originFromURL(value string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || u.Scheme == "" || u.Host == "" || u.User != nil || u.Opaque != "" {
+		return "", errors.New("invalid origin")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", errors.New("invalid origin scheme")
+	}
+	if u.Hostname() == "" {
+		return "", errors.New("invalid origin host")
+	}
+	return strings.TrimRight(u.Scheme+"://"+u.Host, "/"), nil
+}
+
+func validateUsername(username string) error {
+	if username == "" {
+		return errors.New("username is required")
+	}
+	if !utf8.ValidString(username) || len(username) > maxUsernameBytes {
+		return errors.New("username is invalid")
+	}
+	for _, r := range username {
+		if unicode.IsControl(r) {
+			return errors.New("username is invalid")
+		}
+	}
+	return nil
+}
+
+func validateNodeInput(name string, labels map[string]string, publicHost string) error {
+	if err := validateNodeText("node name", name, maxNodeNameBytes, false); err != nil {
+		return err
+	}
+	if len(labels) > maxNodeLabelEntries {
+		return fmt.Errorf("node has too many labels (maximum %d)", maxNodeLabelEntries)
+	}
+	for key, value := range labels {
+		if err := validateNodeText("node label key", key, maxNodeLabelKeyBytes, false); err != nil {
+			return err
+		}
+		if err := validateNodeText("node label value", value, maxNodeLabelValueBytes, true); err != nil {
+			return err
+		}
+	}
+	if err := validateNodeText("node public host", publicHost, maxNodeMetadataBytes, true); err != nil {
+		return err
+	}
+	host := strings.TrimSpace(publicHost)
+	if host == "" {
+		return nil
+	}
+	host = trimEnclosingBrackets(host)
+	if net.ParseIP(host) != nil {
+		return nil
+	}
+	if strings.ContainsAny(host, "/?#@\\:") {
+		return errors.New("node public host must be an IP address or hostname")
+	}
+	for _, r := range host {
+		if unicode.IsSpace(r) {
+			return errors.New("node public host must be an IP address or hostname")
+		}
+	}
+	return nil
+}
+
+func validateNodeText(field, value string, maxBytes int, allowEmpty bool) error {
+	if !allowEmpty && strings.TrimSpace(value) == "" {
+		return fmt.Errorf("%s is required", field)
+	}
+	if !utf8.ValidString(value) {
+		return fmt.Errorf("%s is invalid UTF-8", field)
+	}
+	if len(value) > maxBytes {
+		return fmt.Errorf("%s is too long", field)
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("%s contains a control character", field)
+		}
+	}
+	return nil
+}
+
+func validateNodeError(field, value string, maxBytes int, allowEmpty bool) error {
+	if !allowEmpty && strings.TrimSpace(value) == "" {
+		return fmt.Errorf("%s is required", field)
+	}
+	if !utf8.ValidString(value) {
+		return fmt.Errorf("%s is invalid UTF-8", field)
+	}
+	if len(value) > maxBytes {
+		return fmt.Errorf("%s is too long", field)
+	}
+	for _, r := range value {
+		if r == '\x00' || (unicode.IsControl(r) && r != '\n' && r != '\r' && r != '\t') {
+			return fmt.Errorf("%s contains an invalid control character", field)
+		}
+	}
+	return nil
+}
+
+func validateNodeIdentity(expectedID, claimedID string) error {
+	if claimedID == "" {
+		return nil
+	}
+	if err := validateNodeText("node id", claimedID, validate.MaxIDBytes, false); err != nil {
+		return err
+	}
+	if claimedID != expectedID {
+		return errors.New("node id does not match authenticated node")
+	}
+	return nil
+}
+
+func validateNodeVersion(version string) error {
+	return validateNodeText("node version", version, maxNodeVersionBytes, true)
+}
+
+func validateNodeSystem(system model.NodeSystem) error {
+	for field, value := range map[string]string{
+		"node hostname":         system.Hostname,
+		"node operating system": system.OS,
+		"node architecture":     system.Arch,
+		"node IP":               system.IP,
+	} {
+		if err := validateNodeText(field, value, maxNodeMetadataBytes, true); err != nil {
+			return err
+		}
+	}
+	if system.IP != "" && net.ParseIP(trimEnclosingBrackets(strings.TrimSpace(system.IP))) == nil {
+		return errors.New("node IP is invalid")
+	}
+	return nil
+}
+
+func validateNodeHeartbeat(version string, system model.NodeSystem) error {
+	if err := validateNodeVersion(version); err != nil {
+		return err
+	}
+	return validateNodeSystem(system)
+}
+
+func validateNodeHello(nodeID string, hello sharedprotocol.ControlMessage) error {
+	if err := validateNodeIdentity(nodeID, hello.NodeID); err != nil {
+		return err
+	}
+	return validateNodeHeartbeat(hello.Version, hello.System)
+}
+
+func validateNodeControlMessage(nodeID string, msg sharedprotocol.ControlMessage) error {
+	if err := validateNodeIdentity(nodeID, msg.NodeID); err != nil {
+		return err
+	}
+	switch msg.Type {
+	case "heartbeat":
+		if err := validateNodeHeartbeat(msg.Version, msg.System); err != nil {
+			return err
+		}
+		if msg.UpdateReport != nil {
+			return validateNodeUpdateReport(*msg.UpdateReport)
+		}
+	case "pull_config":
+		return nil
+	case "update_status":
+		if msg.UpdateReport == nil {
+			return errors.New("update status report is required")
+		}
+		return validateNodeUpdateReport(*msg.UpdateReport)
+	default:
+		return fmt.Errorf("unsupported node message type %q", msg.Type)
+	}
+	return nil
+}
+
+func validateNodeUpdateReport(report model.NodeUpdateReport) error {
+	switch report.Status {
+	case model.NodeUpdateIdle, model.NodeUpdateRequested, model.NodeUpdateRunning, model.NodeUpdateSucceeded, model.NodeUpdateFailed:
+	default:
+		return fmt.Errorf("unsupported node update status %q", report.Status)
+	}
+	if err := validateNodeVersion(report.Version); err != nil {
+		return err
+	}
+	return validateNodeError("node update error", report.Error, maxNodeUpdateErrorBytes, true)
+}
+
+func validateMetricsReport(report model.MetricsReport) error {
+	if report.NodeID != "" {
+		if err := validateNodeText("metrics node id", report.NodeID, validate.MaxIDBytes, true); err != nil {
+			return err
+		}
+	}
+	if len(report.ForwardStats) > maxMetricStats || len(report.TunnelStats) > maxMetricStats {
+		return fmt.Errorf("metrics report has too many statistics (maximum %d per kind)", maxMetricStats)
+	}
+	if len(report.ForwardStats)+len(report.TunnelStats) > maxMetricStats*2 {
+		return fmt.Errorf("metrics report has too many statistics")
+	}
+	for _, stats := range []struct {
+		kind string
+		list []model.TrafficStat
+	}{
+		{kind: "forward", list: report.ForwardStats},
+		{kind: "tunnel", list: report.TunnelStats},
+	} {
+		for _, stat := range stats.list {
+			if err := validateNodeText(stats.kind+" metric id", stat.ID, maxMetricIDBytes, false); err != nil {
+				return err
+			}
+			for field, value := range map[string]int64{
+				stats.kind + " bytes_in":    stat.BytesIn,
+				stats.kind + " bytes_out":   stat.BytesOut,
+				stats.kind + " connections": stat.Connections,
+			} {
+				if value < 0 || value > maxMetricValue {
+					return fmt.Errorf("%s is outside the permitted range", field)
+				}
+			}
+		}
+	}
+	if report.Runtime.UptimeSeconds < 0 || report.Runtime.UptimeSeconds > maxMetricValue {
+		return errors.New("metrics uptime is outside the permitted range")
+	}
+	if report.Runtime.Goroutines < 0 || report.Runtime.Goroutines > maxMetricGoroutines {
+		return errors.New("metrics goroutine count is outside the permitted range")
+	}
+	if !report.ObservedAt.IsZero() {
+		now := time.Now().UTC()
+		if report.ObservedAt.Before(now.Add(-maxMetricTimeSkew)) || report.ObservedAt.After(now.Add(maxMetricTimeSkew)) {
+			return errors.New("metrics timestamp is outside the permitted range")
+		}
+	}
+	if len(report.AgentErrors) > maxAgentErrors {
+		return fmt.Errorf("metrics report has too many agent errors (maximum %d)", maxAgentErrors)
+	}
+	for _, agentError := range report.AgentErrors {
+		if err := validateNodeText("agent error scope", agentError.Scope, maxAgentErrorScopeBytes, true); err != nil {
+			return err
+		}
+		if err := validateNodeError("agent error message", agentError.Message, maxAgentErrorMessageBytes, true); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func validateNodePortRange(portMin, portMax int) error {
@@ -2626,6 +3451,9 @@ func (s *Server) loadHistoryCleanupConfig(ctx context.Context) error {
 			continue
 		}
 		parsed, err := parseNonNegativeDuration(value)
+		if setting.key == historyCleanupIntervalSetting {
+			parsed, err = parseCleanupInterval(value)
+		}
 		if err != nil {
 			return fmt.Errorf("invalid persisted setting %s: %w", setting.key, err)
 		}

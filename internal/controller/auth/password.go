@@ -14,14 +14,19 @@ import (
 )
 
 const (
-	pbkdf2Iterations = 210000
-	saltBytes        = 16
-	keyBytes         = 32
+	pbkdf2Iterations    = 210000
+	saltBytes           = 16
+	keyBytes            = 32
+	maxPasswordBytes    = 4096
+	maxPBKDF2Iterations = 1000000
 )
 
 func HashPassword(password string) (string, error) {
 	if len(password) < 12 {
 		return "", errors.New("password must be at least 12 characters")
+	}
+	if len(password) > maxPasswordBytes {
+		return "", errors.New("password is too long")
 	}
 	salt := make([]byte, saltBytes)
 	if _, err := rand.Read(salt); err != nil {
@@ -39,20 +44,23 @@ func HashPassword(password string) (string, error) {
 }
 
 func VerifyPassword(encoded, password string) bool {
+	if len(password) > maxPasswordBytes {
+		return false
+	}
 	parts := strings.Split(encoded, "$")
 	if len(parts) != 4 || parts[0] != "pbkdf2-sha256" {
 		return false
 	}
 	iterations, err := strconv.Atoi(parts[1])
-	if err != nil || iterations < 100000 {
+	if err != nil || iterations < 100000 || iterations > maxPBKDF2Iterations {
 		return false
 	}
 	salt, err := base64.RawURLEncoding.DecodeString(parts[2])
-	if err != nil {
+	if err != nil || len(salt) != saltBytes {
 		return false
 	}
 	want, err := base64.RawURLEncoding.DecodeString(parts[3])
-	if err != nil {
+	if err != nil || len(want) != keyBytes {
 		return false
 	}
 	got, err := pbkdf2.Key(sha256.New, password, salt, iterations, len(want))

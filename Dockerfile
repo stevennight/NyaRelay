@@ -1,13 +1,13 @@
 # syntax=docker/dockerfile:1.7
 
-FROM --platform=$BUILDPLATFORM node:24-alpine AS web
+FROM --platform=$BUILDPLATFORM node:24-alpine@sha256:d32cdf619f63fe0471182d08996dd516c6275bb5fd31ae06e55a570bd9e1ad43 AS web
 WORKDIR /src/web/app
 COPY web/app/package.json web/app/package-lock.json* ./
 RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
 COPY web/app ./
 RUN npm run build
 
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS go-build
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine@sha256:28d89ee9cc0ff9fec75c82ca201e6bf7fdf9a679d4b7b24dfa04f2bb766bb468 AS go-build
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
 ARG NYARELAY_VERSION=0.1.3-dev
@@ -15,6 +15,7 @@ ARG NYARELAY_COMMIT=
 ARG NYARELAY_BUILD_DATE=
 ARG NYARELAY_UPDATE_PUBLIC_KEY=
 WORKDIR /src
+RUN mkdir -p /out/nodes
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
@@ -75,7 +76,7 @@ RUN --mount=type=secret,id=nyarelay_update_signing_key,required=false \
 RUN gzip -k -9 /out/nodes/nyarelay-node-linux-amd64 /out/nodes/nyarelay-node-linux-arm64
 RUN cp "/out/nodes/nyarelay-node-${TARGETOS}-${TARGETARCH}" /out/nyarelay-node
 
-FROM alpine:3.22
+FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
 RUN apk add --no-cache su-exec \
     && addgroup -S nyarelay \
     && adduser -S -G nyarelay nyarelay

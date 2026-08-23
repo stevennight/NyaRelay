@@ -25,6 +25,19 @@ import (
 
 const defaultNodeBinaryPath = "/usr/local/bin/nyarelay-node"
 
+const (
+	maxNodeBinaryBytes    = 128 << 20
+	maxUpdateVersionBytes = 128
+	maxUpdateURLBytes     = 2048
+)
+
+var updateHTTPClient = &http.Client{
+	Timeout: 30 * time.Second,
+	CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
 type updateOptions struct {
 	requestPath string
 	statusPath  string
@@ -58,15 +71,11 @@ func writeUpdateRequest(path string, req model.NodeUpdateRequest) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, payload, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return writePrivateFileAtomic(path, payload)
 }
 
 func loadUpdateRequest(path string) (model.NodeUpdateRequest, error) {
-	payload, err := os.ReadFile(path)
+	payload, err := readFileLimited(path, 1<<20)
 	if err != nil {
 		return model.NodeUpdateRequest{}, err
 	}
@@ -88,11 +97,11 @@ func saveUpdateStatus(path string, report model.NodeUpdateReport) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, payload, 0o600)
+	return writePrivateFileAtomic(path, payload)
 }
 
 func loadUpdateStatus(path string) (model.NodeUpdateReport, error) {
-	payload, err := os.ReadFile(path)
+	payload, err := readFileLimited(path, 1<<20)
 	if err != nil {
 		return model.NodeUpdateReport{}, err
 	}
@@ -106,6 +115,9 @@ func loadUpdateStatus(path string) (model.NodeUpdateReport, error) {
 func handleUpdateCommand(cfg Config, cmd model.NodeUpdateCommand) error {
 	if strings.TrimSpace(sharedversion.UpdatePublicKey) == "" {
 		return errors.New("update public key is not configured")
+	}
+	if strings.TrimSpace(cmd.Version) == "" || cmd.Manifest.Version != cmd.Version {
+		return errors.New("update command version does not match its signed manifest")
 	}
 	if cmd.SigningKeyID != sharedversion.UpdatePublicKey {
 		return errors.New("update signing key does not match trusted key")
@@ -160,6 +172,15 @@ func runUpdate(ctx context.Context, cfg Config, requestPath, statusPath, binaryP
 	if req.NodeToken == "" {
 		req.NodeToken = cfg.NodeToken
 	}
+	if req.OS == "" {
+		req.OS = runtime.GOOS
+	}
+	if req.Arch == "" {
+		req.Arch = runtime.GOARCH
+	}
+	if err := validateUpdateRequest(cfg, req); err != nil {
+		return err
+	}
 	if err := saveUpdateStatus(statusPath, model.NodeUpdateReport{Status: model.NodeUpdateRunning, Version: req.TargetVersion}); err != nil {
 		return err
 	}
@@ -171,6 +192,40 @@ func runUpdate(ctx context.Context, cfg Config, requestPath, statusPath, binaryP
 		return err
 	}
 	return nil
+}
+
+func validateUpdateRequest(cfg Config, req model.NodeUpdateRequest) error {
+	if strings.TrimSpace(req.TargetVersion) == "" || len(req.TargetVersion) > maxUpdateVersionBytes {
+		return errors.New("update target version is invalid")
+	}
+	if !nodeNeedsUpdate(sharedversion.Version, req.TargetVersion) {
+		return errors.New("update target version is not newer than the installed version")
+	}
+	if len(req.ControllerURL) > maxUpdateURLBytes || !sameControllerURL(req.ControllerURL, cfg.ControllerURL) {
+		return errors.New("update controller does not match node configuration")
+	}
+	if req.NodeID == "" || req.NodeID != cfg.NodeID {
+		return errors.New("update node id does not match node configuration")
+	}
+	if req.NodeToken == "" || req.NodeToken != cfg.NodeToken {
+		return errors.New("update node token does not match node configuration")
+	}
+	if req.OS != runtime.GOOS || req.Arch != runtime.GOARCH {
+		return fmt.Errorf("update target platform %s/%s does not match local platform %s/%s", req.OS, req.Arch, runtime.GOOS, runtime.GOARCH)
+	}
+	if len(req.SHA256) != sha256.Size*2 {
+		return errors.New("update artifact digest is invalid")
+	}
+	if _, err := hex.DecodeString(req.SHA256); err != nil {
+		return errors.New("update artifact digest is invalid")
+	}
+	return nil
+}
+
+func sameControllerURL(left, right string) bool {
+	leftURL, leftErr := validateControllerURL(left)
+	rightURL, rightErr := validateControllerURL(right)
+	return leftErr == nil && rightErr == nil && leftURL.String() == rightURL.String()
 }
 
 func performUpdate(ctx context.Context, req model.NodeUpdateRequest, binaryPath string) error {
@@ -197,6 +252,9 @@ func performUpdate(ctx context.Context, req model.NodeUpdateRequest, binaryPath 
 	if req.SHA256 != "" && !strings.EqualFold(req.SHA256, artifact.SHA256) {
 		return errors.New("requested artifact digest does not match release manifest")
 	}
+	if artifact.Size <= 0 || artifact.Size > maxNodeBinaryBytes {
+		return errors.New("node release artifact size is invalid")
+	}
 	payload, err := downloadUpdateBinary(ctx, req)
 	if err != nil {
 		return err
@@ -204,6 +262,9 @@ func performUpdate(ctx context.Context, req model.NodeUpdateRequest, binaryPath 
 	sum := sha256.Sum256(payload)
 	if !strings.EqualFold(hex.EncodeToString(sum[:]), artifact.SHA256) {
 		return errors.New("downloaded node binary sha256 mismatch")
+	}
+	if int64(len(payload)) != artifact.Size {
+		return fmt.Errorf("downloaded node binary size %d does not match manifest size %d", len(payload), artifact.Size)
 	}
 	return replaceBinary(binaryPath, payload)
 }
@@ -222,7 +283,7 @@ func downloadUpdateBinary(ctx context.Context, req model.NodeUpdateRequest) ([]b
 	if err != nil {
 		return nil, err
 	}
-	resp, err := http.DefaultClient.Do(httpReq)
+	resp, err := updateHTTPClient.Do(httpReq)
 	if err != nil {
 		return nil, err
 	}
@@ -230,12 +291,22 @@ func downloadUpdateBinary(ctx context.Context, req model.NodeUpdateRequest) ([]b
 	if resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("download node binary failed: %s", resp.Status)
 	}
+	if resp.ContentLength > maxNodeBinaryBytes {
+		return nil, errors.New("compressed node binary is too large")
+	}
 	reader, err := gzip.NewReader(resp.Body)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = reader.Close() }()
-	return io.ReadAll(reader)
+	payload, err := io.ReadAll(io.LimitReader(reader, maxNodeBinaryBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(payload) > maxNodeBinaryBytes {
+		return nil, errors.New("downloaded node binary is too large")
+	}
+	return payload, nil
 }
 
 func doUpdateJSON(ctx context.Context, req model.NodeUpdateRequest, method, path string, body io.Reader, dest any) error {
@@ -243,7 +314,7 @@ func doUpdateJSON(ctx context.Context, req model.NodeUpdateRequest, method, path
 	if err != nil {
 		return err
 	}
-	resp, err := http.DefaultClient.Do(httpReq)
+	resp, err := updateHTTPClient.Do(httpReq)
 	if err != nil {
 		return err
 	}
@@ -251,12 +322,15 @@ func doUpdateJSON(ctx context.Context, req model.NodeUpdateRequest, method, path
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("controller request failed: %s", resp.Status)
 	}
-	return json.NewDecoder(resp.Body).Decode(dest)
+	return json.NewDecoder(io.LimitReader(resp.Body, maxControllerJSONBytes)).Decode(dest)
 }
 
 func newUpdateRequest(ctx context.Context, req model.NodeUpdateRequest, method, path string, body io.Reader) (*http.Request, error) {
-	base := strings.TrimRight(req.ControllerURL, "/")
-	httpReq, err := http.NewRequestWithContext(ctx, method, base+path, body)
+	requestURL, err := controllerURLWithPath(req.ControllerURL, path)
+	if err != nil {
+		return nil, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, method, requestURL, body)
 	if err != nil {
 		return nil, err
 	}

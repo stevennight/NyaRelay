@@ -35,15 +35,19 @@ func (s *Service) udpLoop(ctx context.Context, forward model.ForwardRuntime, tun
 		_ = inbound.SetReadDeadline(time.Now().Add(time.Second))
 		n, clientAddr, err := inbound.ReadFromUDP(buf)
 		if err != nil {
-			select {
-			case <-ctx.Done():
+			if ctx.Err() != nil {
 				return
-			default:
-				continue
 			}
+			continue
 		}
 		payload := append([]byte(nil), buf[:n]...)
-		go s.handleUDPPacket(ctx, forward, tunnel, inbound, clientAddr, payload)
+		if !s.tryAcquireUDPPacket() {
+			continue
+		}
+		go func(clientAddr *net.UDPAddr, payload []byte) {
+			defer s.releaseUDPPacket()
+			s.handleUDPPacket(ctx, forward, tunnel, inbound, clientAddr, payload)
+		}(clientAddr, payload)
 	}
 }
 
@@ -117,6 +121,9 @@ func (s *Service) handleUDPStageTransit(ctx context.Context, tunnel model.Tunnel
 }
 
 func (s *Service) forwardUDPFrameWithRetry(ctx context.Context, tunnel model.TunnelRuntime, forward model.ForwardRuntime, fromStageIndex int, frame protocol.UDPDatagramFrame) (protocol.UDPDatagramFrame, string, error) {
+	retryCtx, cancel := context.WithTimeout(ctx, relayDialBudget)
+	defer cancel()
+	ctx = retryCtx
 	attempts := s.udpCandidateAttemptLimit(tunnel, fromStageIndex)
 	var lastErr error
 	var lastStatID string
@@ -177,8 +184,22 @@ func (s *Service) udpCandidateAttemptLimit(tunnel model.TunnelRuntime, fromStage
 
 func (s *Service) handleUDPStageExit(ctx context.Context, forward model.ForwardRuntime, inbound net.Conn, counter *metrics.Counter) {
 	for {
+		deadline := time.Now().Add(time.Second)
+		if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+			deadline = ctxDeadline
+		}
+		_ = inbound.SetReadDeadline(deadline)
 		frame, err := protocol.ReadUDPDatagramFrame(inbound)
 		if err != nil {
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					continue
+				}
+			}
 			if !errors.Is(err, io.EOF) {
 				s.log.Debug("udp stream read failed", "forward", forward.Name, "error", err)
 			}
@@ -210,6 +231,9 @@ func (s *Service) handleUDPStageExit(ctx context.Context, forward model.ForwardR
 }
 
 func (s *Service) udpTargetRoundTrip(ctx context.Context, forward model.ForwardRuntime, sessionID string, payload []byte) (response []byte, statID string, err error) {
+	retryCtx, cancel := context.WithTimeout(ctx, relayDialBudget)
+	defer cancel()
+	ctx = retryCtx
 	attempts := len(forward.Targets)
 	if attempts <= 0 {
 		attempts = 1

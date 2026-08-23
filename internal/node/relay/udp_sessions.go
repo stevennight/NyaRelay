@@ -9,12 +9,14 @@ import (
 const (
 	udpSessionIdleTimeout = 120 * time.Second
 	udpSessionGCInterval  = 30 * time.Second
+	maxUDPSessionEntries  = 100000
 )
 
 type udpCandidateSessions struct {
 	mu          sync.Mutex
 	idleTimeout time.Duration
 	gcInterval  time.Duration
+	maxEntries  int
 	sessions    map[string]udpCandidateSession
 }
 
@@ -29,6 +31,7 @@ func newUDPCandidateSessions() *udpCandidateSessions {
 	return &udpCandidateSessions{
 		idleTimeout: udpSessionIdleTimeout,
 		gcInterval:  udpSessionGCInterval,
+		maxEntries:  maxUDPSessionEntries,
 		sessions:    make(map[string]udpCandidateSession),
 	}
 }
@@ -59,11 +62,32 @@ func (s *udpCandidateSessions) bind(key string, candidateIndex int, candidateNod
 		s.sessions[key] = existing
 		return
 	}
+	limit := s.maxEntries
+	if limit <= 0 {
+		limit = maxUDPSessionEntries
+	}
+	if len(s.sessions) >= limit {
+		s.evictOldestLocked()
+	}
 	s.sessions[key] = udpCandidateSession{
 		candidateIndex:  candidateIndex,
 		candidateNodeID: candidateNodeID,
 		createdAt:       now,
 		lastSeen:        now,
+	}
+}
+
+func (s *udpCandidateSessions) evictOldestLocked() {
+	var oldestKey string
+	var oldest time.Time
+	for key, session := range s.sessions {
+		if oldestKey == "" || session.lastSeen.Before(oldest) {
+			oldestKey = key
+			oldest = session.lastSeen
+		}
+	}
+	if oldestKey != "" {
+		delete(s.sessions, oldestKey)
 	}
 }
 
