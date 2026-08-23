@@ -80,7 +80,7 @@ const emptyTunnelForm = (): TunnelForm => ({
 
 export function TunnelsPage() {
   const navigate = useNavigate()
-  return <TunnelsListView onCloseModal={() => navigate({ to: '/tunnels', replace: true })} />
+  return <TunnelsListView onCloseModal={() => navigate({ to: '/tunnels', replace: true, resetScroll: false })} />
 }
 
 export function TunnelNewPage() {
@@ -88,7 +88,7 @@ export function TunnelNewPage() {
   return (
     <TunnelsListView
       modal="new"
-      onCloseModal={() => navigate({ to: '/tunnels', replace: true })}
+      onCloseModal={() => navigate({ to: '/tunnels', replace: true, resetScroll: false })}
     />
   )
 }
@@ -99,7 +99,7 @@ export function TunnelDetailPage({ tunnelId }: { tunnelId: string }) {
     <TunnelsListView
       modal="detail"
       tunnelId={tunnelId}
-      onCloseModal={() => navigate({ to: '/tunnels', replace: true })}
+      onCloseModal={() => navigate({ to: '/tunnels', replace: true, resetScroll: false })}
     />
   )
 }
@@ -154,7 +154,7 @@ function TunnelsListView({
       title="隧道"
       subtitle="隧道定义入口、中间节点、出口和节点间传输。"
       action={
-        <Link to="/tunnels/new" className="button-link">
+        <Link to="/tunnels/new" className="button-link" resetScroll={false}>
           <Plus size={16} />
           新建隧道
         </Link>
@@ -166,7 +166,7 @@ function TunnelsListView({
           title="还没有隧道"
           text="先选择入口节点；需要多跳时再添加中间节点和出口节点。"
           action={
-            <Link to="/tunnels/new" className="button-link">
+            <Link to="/tunnels/new" className="button-link" resetScroll={false}>
               <Plus size={16} />
               新建隧道
             </Link>
@@ -231,7 +231,7 @@ function TunnelsListView({
                 <tr key={tunnel.id}>
                   <td>
                     <strong>
-                      <Link to="/tunnels/$tunnelId" params={{ tunnelId: tunnel.id }}>
+                      <Link to="/tunnels/$tunnelId" params={{ tunnelId: tunnel.id }} resetScroll={false}>
                         {tunnel.name}
                       </Link>
                     </strong>
@@ -274,7 +274,7 @@ function TunnelCreateModal({ onClose }: { onClose: () => void }) {
         onSaved={async (saved) => {
           setEditorDirty(false)
           await queryClient.invalidateQueries({ queryKey: ['tunnels'] })
-          navigate({ to: '/tunnels/$tunnelId', params: { tunnelId: saved.id }, replace: true })
+          navigate({ to: '/tunnels/$tunnelId', params: { tunnelId: saved.id }, replace: true, resetScroll: false })
         }}
       />
     </Modal>
@@ -324,7 +324,7 @@ function TunnelDetailModal({ tunnelId, onClose }: { tunnelId: string; onClose: (
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ['tunnels'] })
       await queryClient.invalidateQueries({ queryKey: ['dashboard'] })
-      navigate({ to: '/tunnels', replace: true })
+      navigate({ to: '/tunnels', replace: true, resetScroll: false })
     },
   })
 

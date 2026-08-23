@@ -62,7 +62,7 @@ function isNodeFilters(value: unknown): value is NodeFilters {
 
 export function NodesPage() {
   const navigate = useNavigate()
-  return <NodesListView onCloseModal={() => navigate({ to: '/nodes', replace: true })} />
+  return <NodesListView onCloseModal={() => navigate({ to: '/nodes', replace: true, resetScroll: false })} />
 }
 
 export function NodeNewPage() {
@@ -70,7 +70,7 @@ export function NodeNewPage() {
   return (
     <NodesListView
       modal="new"
-      onCloseModal={() => navigate({ to: '/nodes', replace: true })}
+      onCloseModal={() => navigate({ to: '/nodes', replace: true, resetScroll: false })}
     />
   )
 }
@@ -81,7 +81,7 @@ export function NodeDetailPage({ nodeId }: { nodeId: string }) {
     <NodesListView
       modal="detail"
       nodeId={nodeId}
-      onCloseModal={() => navigate({ to: '/nodes', replace: true })}
+      onCloseModal={() => navigate({ to: '/nodes', replace: true, resetScroll: false })}
     />
   )
 }
@@ -153,7 +153,7 @@ function NodesListView({
             <RefreshCw size={16} />
             批量更新
           </button>
-          <Link to="/nodes/new" className="button-link">
+          <Link to="/nodes/new" className="button-link" resetScroll={false}>
             <Plus size={16} />
             添加节点
           </Link>
@@ -168,7 +168,7 @@ function NodesListView({
           title="还没有节点"
           text="先添加节点，然后让 node 服务主动连到控制器。"
           action={
-            <Link to="/nodes/new" className="button-link">
+            <Link to="/nodes/new" className="button-link" resetScroll={false}>
               <Plus size={16} />
               添加节点
             </Link>
@@ -221,7 +221,7 @@ function NodesListView({
                 <tr key={node.id}>
                   <td>
                     <strong>
-                      <Link to="/nodes/$nodeId" params={{ nodeId: node.id }}>
+                      <Link to="/nodes/$nodeId" params={{ nodeId: node.id }} resetScroll={false}>
                         {node.name}
                       </Link>
                     </strong>
@@ -248,7 +248,7 @@ function NodesListView({
                           更新
                         </button>
                       ) : null}
-                      <Link to="/nodes/$nodeId" params={{ nodeId: node.id }} className="button-link ghost">
+                      <Link to="/nodes/$nodeId" params={{ nodeId: node.id }} className="button-link ghost" resetScroll={false}>
                         详情
                       </Link>
                     </InlineActions>
@@ -345,7 +345,7 @@ function NodeDetailModal({ nodeId, onClose }: { nodeId: string; onClose: () => v
       await queryClient.invalidateQueries({ queryKey: ['nodes'] })
       await queryClient.invalidateQueries({ queryKey: ['node', nodeId] })
       await queryClient.invalidateQueries({ queryKey: ['node-install', nodeId] })
-      navigate({ to: '/nodes', replace: true })
+      navigate({ to: '/nodes', replace: true, resetScroll: false })
     },
   })
   const update = useMutation({
@@ -665,7 +665,7 @@ function NodeInstallContent({
           <ClipboardCopy size={16} />
           {copyState === 'copied' ? '已复制' : copyState === 'error' ? '复制失败' : '复制命令'}
         </button>
-        <Link to="/nodes/$nodeId" params={{ nodeId: result.node.id }} className="button-link">
+        <Link to="/nodes/$nodeId" params={{ nodeId: result.node.id }} className="button-link" resetScroll={false}>
           节点详情
         </Link>
       </div>

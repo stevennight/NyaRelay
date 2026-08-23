@@ -163,7 +163,7 @@ export function SortableTable<T>({
                     column.label
                   ) : (
                     <button
-                      className="table-sort"
+                      className={`table-sort${active ? ' active' : ''}`}
                       type="button"
                       onClick={() => setSort((current) => ({
                         key: column.key,
@@ -439,37 +439,6 @@ export function useSessionState<T>(
   }, [key, value])
 
   return [value, setValue]
-}
-
-export function useListScrollRestoration(key: string) {
-  useEffect(() => {
-    const content = document.querySelector<HTMLElement>('.content')
-    if (!content) return
-
-    const storageKey = `nyarelay:list-scroll:${key}`
-    try {
-      const stored = sessionStorage.getItem(storageKey)
-      if (stored) {
-        const scrollTop = Number(stored)
-        if (Number.isFinite(scrollTop)) content.scrollTop = scrollTop
-      }
-    } catch {
-      // Storage can be unavailable in privacy-restricted browser contexts.
-    }
-
-    const save = () => {
-      try {
-        sessionStorage.setItem(storageKey, String(content.scrollTop))
-      } catch {
-        // Storage can be unavailable in privacy-restricted browser contexts.
-      }
-    }
-    content.addEventListener('scroll', save, { passive: true })
-    return () => {
-      save()
-      content.removeEventListener('scroll', save)
-    }
-  }, [key])
 }
 
 export function Subnav({

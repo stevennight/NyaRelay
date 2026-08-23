@@ -243,9 +243,12 @@ code {
 }
 
 .shell {
+  height: 100vh;
+  height: 100dvh;
   min-height: 100vh;
   display: grid;
   grid-template-columns: 240px minmax(0, 1fr);
+  overflow: hidden;
 }
 
 aside {
@@ -296,8 +299,10 @@ nav .nav-link.active, nav .nav-link:hover, .logout:hover {
 }
 
 .content {
+  min-height: 0;
   padding: 28px;
   overflow: auto;
+  overscroll-behavior: contain;
 }
 
 .page-frame {
@@ -418,8 +423,13 @@ td small {
   gap: 6px;
 }
 
-.table-sort:hover {
-  background: transparent;
+button.table-sort:hover:not(:disabled),
+button.table-sort:focus-visible {
+  background: var(--primary-soft);
+  color: var(--primary-hover);
+}
+
+.table-sort.active {
   color: var(--primary-hover);
 }
 .table-wrap a {
@@ -1004,6 +1014,7 @@ td small {
 @media (max-width: 860px) {
   .shell {
     grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
   }
 
   aside {

@@ -157,4 +157,8 @@ const routeTree = rootRoute.addChildren([
   settingsControllerRoute,
 ])
 
-export const router = createRouter({ routeTree })
+export const router = createRouter({
+  routeTree,
+  scrollRestoration: true,
+  scrollToTopSelectors: ['.content'],
+})

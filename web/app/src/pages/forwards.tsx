@@ -98,7 +98,7 @@ const emptyForwardFilters = (): ForwardFilters => ({
 
 export function ForwardsPage() {
   const navigate = useNavigate()
-  return <ForwardsListView onCloseModal={() => navigate({ to: '/forwards', replace: true })} />
+  return <ForwardsListView onCloseModal={() => navigate({ to: '/forwards', replace: true, resetScroll: false })} />
 }
 
 export function ForwardNewPage() {
@@ -106,7 +106,7 @@ export function ForwardNewPage() {
   return (
     <ForwardsListView
       modal="new"
-      onCloseModal={() => navigate({ to: '/forwards', replace: true })}
+      onCloseModal={() => navigate({ to: '/forwards', replace: true, resetScroll: false })}
     />
   )
 }
@@ -117,7 +117,7 @@ export function ForwardDetailPage({ forwardId }: { forwardId: string }) {
     <ForwardsListView
       modal="detail"
       forwardId={forwardId}
-      onCloseModal={() => navigate({ to: '/forwards', replace: true })}
+      onCloseModal={() => navigate({ to: '/forwards', replace: true, resetScroll: false })}
     />
   )
 }
@@ -213,7 +213,7 @@ function ForwardsListView({
       title="转发"
       subtitle="转发选择一个隧道，设置入口端口、目标池和选择策略。"
       action={
-        <Link to="/forwards/new" className="button-link">
+        <Link to="/forwards/new" className="button-link" resetScroll={false}>
           <Plus size={16} />
           新建转发
         </Link>
@@ -225,7 +225,7 @@ function ForwardsListView({
           title="还没有转发"
           text="先创建隧道，再为入口节点分配监听端口。"
           action={
-            <Link to="/forwards/new" className="button-link">
+            <Link to="/forwards/new" className="button-link" resetScroll={false}>
               <Plus size={16} />
               新建转发
             </Link>
@@ -300,7 +300,7 @@ function ForwardsListView({
                   <tr key={forward.id}>
                     <td>
                       <strong>
-                        <Link to="/forwards/$forwardId" params={{ forwardId: forward.id }}>
+                        <Link to="/forwards/$forwardId" params={{ forwardId: forward.id }} resetScroll={false}>
                           {forward.name}
                         </Link>
                       </strong>
@@ -348,7 +348,7 @@ function ForwardCreateModal({ onClose }: { onClose: () => void }) {
         onSaved={async (saved) => {
           setEditorDirty(false)
           await queryClient.invalidateQueries({ queryKey: ['forwards'] })
-          navigate({ to: '/forwards/$forwardId', params: { forwardId: saved.id }, replace: true })
+          navigate({ to: '/forwards/$forwardId', params: { forwardId: saved.id }, replace: true, resetScroll: false })
         }}
       />
     </Modal>
@@ -405,7 +405,7 @@ function ForwardDetailModal({ forwardId, onClose }: { forwardId: string; onClose
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ['forwards'] })
       await queryClient.invalidateQueries({ queryKey: ['dashboard'] })
-      navigate({ to: '/forwards', replace: true })
+      navigate({ to: '/forwards', replace: true, resetScroll: false })
     },
   })
   const handleClose = () => {

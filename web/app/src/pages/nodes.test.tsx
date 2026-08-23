@@ -335,7 +335,7 @@ describe('node pages', () => {
     fireEvent.click(screen.getByRole('button', { name: '吊销' }))
 
     await waitFor(() => {
-      expect(routerMocks.navigate).toHaveBeenCalledWith({ to: '/nodes', replace: true })
+      expect(routerMocks.navigate).toHaveBeenCalledWith({ to: '/nodes', replace: true, resetScroll: false })
     })
 
     const revokeCall = fetchMock.mock.calls.find(([path]) => path === '/api/nodes/revoke')

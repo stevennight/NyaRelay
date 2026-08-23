@@ -14,7 +14,6 @@ import {
 import type { ReactNode } from 'react'
 import { post } from '../api'
 import { useBootstrap } from '../bootstrap'
-import { useListScrollRestoration } from './ui'
 
 const navItems = [
   { to: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
@@ -62,10 +61,8 @@ export function AppFrame() {
 }
 
 function Shell({ publicUrl, children }: { publicUrl?: string; children: ReactNode }) {
-  const location = useLocation()
   const queryClient = useQueryClient()
   const navigate = useNavigate()
-  useListScrollRestoration(scrollKeyForPath(location.pathname))
   const logout = useMutation({
     mutationFn: () => post('/api/auth/logout', {}),
     onSuccess: async () => {
@@ -108,12 +105,6 @@ function Shell({ publicUrl, children }: { publicUrl?: string; children: ReactNod
       <section className="content">{children}</section>
     </div>
   )
-}
-
-function scrollKeyForPath(pathname: string) {
-  const root = pathname.split('/').filter(Boolean)[0]
-  if (root === 'nodes' || root === 'tunnels' || root === 'forwards') return root
-  return `route:${pathname}`
 }
 
 function Splash() {

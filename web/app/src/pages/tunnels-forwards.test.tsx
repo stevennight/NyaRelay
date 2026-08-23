@@ -263,6 +263,7 @@ describe('tunnels and forwards pages', () => {
         to: '/tunnels/$tunnelId',
         params: { tunnelId: 'tun-2' },
         replace: true,
+        resetScroll: false,
       })
     })
 
@@ -365,6 +366,7 @@ describe('tunnels and forwards pages', () => {
         to: '/tunnels/$tunnelId',
         params: { tunnelId: 'tun-protocols' },
         replace: true,
+        resetScroll: false,
       })
     })
 
@@ -433,6 +435,7 @@ describe('tunnels and forwards pages', () => {
         to: '/tunnels/$tunnelId',
         params: { tunnelId: 'tun-dragged' },
         replace: true,
+        resetScroll: false,
       })
     })
 
@@ -682,6 +685,7 @@ describe('tunnels and forwards pages', () => {
         to: '/forwards/$forwardId',
         params: { forwardId: 'fwd-1' },
         replace: true,
+        resetScroll: false,
       })
     })
 
