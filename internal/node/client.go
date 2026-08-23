@@ -16,6 +16,7 @@ import (
 	"github.com/coder/websocket"
 
 	"nyarelay/internal/shared/model"
+	sharedprotocol "nyarelay/internal/shared/protocol"
 )
 
 type client struct {
@@ -43,7 +44,9 @@ func newClient(cfg Config) *client {
 
 func (c *client) config(ctx context.Context) (model.SignedConfig, error) {
 	var cfg model.SignedConfig
-	if err := c.doJSON(ctx, http.MethodGet, "/api/node/config", nil, &cfg); err != nil {
+	headers := make(http.Header)
+	headers.Set(sharedprotocol.SupportsLongConfigLeaseHeader, "true")
+	if err := c.doJSONWithHeaders(ctx, http.MethodGet, "/api/node/config", nil, headers, &cfg); err != nil {
 		return model.SignedConfig{}, err
 	}
 	return cfg, nil
@@ -83,6 +86,10 @@ func (c *client) connectWS(ctx context.Context) (*websocket.Conn, error) {
 }
 
 func (c *client) doJSON(ctx context.Context, method, path string, body any, dest any) (err error) {
+	return c.doJSONWithHeaders(ctx, method, path, body, nil, dest)
+}
+
+func (c *client) doJSONWithHeaders(ctx context.Context, method, path string, body any, headers http.Header, dest any) (err error) {
 	var reqBody *bytes.Reader
 	if body == nil {
 		reqBody = bytes.NewReader(nil)
@@ -103,6 +110,11 @@ func (c *client) doJSON(ctx context.Context, method, path string, body any, dest
 	}
 	req.Header.Set("X-NyaRelay-Node-ID", c.nodeID)
 	req.Header.Set("X-NyaRelay-Node-Token", c.token)
+	for key, values := range headers {
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
+	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.http.Do(req)
 	if err != nil {

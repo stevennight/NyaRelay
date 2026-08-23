@@ -93,10 +93,13 @@ func (h *Hub) removeWatcher(nodeID string, ch chan int64) {
 	}
 }
 
-func (h *Hub) RegisterSocket(nodeID string, conn *websocket.Conn) {
+func (h *Hub) RegisterSocket(nodeID string, conn *websocket.Conn, supportsLongConfigLease bool) {
 	h.mu.Lock()
 	old := h.sockets[nodeID]
-	h.sockets[nodeID] = &socketConn{conn: conn}
+	h.sockets[nodeID] = &socketConn{
+		conn:                    conn,
+		supportsLongConfigLease: supportsLongConfigLease,
+	}
 	h.mu.Unlock()
 	if old != nil {
 		_ = old.Close(websocket.StatusNormalClosure, "replaced")
@@ -134,6 +137,13 @@ func (h *Hub) NodeIDs() []string {
 	return out
 }
 
+func (h *Hub) SupportsLongConfigLease(nodeID string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	sock := h.sockets[nodeID]
+	return sock != nil && sock.supportsLongConfigLease
+}
+
 func (h *Hub) Send(nodeID string, value any) error {
 	return h.SendContext(context.Background(), nodeID, value)
 }
@@ -149,8 +159,9 @@ func (h *Hub) SendContext(ctx context.Context, nodeID string, value any) error {
 }
 
 type socketConn struct {
-	conn *websocket.Conn
-	mu   sync.Mutex
+	conn                    *websocket.Conn
+	supportsLongConfigLease bool
+	mu                      sync.Mutex
 }
 
 func (c *socketConn) Send(ctx context.Context, value any) error {

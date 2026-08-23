@@ -31,7 +31,7 @@ var Version = sharedversion.Version
 // Keep control messages bounded while allowing node-scoped configs with many relays.
 const (
 	controlWebSocketReadLimit int64 = 256 * 1024
-	maxSignedConfigLifetime         = 30 * time.Minute
+	maxSignedConfigLifetime         = model.RelayConfigLease
 	maxSignedConfigClockSkew        = 5 * time.Minute
 )
 
@@ -147,7 +147,9 @@ func bootstrapConfig(
 	apply func(context.Context, model.SignedConfig, string) error,
 	log *slog.Logger,
 ) {
+	var httpConfig *model.SignedConfig
 	if signed, err := client.config(ctx); err == nil {
+		httpConfig = &signed
 		if err := apply(ctx, signed, "http"); err != nil {
 			log.Warn("initial config apply failed", "error", err)
 		}
@@ -156,7 +158,12 @@ func bootstrapConfig(
 	}
 
 	if signed, err := loadConfig(cachePath); err == nil {
-		if signed.Config.Revision > currentRevision.Load() {
+		current := currentRevision.Load()
+		isNewerRevision := signed.Config.Revision > current
+		isLongerSameRevision := httpConfig != nil &&
+			signed.Config.Revision == current &&
+			signed.Config.ExpiresAt.After(httpConfig.Config.ExpiresAt)
+		if isNewerRevision || isLongerSameRevision {
 			if err := apply(ctx, signed, "cache"); err != nil {
 				log.Warn("cached config apply failed", "error", err)
 			}
@@ -201,10 +208,11 @@ func controlLoopWithOptions(ctx context.Context, client *client, cfg Config, log
 		}
 
 		hello := sharedprotocol.ControlMessage{
-			Type:    "hello",
-			NodeID:  cfg.NodeID,
-			Version: Version,
-			System:  nodeSystem(),
+			Type:                    "hello",
+			NodeID:                  cfg.NodeID,
+			Version:                 Version,
+			SupportsLongConfigLease: true,
+			System:                  nodeSystem(),
 		}
 		if err := write(hello); err != nil {
 			logControlFailure(log, connCtx, "control websocket hello failed", "error", err)

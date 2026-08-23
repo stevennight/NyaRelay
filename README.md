@@ -66,7 +66,7 @@ go run ./cmd/node --controller http://127.0.0.1:8080 --id <node-id> --token <nod
 go run ./cmd/node --version
 ```
 
-The node caches the last valid signed configuration under its data directory. Existing routes continue to run while the configuration lease is valid; if the controller remains unavailable past the lease, the node stops its relay listeners until it receives a fresh signed configuration.
+The node caches the last valid signed configuration under its data directory. Current nodes keep existing routes running for up to 30 days while the controller is unavailable; once the lease expires, the node stops its relay listeners until it receives a fresh signed configuration. During the rolling upgrade, older node binaries receive a 15-minute compatibility lease until they advertise support for the 30-day lease.
 
 ## Deployment
 

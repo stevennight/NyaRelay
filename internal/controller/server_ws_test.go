@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -70,9 +71,10 @@ func TestNodeWebSocketReceivesConfigPush(t *testing.T) {
 	defer closeTestWebSocket(t, conn, websocket.StatusNormalClosure, "done")
 
 	hello := sharedprotocol.ControlMessage{
-		Type:    "hello",
-		NodeID:  node.ID,
-		Version: "1.0.0",
+		Type:                    "hello",
+		NodeID:                  node.ID,
+		Version:                 "1.0.0",
+		SupportsLongConfigLease: true,
 		System: model.NodeSystem{
 			Hostname: "node-1",
 			OS:       "linux",
@@ -92,6 +94,9 @@ func TestNodeWebSocketReceivesConfigPush(t *testing.T) {
 	}
 	if first.Config.Config.NodeID != node.ID {
 		t.Fatalf("config node mismatch: got %s", first.Config.Config.NodeID)
+	}
+	if got := first.Config.Config.ExpiresAt.Sub(first.Config.Config.IssuedAt); got != model.RelayConfigLease {
+		t.Fatalf("config lease = %s, want %s", got, model.RelayConfigLease)
 	}
 
 	tunnel := upsertTunnel(t, s, directTunnelRequest("tun_ws_push", node.ID))
@@ -122,6 +127,93 @@ func TestNodeWebSocketReceivesConfigPush(t *testing.T) {
 	}
 	if len(second.Config.Config.Forwards) != 1 {
 		t.Fatalf("expected one forward in pushed config, got %d", len(second.Config.Config.Forwards))
+	}
+}
+
+func TestNodeHTTPConfigNegotiatesLongLease(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	st, err := store.Open(ctx, filepath.Join(dir, "nyarelay.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeTestStore(t, st)
+
+	s := &Server{
+		cfg:      Config{PublicURL: "https://panel.example"},
+		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:    st,
+		sessions: auth.NewSessions(time.Hour),
+		limiter:  auth.NewLoginLimiter(),
+		hub:      nodehub.New(),
+		mux:      http.NewServeMux(),
+	}
+	if err := s.ensureSigningKey(ctx); err != nil {
+		t.Fatal(err)
+	}
+	s.routes()
+
+	ts := httptest.NewServer(secureHeaders(s.mux))
+	defer ts.Close()
+
+	node := model.Node{
+		ID:        "node_http_lease",
+		Name:      "node-http-lease",
+		Status:    model.NodeOffline,
+		Approved:  true,
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := st.UpsertNode(ctx, node, "node-token"); err != nil {
+		t.Fatal(err)
+	}
+
+	fetchLease := func(capability string) time.Duration {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/api/node/config", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("X-NyaRelay-Node-ID", node.ID)
+		req.Header.Set("X-NyaRelay-Node-Token", "node-token")
+		if capability != "" {
+			req.Header.Set(sharedprotocol.SupportsLongConfigLeaseHeader, capability)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("config status = %d, want %d", resp.StatusCode, http.StatusOK)
+		}
+		var signed model.SignedConfig
+		if err := json.NewDecoder(resp.Body).Decode(&signed); err != nil {
+			t.Fatal(err)
+		}
+		return signed.Config.ExpiresAt.Sub(signed.Config.IssuedAt)
+	}
+
+	if got := fetchLease(""); got != model.LegacyRelayConfigLease {
+		t.Fatalf("legacy HTTP config lease = %s, want %s", got, model.LegacyRelayConfigLease)
+	}
+	if got := fetchLease("true"); got != model.RelayConfigLease {
+		t.Fatalf("modern HTTP config lease = %s, want %s", got, model.RelayConfigLease)
+	}
+}
+
+func TestConfigLeaseForNodeRequiresLongLeaseCapability(t *testing.T) {
+	hub := nodehub.New()
+	s := &Server{hub: hub}
+
+	if got := s.configLeaseForNode("missing"); got != legacyNodeConfigLease {
+		t.Fatalf("unconnected node lease = %s, want %s", got, legacyNodeConfigLease)
+	}
+	hub.RegisterSocket("legacy", nil, false)
+	if got := s.configLeaseForNode("legacy"); got != legacyNodeConfigLease {
+		t.Fatalf("legacy node lease = %s, want %s", got, legacyNodeConfigLease)
+	}
+	hub.RegisterSocket("modern", nil, true)
+	if got := s.configLeaseForNode("modern"); got != nodeConfigLease {
+		t.Fatalf("modern node lease = %s, want %s", got, nodeConfigLease)
 	}
 }
 

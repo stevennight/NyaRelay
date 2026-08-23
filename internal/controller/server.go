@@ -52,7 +52,8 @@ const (
 	controlWebSocketReadLimit      = 256 * 1024
 	controlWebSocketHelloTimeout   = 10 * time.Second
 	controlWebSocketIdleTimeout    = 90 * time.Second
-	nodeConfigLease                = 15 * time.Minute
+	nodeConfigLease                = model.RelayConfigLease
+	legacyNodeConfigLease          = model.LegacyRelayConfigLease
 	maxNodeCredentialBytes         = 256
 	maxNodeNameBytes               = 256
 	maxNodeLabelEntries            = 64
@@ -2022,7 +2023,7 @@ func (s *Server) handleNodeWS(w http.ResponseWriter, r *http.Request, node model
 		return
 	}
 	s.log.Info("node online", "node", node.ID, "version", hello.Version)
-	s.hub.RegisterSocket(node.ID, conn)
+	s.hub.RegisterSocket(node.ID, conn, hello.SupportsLongConfigLease)
 	s.nodeSocketMu.Unlock()
 	defer func() {
 		if s.hub.UnregisterSocket(node.ID, conn) {
@@ -2103,7 +2104,7 @@ func logNodeWebSocketReadFailure(log *slog.Logger, ctx context.Context, err erro
 }
 
 func (s *Server) handleNodeConfig(w http.ResponseWriter, r *http.Request, node model.Node) {
-	signed, err := s.compileConfig(r.Context(), node.ID)
+	signed, err := s.compileConfigWithLease(r.Context(), node.ID, configLeaseForRequest(r))
 	if err != nil {
 		writeError(w, err, http.StatusInternalServerError)
 		return
@@ -2183,7 +2184,7 @@ func (s *Server) pushConfigs(ctx context.Context) {
 }
 
 func (s *Server) pushConfig(ctx context.Context, nodeID string) error {
-	signed, err := s.compileConfig(ctx, nodeID)
+	signed, err := s.compileConfigWithLease(ctx, nodeID, s.configLeaseForNode(nodeID))
 	if err != nil {
 		return err
 	}
@@ -2226,6 +2227,24 @@ func (s *Server) sendNodeUpdateIfNeeded(ctx context.Context, nodeID string, send
 }
 
 func (s *Server) compileConfig(ctx context.Context, nodeID string) (model.SignedConfig, error) {
+	return s.compileConfigWithLease(ctx, nodeID, nodeConfigLease)
+}
+
+func (s *Server) configLeaseForNode(nodeID string) time.Duration {
+	if s.hub != nil && s.hub.SupportsLongConfigLease(nodeID) {
+		return nodeConfigLease
+	}
+	return legacyNodeConfigLease
+}
+
+func configLeaseForRequest(r *http.Request) time.Duration {
+	if r != nil && strings.EqualFold(strings.TrimSpace(r.Header.Get(sharedprotocol.SupportsLongConfigLeaseHeader)), "true") {
+		return nodeConfigLease
+	}
+	return legacyNodeConfigLease
+}
+
+func (s *Server) compileConfigWithLease(ctx context.Context, nodeID string, lease time.Duration) (model.SignedConfig, error) {
 	nodes, err := s.store.ListNodes(ctx)
 	if err != nil {
 		return model.SignedConfig{}, err
@@ -2257,7 +2276,7 @@ func (s *Server) compileConfig(ctx context.Context, nodeID string) (model.Signed
 		Forwards:               scopedForwards,
 		FailureCooldownSeconds: int64(s.currentFailureCooldown() / time.Second),
 	}
-	cfg.ExpiresAt = cfg.IssuedAt.Add(nodeConfigLease)
+	cfg.ExpiresAt = cfg.IssuedAt.Add(lease)
 	priv, _, err := s.store.GetSetting(ctx, signingKeySetting)
 	if err != nil {
 		return model.SignedConfig{}, err

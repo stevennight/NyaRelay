@@ -2,6 +2,13 @@ package model
 
 import "time"
 
+const (
+	// RelayConfigLease is the maximum offline period for a current node config.
+	RelayConfigLease = 30 * 24 * time.Hour
+	// LegacyRelayConfigLease keeps older node binaries compatible during rollout.
+	LegacyRelayConfigLease = 15 * time.Minute
+)
+
 type TunnelType string
 
 const (

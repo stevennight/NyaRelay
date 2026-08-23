@@ -87,6 +87,45 @@ func TestBootstrapConfigFallsBackToCache(t *testing.T) {
 	}
 }
 
+func TestBootstrapConfigUsesLongerCacheForSameRevision(t *testing.T) {
+	ctx := context.Background()
+	pub, priv, err := sharedcrypto.GenerateSigningKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	httpCfg := signedConfig(t, priv, 4, "node-1")
+	cacheCfg := signedConfig(t, priv, 4, "node-1")
+	cacheCfg.Config.ExpiresAt = cacheCfg.Config.IssuedAt.Add(model.RelayConfigLease)
+	cacheCfg.Signature, err = sharedcrypto.SignJSON(priv, cacheCfg.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cacheDir := t.TempDir()
+	if err := saveConfig(cacheDir+"/cached.json", cacheCfg); err != nil {
+		t.Fatal(err)
+	}
+
+	client := fakeConfigClient{signed: httpCfg}
+	var currentRevision atomic.Int64
+	var applied []string
+	apply := func(ctx context.Context, signed model.SignedConfig, source string) error {
+		if err := verifySignedConfig("node-1", pub, signed); err != nil {
+			return err
+		}
+		applied = append(applied, source)
+		currentRevision.Store(signed.Config.Revision)
+		return nil
+	}
+
+	bootstrapConfig(ctx, client, cacheDir+"/cached.json", &currentRevision, apply, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	if len(applied) != 2 || applied[0] != "http" || applied[1] != "cache" {
+		t.Fatalf("unexpected apply order: %v", applied)
+	}
+}
+
 func TestVerifySignedConfigRequiresSigningKeyAndFreshExpiry(t *testing.T) {
 	pub, priv, err := sharedcrypto.GenerateSigningKey()
 	if err != nil {
@@ -104,6 +143,15 @@ func TestVerifySignedConfigRequiresSigningKeyAndFreshExpiry(t *testing.T) {
 	}
 	if err := verifySignedConfig("node-1", pub, expired); err == nil {
 		t.Fatal("expired config must be rejected")
+	}
+	longLease := valid
+	longLease.Config.ExpiresAt = longLease.Config.IssuedAt.Add(maxSignedConfigLifetime)
+	longLease.Signature, err = sharedcrypto.SignJSON(priv, longLease.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verifySignedConfig("node-1", pub, longLease); err != nil {
+		t.Fatalf("maximum supported config lease must be accepted: %v", err)
 	}
 	tooLong := valid
 	tooLong.Config.ExpiresAt = tooLong.Config.IssuedAt.Add(maxSignedConfigLifetime + time.Minute)

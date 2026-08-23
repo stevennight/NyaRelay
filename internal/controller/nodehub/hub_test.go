@@ -39,8 +39,8 @@ func TestUnregisterSocketDoesNotRemoveReplacement(t *testing.T) {
 	first := dial()
 	second := dial()
 	hub := New()
-	hub.RegisterSocket("node-1", first)
-	hub.RegisterSocket("node-1", second)
+	hub.RegisterSocket("node-1", first, false)
+	hub.RegisterSocket("node-1", second, true)
 
 	if hub.UnregisterSocket("node-1", first) {
 		t.Fatal("replacement connection was treated as current")
@@ -53,6 +53,22 @@ func TestUnregisterSocketDoesNotRemoveReplacement(t *testing.T) {
 	}
 	if got := hub.NodeIDs(); len(got) != 0 {
 		t.Fatalf("socket remained registered after current connection closed: %v", got)
+	}
+}
+
+func TestSupportsLongConfigLeaseTracksSocket(t *testing.T) {
+	hub := New()
+	hub.RegisterSocket("legacy", nil, false)
+	hub.RegisterSocket("modern", nil, true)
+
+	if hub.SupportsLongConfigLease("legacy") {
+		t.Fatal("legacy socket advertised long config lease support")
+	}
+	if !hub.SupportsLongConfigLease("modern") {
+		t.Fatal("modern socket did not advertise long config lease support")
+	}
+	if hub.SupportsLongConfigLease("missing") {
+		t.Fatal("missing socket advertised long config lease support")
 	}
 }
 

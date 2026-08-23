@@ -71,7 +71,7 @@ node -> Caddy HTTPS -> controller WebSocket
 - controller 只通知“配置版本变化”，不 SSH 进节点。
 - node 验证 Ed25519 签名后应用配置。
 - 节点主动上报流量、连接数、链路状态和错误事件。
-- controller 重启不影响已有转发，node 使用最后一次有效配置继续运行。
+- controller 重启不影响已有转发，node 使用最后一次有效配置继续运行；当前版本的签名配置离线租约为 30 天。
 
 ### 数据面与链路类型
 

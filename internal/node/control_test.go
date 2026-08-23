@@ -39,6 +39,9 @@ func TestControlLoopReconnectsWhenHeartbeatPingTimesOut(t *testing.T) {
 		if err := wsjson.Read(r.Context(), conn, &hello); err != nil {
 			return
 		}
+		if !hello.SupportsLongConfigLease {
+			t.Errorf("node hello did not advertise long config lease support")
+		}
 		if connections.Add(1) >= 2 {
 			reconnectOnce.Do(func() { close(reconnected) })
 		}
@@ -278,6 +281,9 @@ func TestNodeClientDoesNotFollowRedirects(t *testing.T) {
 	var hits atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
+		if got := r.Header.Get(sharedprotocol.SupportsLongConfigLeaseHeader); got != "true" {
+			t.Errorf("long config lease header = %q, want true", got)
+		}
 		http.Redirect(w, r, "/api/node/config", http.StatusFound)
 	}))
 	defer server.Close()
