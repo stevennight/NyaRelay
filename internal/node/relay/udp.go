@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"nyarelay/internal/node/metrics"
@@ -41,243 +42,360 @@ func (s *Service) udpLoop(ctx context.Context, forward model.ForwardRuntime, tun
 			continue
 		}
 		payload := append([]byte(nil), buf[:n]...)
-		if !s.tryAcquireUDPPacket() {
-			continue
+		s.submitUDPEntryPacket(ctx, forward, tunnel, inbound, clientAddr, payload)
+	}
+}
+
+func watchConnContext(ctx context.Context, conn net.Conn) func() {
+	stop := make(chan struct{})
+	var stopOnce sync.Once
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-stop:
 		}
-		go func(clientAddr *net.UDPAddr, payload []byte) {
-			defer s.releaseUDPPacket()
-			s.handleUDPPacket(ctx, forward, tunnel, inbound, clientAddr, payload)
-		}(clientAddr, payload)
+	}()
+	return func() {
+		stopOnce.Do(func() { close(stop) })
 	}
 }
 
-func (s *Service) handleUDPPacket(ctx context.Context, forward model.ForwardRuntime, tunnel model.TunnelRuntime, inbound *net.UDPConn, clientAddr *net.UDPAddr, payload []byte) {
-	counter := s.forwards.Get("forward:" + forward.ID)
-	counter.AddConnection()
-	var response []byte
-	var statID string
-	var err error
-	if tunnel.Type == model.TunnelDirect {
-		sessionID := forward.ID + ":" + clientAddr.String()
-		response, statID, err = s.udpTargetRoundTrip(ctx, forward, sessionID, payload)
-	} else {
-		sessionID := forward.ID + ":" + clientAddr.String()
-		response, statID, err = s.forwardUDPOverTunnel(ctx, tunnel, forward, sessionID, payload)
+func (s *Service) readInitialUDPFrame(ctx context.Context, conn net.Conn) (protocol.UDPDatagramFrame, error) {
+	stopWatch := watchConnContext(ctx, conn)
+	defer stopWatch()
+	deadline := time.Now().Add(udpSessionFirstFrameLimit)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
 	}
-	if err != nil {
-		s.log.Debug("udp forward failed", "forward", forward.Name, "error", err)
-		return
-	}
-	if statID != "" {
-		tunnelCounter := s.tunnels.Get(statID)
-		tunnelCounter.AddIn(int64(len(payload)))
-		tunnelCounter.AddOut(int64(len(response)))
-	}
-	counter.AddIn(int64(len(payload)))
-	if len(response) > 0 {
-		_, _ = inbound.WriteToUDP(response, clientAddr)
-		counter.AddOut(int64(len(response)))
-	}
+	_ = conn.SetReadDeadline(deadline)
+	frame, err := protocol.ReadUDPDatagramFrame(conn)
+	_ = conn.SetReadDeadline(time.Time{})
+	return frame, err
 }
 
-func (s *Service) forwardUDPOverTunnel(ctx context.Context, tunnel model.TunnelRuntime, forward model.ForwardRuntime, sessionID string, payload []byte) ([]byte, string, error) {
-	frame := protocol.UDPDatagramFrame{
-		ForwardID: forward.ID,
-		SessionID: sessionID,
-		Payload:   payload,
+func validateInitialUDPFrame(frame protocol.UDPDatagramFrame, forwardID string) error {
+	if frame.ForwardID != forwardID {
+		return errors.New("udp frame forward mismatch")
 	}
-	response, statID, err := s.forwardUDPFrameWithRetry(ctx, tunnel, forward, 0, frame)
+	if frame.SessionID == "" {
+		return errors.New("udp frame session is empty")
+	}
+	return nil
+}
+
+func writeUDPFrameWithDeadline(conn net.Conn, frame protocol.UDPDatagramFrame) error {
+	_ = conn.SetWriteDeadline(time.Now().Add(udpSessionWriteTimeout))
+	defer func() { _ = conn.SetWriteDeadline(time.Time{}) }()
+	return protocol.WriteUDPDatagramFrame(conn, frame)
+}
+
+func writeUDPConnPayload(conn net.Conn, payload []byte) error {
+	_ = conn.SetWriteDeadline(time.Now().Add(udpSessionWriteTimeout))
+	defer func() { _ = conn.SetWriteDeadline(time.Time{}) }()
+	n, err := conn.Write(payload)
 	if err != nil {
-		return nil, statID, err
+		return err
 	}
-	return response.Payload, statID, err
+	if n != len(payload) {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
+type udpPumpSide uint8
+
+const (
+	udpPumpUpstream udpPumpSide = iota
+	udpPumpDownstream
+)
+
+type udpPumpResult struct {
+	side        udpPumpSide
+	err         error
+	writeFailed bool
+}
+
+type udpSessionEndReason uint8
+
+const (
+	udpSessionEndedByPump udpSessionEndReason = iota
+	udpSessionEndedByContext
+	udpSessionEndedByIdle
+)
+
+type udpPersistentSessionResult struct {
+	reason udpSessionEndReason
+	pump   udpPumpResult
+}
+
+func runUDPPersistentSession(ctx context.Context, idleTimeout time.Duration, closeConnections func(), pumps ...func(context.Context, func()) udpPumpResult) udpPersistentSessionResult {
+	if idleTimeout <= 0 {
+		idleTimeout = udpSessionIdleTimeout
+	}
+	sessionCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	activity := make(chan struct{}, 1)
+	touch := func() {
+		select {
+		case activity <- struct{}{}:
+		default:
+		}
+	}
+	results := make(chan udpPumpResult, len(pumps))
+	var wait sync.WaitGroup
+	for _, pump := range pumps {
+		pump := pump
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			results <- pump(sessionCtx, touch)
+		}()
+	}
+
+	timer := time.NewTimer(idleTimeout)
+	defer timer.Stop()
+	resetIdle := func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(idleTimeout)
+	}
+
+	var result udpPersistentSessionResult
+selectLoop:
+	for {
+		select {
+		case pumpResult := <-results:
+			result.reason = udpSessionEndedByPump
+			result.pump = pumpResult
+			break selectLoop
+		case <-ctx.Done():
+			result.reason = udpSessionEndedByContext
+			break selectLoop
+		case <-timer.C:
+			result.reason = udpSessionEndedByIdle
+			break selectLoop
+		case <-activity:
+			resetIdle()
+		}
+	}
+
+	cancel()
+	closeConnections()
+	wait.Wait()
+	return result
 }
 
 func (s *Service) handleUDPStageTransit(ctx context.Context, tunnel model.TunnelRuntime, forward model.ForwardRuntime, stage model.TunnelRuntimeStage, inbound net.Conn, counter *metrics.Counter) {
-	frame, err := protocol.ReadUDPDatagramFrame(inbound)
+	first, err := s.readInitialUDPFrame(ctx, inbound)
 	if err != nil {
-		if !errors.Is(err, io.EOF) {
-			s.log.Debug("udp transit read failed", "forward", forward.Name, "error", err)
+		if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+			s.log.Debug("udp transit first frame read failed", "forward", forward.Name, "error", err)
 		}
 		return
 	}
-	if frame.ForwardID != forward.ID {
+	if err := validateInitialUDPFrame(first, forward.ID); err != nil {
+		s.log.Debug("udp transit first frame rejected", "forward", forward.Name, "error", err)
 		return
 	}
-	response, statID, err := s.forwardUDPFrameWithRetry(ctx, tunnel, forward, stage.Index, frame)
+	next, statID, err := s.dialForwardNext(ctx, tunnel, forward, stage.Index, "udp", first.SessionID)
 	if err != nil {
-		s.log.Warn("udp transit failed", "forward", forward.Name, "error", err)
+		s.log.Warn("udp transit next stage dial failed", "forward", forward.Name, "error", err)
 		return
 	}
-	counter.AddIn(int64(len(frame.Payload)))
-	counter.AddOut(int64(len(response.Payload)))
-	tunnelCounter := s.tunnels.Get(statID)
-	tunnelCounter.AddIn(int64(len(frame.Payload)))
-	tunnelCounter.AddOut(int64(len(response.Payload)))
-	if err := protocol.WriteUDPDatagramFrame(inbound, response); err != nil {
-		s.markUDPStreamFailure(tunnel, forward, stage.Index, statID, frame.SessionID)
+	defer s.closeConn(next, "udp transit next outbound")
+	if err := writeUDPFrameWithDeadline(next, first); err != nil {
+		s.markUDPStreamFailure(tunnel, forward, stage.Index, statID, first.SessionID)
+		s.log.Debug("udp transit first frame write failed", "forward", forward.Name, "error", err)
 		return
+	}
+	counter.AddIn(int64(len(first.Payload)))
+	if statID != "" {
+		s.tunnels.Get(statID).AddIn(int64(len(first.Payload)))
+	}
+
+	responseSeen := false
+	result := runUDPPersistentSession(ctx, s.udpIdleTimeout(), func() {
+		_ = inbound.Close()
+		_ = next.Close()
+	},
+		func(sessionCtx context.Context, touch func()) udpPumpResult {
+			return s.relayUDPFramePump(sessionCtx, inbound, next, forward.ID, first.SessionID, udpPumpUpstream, counter, statID, nil, touch)
+		},
+		func(sessionCtx context.Context, touch func()) udpPumpResult {
+			return s.relayUDPFramePump(sessionCtx, next, inbound, forward.ID, first.SessionID, udpPumpDownstream, counter, statID, &responseSeen, touch)
+		},
+	)
+	if result.reason == udpSessionEndedByPump && result.pump.side == udpPumpDownstream && !result.pump.writeFailed {
+		if !errors.Is(result.pump.err, io.EOF) || !responseSeen {
+			s.markUDPStreamFailure(tunnel, forward, stage.Index, statID, first.SessionID)
+		}
+	}
+	if result.reason == udpSessionEndedByPump && result.pump.side == udpPumpUpstream && result.pump.writeFailed {
+		s.markUDPStreamFailure(tunnel, forward, stage.Index, statID, first.SessionID)
+	}
+	if result.reason == udpSessionEndedByPump && result.pump.err != nil && !errors.Is(result.pump.err, io.EOF) && !errors.Is(result.pump.err, net.ErrClosed) {
+		s.log.Debug("udp transit session ended", "forward", forward.Name, "error", result.pump.err)
 	}
 }
 
-func (s *Service) forwardUDPFrameWithRetry(ctx context.Context, tunnel model.TunnelRuntime, forward model.ForwardRuntime, fromStageIndex int, frame protocol.UDPDatagramFrame) (protocol.UDPDatagramFrame, string, error) {
-	retryCtx, cancel := context.WithTimeout(ctx, relayDialBudget)
-	defer cancel()
-	ctx = retryCtx
-	attempts := s.udpCandidateAttemptLimit(tunnel, fromStageIndex)
-	var lastErr error
-	var lastStatID string
-	for attempt := 0; attempt < attempts; attempt++ {
-		stream, statID, err := s.dialForwardNext(ctx, tunnel, forward, fromStageIndex, "udp", frame.SessionID)
-		lastStatID = statID
+func (s *Service) relayUDPFramePump(ctx context.Context, src, dst net.Conn, forwardID, sessionID string, side udpPumpSide, counter *metrics.Counter, statID string, responseSeen *bool, touch func()) udpPumpResult {
+	for {
+		frame, err := protocol.ReadUDPDatagramFrame(src)
 		if err != nil {
-			lastErr = err
-			continue
+			return udpPumpResult{side: side, err: err}
 		}
-		response, err := s.writeReadUDPFrame(stream, tunnel, forward, fromStageIndex, statID, frame)
-		_ = stream.Close()
-		if err != nil {
-			lastErr = err
-			continue
+		if frame.ForwardID != forwardID || frame.SessionID != sessionID {
+			return udpPumpResult{side: side, err: errors.New("udp frame session mismatch")}
 		}
-		return response, statID, nil
-	}
-	if lastErr == nil {
-		lastErr = errors.New("udp candidate attempts exhausted")
-	}
-	return protocol.UDPDatagramFrame{}, lastStatID, lastErr
-}
-
-func (s *Service) writeReadUDPFrame(stream net.Conn, tunnel model.TunnelRuntime, forward model.ForwardRuntime, fromStageIndex int, statID string, frame protocol.UDPDatagramFrame) (protocol.UDPDatagramFrame, error) {
-	if err := protocol.WriteUDPDatagramFrame(stream, frame); err != nil {
-		s.markUDPStreamFailure(tunnel, forward, fromStageIndex, statID, frame.SessionID)
-		return protocol.UDPDatagramFrame{}, err
-	}
-	response, err := protocol.ReadUDPDatagramFrame(stream)
-	if err != nil {
-		s.markUDPStreamFailure(tunnel, forward, fromStageIndex, statID, frame.SessionID)
-		return protocol.UDPDatagramFrame{}, err
-	}
-	if response.ForwardID != forward.ID || response.SessionID != frame.SessionID {
-		s.markUDPStreamFailure(tunnel, forward, fromStageIndex, statID, frame.SessionID)
-		return protocol.UDPDatagramFrame{}, errors.New("udp response frame mismatch")
-	}
-	return response, nil
-}
-
-func (s *Service) udpCandidateAttemptLimit(tunnel model.TunnelRuntime, fromStageIndex int) int {
-	nextIndex := fromStageIndex + 1
-	if tunnel.Type == model.TunnelDirect || nextIndex >= len(tunnel.Stages) {
-		return 1
-	}
-	count := 0
-	for _, node := range tunnel.Stages[nextIndex].Nodes {
-		if runtimeNodeSupportsProtocol(node, model.ForwardProtocolUDP) {
-			count++
+		if err := writeUDPFrameWithDeadline(dst, frame); err != nil {
+			return udpPumpResult{side: side, err: err, writeFailed: true}
+		}
+		if side == udpPumpDownstream && responseSeen != nil {
+			*responseSeen = true
+		}
+		touch()
+		if side == udpPumpUpstream {
+			counter.AddIn(int64(len(frame.Payload)))
+			if statID != "" {
+				s.tunnels.Get(statID).AddIn(int64(len(frame.Payload)))
+			}
+		} else {
+			counter.AddOut(int64(len(frame.Payload)))
+			if statID != "" {
+				s.tunnels.Get(statID).AddOut(int64(len(frame.Payload)))
+			}
 		}
 	}
-	if count <= 0 {
-		return 1
-	}
-	return count
 }
 
 func (s *Service) handleUDPStageExit(ctx context.Context, forward model.ForwardRuntime, inbound net.Conn, counter *metrics.Counter) {
-	for {
-		deadline := time.Now().Add(time.Second)
-		if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
-			deadline = ctxDeadline
+	first, err := s.readInitialUDPFrame(ctx, inbound)
+	if err != nil {
+		if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+			s.log.Debug("udp exit first frame read failed", "forward", forward.Name, "error", err)
 		}
-		_ = inbound.SetReadDeadline(deadline)
-		frame, err := protocol.ReadUDPDatagramFrame(inbound)
-		if err != nil {
-			var netErr net.Error
-			if errors.As(err, &netErr) && netErr.Timeout() {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					continue
-				}
-			}
-			if !errors.Is(err, io.EOF) {
-				s.log.Debug("udp stream read failed", "forward", forward.Name, "error", err)
-			}
-			return
+		return
+	}
+	if err := validateInitialUDPFrame(first, forward.ID); err != nil {
+		s.log.Debug("udp exit first frame rejected", "forward", forward.Name, "error", err)
+		return
+	}
+	out, statID, targetID, err := s.openUDPStageTarget(ctx, forward, first.SessionID, first.Payload)
+	if err != nil {
+		s.log.Debug("udp exit target open failed", "forward", forward.Name, "error", err)
+		return
+	}
+	defer s.closeConn(out, "udp exit target outbound")
+	counter.AddIn(int64(len(first.Payload)))
+	if statID != "" {
+		s.tunnels.Get(statID).AddIn(int64(len(first.Payload)))
+	}
+
+	responseSeen := false
+	result := runUDPPersistentSession(ctx, s.udpIdleTimeout(), func() {
+		_ = inbound.Close()
+		_ = out.Close()
+	},
+		func(sessionCtx context.Context, touch func()) udpPumpResult {
+			return s.relayUDPFramesToTarget(sessionCtx, inbound, out, forward.ID, first.SessionID, counter, statID, touch)
+		},
+		func(sessionCtx context.Context, touch func()) udpPumpResult {
+			return s.relayUDPTargetToFrames(sessionCtx, out, inbound, forward.ID, first.SessionID, counter, statID, &responseSeen, touch)
+		},
+	)
+	if result.reason == udpSessionEndedByPump && result.pump.side == udpPumpDownstream && !result.pump.writeFailed {
+		if !errors.Is(result.pump.err, io.EOF) || !responseSeen {
+			s.markUDPTargetFailure(forward.ID, first.SessionID, targetID)
 		}
-		if frame.ForwardID != forward.ID {
-			return
-		}
-		response, statID, err := s.udpTargetRoundTrip(ctx, forward, frame.SessionID, frame.Payload)
-		if err != nil {
-			s.log.Debug("udp target round trip failed", "forward", forward.Name, "error", err)
-			return
-		}
-		counter.AddIn(int64(len(frame.Payload)))
-		counter.AddOut(int64(len(response)))
-		if statID != "" {
-			tunnelCounter := s.tunnels.Get(statID)
-			tunnelCounter.AddIn(int64(len(frame.Payload)))
-			tunnelCounter.AddOut(int64(len(response)))
-		}
-		if err := protocol.WriteUDPDatagramFrame(inbound, protocol.UDPDatagramFrame{
-			ForwardID: forward.ID,
-			SessionID: frame.SessionID,
-			Payload:   response,
-		}); err != nil {
-			return
-		}
+	}
+	if result.reason == udpSessionEndedByPump && result.pump.side == udpPumpUpstream && result.pump.writeFailed {
+		s.markUDPTargetFailure(forward.ID, first.SessionID, targetID)
+	}
+	if result.reason == udpSessionEndedByPump && result.pump.err != nil && !errors.Is(result.pump.err, io.EOF) && !errors.Is(result.pump.err, net.ErrClosed) {
+		s.log.Debug("udp exit session ended", "forward", forward.Name, "error", result.pump.err)
 	}
 }
 
-func (s *Service) udpTargetRoundTrip(ctx context.Context, forward model.ForwardRuntime, sessionID string, payload []byte) (response []byte, statID string, err error) {
-	retryCtx, cancel := context.WithTimeout(ctx, relayDialBudget)
-	defer cancel()
-	ctx = retryCtx
+func (s *Service) openUDPStageTarget(ctx context.Context, forward model.ForwardRuntime, sessionID string, firstPayload []byte) (net.Conn, string, string, error) {
 	attempts := len(forward.Targets)
 	if attempts <= 0 {
 		attempts = 1
 	}
 	var lastErr error
-	var lastStatID string
 	for attempt := 0; attempt < attempts; attempt++ {
-		response, statID, err = s.udpTargetRoundTripOnce(ctx, forward, sessionID, payload)
-		lastStatID = statID
-		if err == nil {
-			return response, statID, nil
+		out, statID, targetID, err := s.dialForwardTarget(ctx, forward, "udp", sessionID)
+		if err != nil {
+			lastErr = err
+			continue
 		}
-		lastErr = err
+		if err := writeUDPConnPayload(out, firstPayload); err != nil {
+			s.markUDPTargetFailure(forward.ID, sessionID, targetID)
+			_ = out.Close()
+			lastErr = err
+			continue
+		}
+		return out, statID, targetID, nil
 	}
-	return nil, lastStatID, lastErr
+	if lastErr == nil {
+		lastErr = errors.New("udp target attempts exhausted")
+	}
+	return nil, "target:" + forward.ID, "", lastErr
 }
 
-func (s *Service) udpTargetRoundTripOnce(ctx context.Context, forward model.ForwardRuntime, sessionID string, payload []byte) (response []byte, statID string, err error) {
-	out, statID, targetID, err := s.dialForwardTarget(ctx, forward, "udp", sessionID)
-	if err != nil {
-		return nil, statID, err
-	}
-	defer func() {
-		if closeErr := out.Close(); err == nil {
-			err = closeErr
+func (s *Service) relayUDPFramesToTarget(ctx context.Context, inbound, target net.Conn, forwardID, sessionID string, counter *metrics.Counter, statID string, touch func()) udpPumpResult {
+	for {
+		frame, err := protocol.ReadUDPDatagramFrame(inbound)
+		if err != nil {
+			return udpPumpResult{side: udpPumpUpstream, err: err}
 		}
-	}()
-	deadline := time.Now().Add(10 * time.Second)
-	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
-		deadline = d
+		if frame.ForwardID != forwardID || frame.SessionID != sessionID {
+			return udpPumpResult{side: udpPumpUpstream, err: errors.New("udp frame session mismatch")}
+		}
+		if err := writeUDPConnPayload(target, frame.Payload); err != nil {
+			return udpPumpResult{side: udpPumpUpstream, err: err, writeFailed: true}
+		}
+		touch()
+		counter.AddIn(int64(len(frame.Payload)))
+		if statID != "" {
+			s.tunnels.Get(statID).AddIn(int64(len(frame.Payload)))
+		}
 	}
-	_ = out.SetDeadline(deadline)
-	if _, err := out.Write(payload); err != nil {
-		s.markUDPTargetFailure(forward.ID, sessionID, targetID)
-		return nil, statID, err
-	}
+}
+
+func (s *Service) relayUDPTargetToFrames(ctx context.Context, target, inbound net.Conn, forwardID, sessionID string, counter *metrics.Counter, statID string, responseSeen *bool, touch func()) udpPumpResult {
 	buf := make([]byte, protocol.MaxUDPPacket)
-	n, err := out.Read(buf)
-	if err != nil {
-		s.markUDPTargetFailure(forward.ID, sessionID, targetID)
-		return nil, statID, err
+	for {
+		n, err := target.Read(buf)
+		if err != nil {
+			return udpPumpResult{side: udpPumpDownstream, err: err}
+		}
+		if err := writeUDPFrameWithDeadline(inbound, protocol.UDPDatagramFrame{
+			ForwardID: forwardID,
+			SessionID: sessionID,
+			Payload:   append([]byte(nil), buf[:n]...),
+		}); err != nil {
+			return udpPumpResult{side: udpPumpDownstream, err: err, writeFailed: true}
+		}
+		*responseSeen = true
+		touch()
+		counter.AddOut(int64(n))
+		if statID != "" {
+			s.tunnels.Get(statID).AddOut(int64(n))
+		}
 	}
-	s.targets.recordSuccess(forward.ID, targetID, "udp")
-	return append([]byte(nil), buf[:n]...), statID, nil
+}
+
+func (s *Service) udpIdleTimeout() time.Duration {
+	timeout := s.udp.idleTimeout
+	if timeout <= 0 {
+		timeout = udpSessionIdleTimeout
+	}
+	return timeout
 }
 
 func (s *Service) markUDPTargetFailure(forwardID, sessionID, targetID string) {

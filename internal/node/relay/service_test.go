@@ -452,8 +452,13 @@ func TestUDPMultiCandidateReselectsOnReadFailure(t *testing.T) {
 
 	client := newUDPTestClient(t, entryListen)
 	defer client.close()
-	if got := client.roundTrip(t, "first"); got != "b:first" {
-		t.Fatalf("udp packet after first candidate failure = %q, want b:first", got)
+	if _, err := client.conn.Write([]byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	_ = client.conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	buf := make([]byte, 1024)
+	if _, err := client.conn.Read(buf); err == nil {
+		t.Fatal("failed UDP stream replayed a datagram after the original write")
 	}
 	if got := client.roundTrip(t, "second"); got != "b:second" {
 		t.Fatalf("udp session did not stay on reselected candidate: %q", got)

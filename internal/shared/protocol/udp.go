@@ -8,7 +8,8 @@ import (
 )
 
 const (
-	MaxUDPPacket          = 64 * 1024
+	MaxUDPPacket          = 65507
+	MaxUDPFrameBytes      = 96 * 1024
 	MaxUDPIdentifierBytes = 1024
 )
 
@@ -22,20 +23,22 @@ func WriteUDPDatagramFrame(w io.Writer, frame UDPDatagramFrame) error {
 	if len(frame.ForwardID) > MaxUDPIdentifierBytes || len(frame.SessionID) > MaxUDPIdentifierBytes {
 		return errors.New("udp frame identifier is too large")
 	}
+	if len(frame.Payload) > MaxUDPPacket {
+		return errors.New("udp payload is too large")
+	}
 	payload, err := json.Marshal(frame)
 	if err != nil {
 		return err
 	}
-	if len(payload) == 0 || len(payload) > MaxUDPPacket+4096 {
+	if len(payload) == 0 || len(payload) > MaxUDPFrameBytes {
 		return errors.New("udp frame is too large")
 	}
 	var size [4]byte
 	binary.BigEndian.PutUint32(size[:], uint32(len(payload)))
-	if _, err := w.Write(size[:]); err != nil {
+	if err := writeFull(w, size[:]); err != nil {
 		return err
 	}
-	_, err = w.Write(payload)
-	return err
+	return writeFull(w, payload)
 }
 
 func ReadUDPDatagramFrame(r io.Reader) (UDPDatagramFrame, error) {
@@ -44,7 +47,7 @@ func ReadUDPDatagramFrame(r io.Reader) (UDPDatagramFrame, error) {
 		return UDPDatagramFrame{}, err
 	}
 	n := binary.BigEndian.Uint32(size[:])
-	if n == 0 || n > MaxUDPPacket+4096 {
+	if n == 0 || n > MaxUDPFrameBytes {
 		return UDPDatagramFrame{}, errors.New("invalid udp frame size")
 	}
 	payload := make([]byte, n)
@@ -62,4 +65,20 @@ func ReadUDPDatagramFrame(r io.Reader) (UDPDatagramFrame, error) {
 		return UDPDatagramFrame{}, errors.New("udp payload is too large")
 	}
 	return frame, nil
+}
+
+func writeFull(w io.Writer, payload []byte) error {
+	for len(payload) > 0 {
+		n, err := w.Write(payload)
+		if n > 0 {
+			payload = payload[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
 }

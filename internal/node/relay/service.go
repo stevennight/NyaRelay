@@ -31,6 +31,7 @@ type Service struct {
 	targets      *targetSelector
 	udp          *udpCandidateSessions
 	udpTargets   *udpCandidateSessions
+	udpEntries   *udpEntrySessions
 	mu           sync.RWMutex
 	cancel       context.CancelFunc
 	expireCancel context.CancelFunc
@@ -61,6 +62,7 @@ func New(log *slog.Logger, nodeID string) *Service {
 		targets:    newTargetSelector(),
 		udp:        newUDPCandidateSessions(),
 		udpTargets: newUDPCandidateSessions(),
+		udpEntries: newUDPEntrySessions(),
 		connSlots:  make(chan struct{}, maxRelayConnections),
 		udpSlots:   make(chan struct{}, maxUDPPacketWorkers),
 	}
@@ -135,6 +137,7 @@ func (s *Service) stopRuntimeLocked() {
 	for _, closer := range s.servers {
 		_ = closer.Close()
 	}
+	s.udpEntries.closeAll()
 	s.udp.clear()
 	s.udpTargets.clear()
 	s.selector.reset()
@@ -152,6 +155,7 @@ func (s *Service) startConfigLocked(ctx context.Context, cfg model.RelayConfig) 
 	}
 	go s.udp.gcLoop(ctx)
 	go s.udpTargets.gcLoop(ctx)
+	s.udpEntries.watch(ctx)
 	for _, tunnel := range cfg.Tunnels {
 		for _, stage := range tunnel.Stages {
 			if stage.Role == model.TunnelStageEntry {
