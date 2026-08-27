@@ -1,9 +1,12 @@
-import { ArrowDown, ArrowUp, ArrowUpDown, X } from 'lucide-react'
+import { AlertTriangle, ArrowDown, ArrowUp, ArrowUpDown, Inbox, LoaderCircle, X } from 'lucide-react'
 import type { Dispatch, ReactNode, SetStateAction } from 'react'
 import {
   cloneElement,
+  createContext,
   Fragment,
   isValidElement,
+  useCallback,
+  useContext,
   useEffect,
   useId,
   useMemo,
@@ -22,11 +25,12 @@ export function PageFrame({
   action?: ReactNode
   children: ReactNode
 }) {
+  const titleID = useId()
   return (
-    <main className="page-frame">
+    <main className="page-frame" aria-labelledby={titleID}>
       <header className="page-header">
         <div className="page-title">
-          <h1>{title}</h1>
+          <h1 id={titleID}>{title}</h1>
           {subtitle && <p>{subtitle}</p>}
         </div>
         {action && <div className="page-action">{action}</div>}
@@ -40,8 +44,76 @@ export function Panel({ children, className = '' }: { children: ReactNode; class
   return <section className={`panel ${className}`.trim()}>{children}</section>
 }
 
+export type ConfirmOptions = {
+  title: string
+  description: string
+  confirmLabel?: string
+  tone?: 'default' | 'danger'
+}
+
+type ConfirmRequest = (options: ConfirmOptions) => Promise<boolean>
+
+const ConfirmContext = createContext<ConfirmRequest | null>(null)
+
+export function ConfirmProvider({ children }: { children: ReactNode }) {
+  const [request, setRequest] = useState<ConfirmOptions | null>(null)
+  const resolveRef = useRef<((confirmed: boolean) => void) | null>(null)
+  const confirm = useCallback<ConfirmRequest>((options) => new Promise((resolve) => {
+    resolveRef.current?.(false)
+    resolveRef.current = resolve
+    setRequest(options)
+  }), [])
+  const finish = useCallback((confirmed: boolean) => {
+    const resolve = resolveRef.current
+    resolveRef.current = null
+    setRequest(null)
+    resolve?.(confirmed)
+  }, [])
+
+  useEffect(() => () => resolveRef.current?.(false), [])
+
+  return (
+    <ConfirmContext.Provider value={confirm}>
+      {children}
+      {request && (
+        <Modal title={request.title} onClose={() => finish(false)}>
+          <div className="confirm-copy">
+            <span className={`confirm-icon${request.tone === 'danger' ? ' danger' : ''}`} aria-hidden="true">
+              <AlertTriangle size={21} />
+            </span>
+            <p>{request.description}</p>
+          </div>
+          <div className="confirm-actions">
+            <button className="ghost" type="button" onClick={() => finish(false)}>取消</button>
+            <button
+              className={request.tone === 'danger' ? 'confirm-danger' : ''}
+              type="button"
+              onClick={() => finish(true)}
+            >
+              {request.confirmLabel ?? '确认'}
+            </button>
+          </div>
+        </Modal>
+      )}
+    </ConfirmContext.Provider>
+  )
+}
+
+export function useConfirm(): ConfirmRequest {
+  const confirm = useContext(ConfirmContext)
+  return useCallback((options: ConfirmOptions) => {
+    if (confirm) return confirm(options)
+    return Promise.resolve(window.confirm(options.description))
+  }, [confirm])
+}
+
 export function Banner({ text }: { text: string }) {
-  return <div className="banner">{text}</div>
+  return (
+    <div className="banner" role="alert">
+      <AlertTriangle size={18} aria-hidden="true" />
+      <span>{text}</span>
+    </div>
+  )
 }
 
 export function Table({
@@ -190,17 +262,42 @@ export function SortableTable<T>({
   )
 }
 
-export function Stat({ label, value }: { label: string; value: string }) {
+export function Stat({
+  label,
+  value,
+  icon,
+  tone = 'default',
+}: {
+  label: string
+  value: string
+  icon?: ReactNode
+  tone?: 'default' | 'success' | 'teal' | 'amber' | 'violet'
+}) {
   return (
-    <div className="stat">
-      <span>{label}</span>
+    <div className={`stat stat-${tone}`}>
+      <div className="stat-label">
+        <span>{label}</span>
+        {icon && <span className="stat-icon">{icon}</span>}
+      </div>
       <strong>{value}</strong>
     </div>
   )
 }
 
 export function StatusPill({ value }: { value: string }) {
-  return <span className={`status ${value}`.trim()}>{value}</span>
+  const labels: Record<string, string> = {
+    online: '在线',
+    offline: '离线',
+    revoked: '已吊销',
+    enabled: '已启用',
+    disabled: '已停用',
+  }
+  return (
+    <span className={`status ${value}`.trim()}>
+      <span className="status-dot" aria-hidden="true" />
+      {labels[value] ?? value}
+    </span>
+  )
 }
 
 export function FieldGrid({ children }: { children: ReactNode }) {
@@ -297,6 +394,7 @@ export function Modal({
   size?: 'md' | 'lg'
 }) {
   const titleID = useId()
+  const subtitleID = useId()
   const dialogRef = useRef<HTMLElement>(null)
   const closeButtonRef = useRef<HTMLButtonElement>(null)
   const onCloseRef = useRef(onClose)
@@ -360,14 +458,21 @@ export function Modal({
         }
       }}
     >
-      <section ref={dialogRef} className={`modal modal-${size}`} role="dialog" aria-modal="true" aria-labelledby={titleID}>
+      <section
+        ref={dialogRef}
+        className={`modal modal-${size}`}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleID}
+        aria-describedby={subtitle ? subtitleID : undefined}
+      >
         <header className="modal-header">
           <div className="modal-title">
             <h2 id={titleID}>{title}</h2>
-            {subtitle && <p>{subtitle}</p>}
+            {subtitle && <p id={subtitleID}>{subtitle}</p>}
           </div>
           <div className="modal-header-actions">
-            {action}
+            {action && <div className="modal-header-action-slot">{action}</div>}
             <button ref={closeButtonRef} className="icon-button" type="button" aria-label="关闭" onClick={() => onCloseRef.current()}>
               <X size={18} />
             </button>
@@ -396,16 +501,47 @@ export function EmptyState({
   title,
   text,
   action,
+  icon,
 }: {
   title: string
   text: string
   action?: ReactNode
+  icon?: ReactNode
 }) {
   return (
     <section className="panel empty-state">
-      <h2>{title}</h2>
-      <p>{text}</p>
-      {action}
+      <div className="empty-state-icon" aria-hidden="true">{icon ?? <Inbox size={22} />}</div>
+      <div className="empty-state-copy">
+        <h2>{title}</h2>
+        <p>{text}</p>
+      </div>
+      {action && <div className="empty-state-action">{action}</div>}
+    </section>
+  )
+}
+
+export function LoadingState({
+  label = '正在加载',
+  rows = 4,
+}: {
+  label?: string
+  rows?: number
+}) {
+  return (
+    <section className="loading-state panel" aria-busy="true" aria-live="polite">
+      <div className="loading-state-heading">
+        <LoaderCircle className="spin" size={18} aria-hidden="true" />
+        <span>{label}</span>
+      </div>
+      <div className="skeleton-list" aria-hidden="true">
+        {Array.from({ length: rows }, (_, index) => (
+          <div className="skeleton-row" key={index}>
+            <span />
+            <span />
+            <span />
+          </div>
+        ))}
+      </div>
     </section>
   )
 }

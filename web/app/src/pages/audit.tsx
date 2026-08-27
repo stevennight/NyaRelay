@@ -1,7 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { api } from '../api'
 import type { AuditEvent } from '../types'
-import { Banner, EmptyState, PageFrame, Table, formatTime } from '../components/ui'
+import { Banner, EmptyState, LoadingState, PageFrame, Table, formatTime } from '../components/ui'
 
 export function AuditPage() {
   const query = useQuery({
@@ -15,7 +15,9 @@ export function AuditPage() {
       subtitle="所有配置变更、登录和节点操作都会留下记录。"
     >
       {query.error && <Banner text={query.error instanceof Error ? query.error.message : '加载失败'} />}
-      {(query.data ?? []).length === 0 ? (
+      {query.isLoading ? (
+        <LoadingState label="正在加载审计记录" />
+      ) : query.error ? null : (query.data ?? []).length === 0 ? (
         <EmptyState title="还没有审计事件" text="完成一次登录或配置变更后，这里就会有记录。" />
       ) : (
         <Table headers={['时间', '操作者', '动作', '目标', '详情']}>

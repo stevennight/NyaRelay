@@ -12,12 +12,14 @@ import {
   FieldGrid,
   FormActions,
   InlineActions,
+  LoadingState,
   Modal,
   PageFrame,
   StatusPill,
   SortableTable,
   ToggleField,
   formatTime,
+  useConfirm,
   useSessionState,
 } from '../components/ui'
 
@@ -161,7 +163,9 @@ function TunnelsListView({
       }
     >
       {query.error && <Banner text={query.error instanceof Error ? query.error.message : '加载失败'} />}
-      {tunnels.length === 0 ? (
+      {query.isLoading ? (
+        <LoadingState label="正在加载隧道" />
+      ) : query.error ? null : tunnels.length === 0 ? (
         <EmptyState
           title="还没有隧道"
           text="先选择入口节点；需要多跳时再添加中间节点和出口节点。"
@@ -256,10 +260,21 @@ function TunnelsListView({
 function TunnelCreateModal({ onClose }: { onClose: () => void }) {
   const queryClient = useQueryClient()
   const navigate = useNavigate()
+  const confirmAction = useConfirm()
   const [editorDirty, setEditorDirty] = useState(false)
   const handleClose = () => {
-    if (editorDirty && !window.confirm('当前隧道还有未保存的修改，确定关闭吗？')) return
-    onClose()
+    if (!editorDirty) {
+      onClose()
+      return
+    }
+    void confirmAction({
+      title: '放弃隧道修改？',
+      description: '当前隧道还有未保存的修改，关闭后这些内容不会保留。',
+      confirmLabel: '放弃修改',
+      tone: 'danger',
+    }).then((confirmed) => {
+      if (confirmed) onClose()
+    })
   }
 
   return (
@@ -284,6 +299,7 @@ function TunnelCreateModal({ onClose }: { onClose: () => void }) {
 function TunnelDetailModal({ tunnelId, onClose }: { tunnelId: string; onClose: () => void }) {
   const queryClient = useQueryClient()
   const navigate = useNavigate()
+  const confirmAction = useConfirm()
   const [mode, setMode] = useState<'details' | 'edit'>('details')
   const [editorDirty, setEditorDirty] = useState(false)
   const [message, setMessage] = useState('')
@@ -330,12 +346,32 @@ function TunnelDetailModal({ tunnelId, onClose }: { tunnelId: string; onClose: (
 
   const tunnel = query.data
   const handleClose = () => {
-    if (mode === 'edit' && editorDirty && !window.confirm('当前隧道还有未保存的修改，确定关闭吗？')) return
-    onClose()
+    if (mode !== 'edit' || !editorDirty) {
+      onClose()
+      return
+    }
+    void confirmAction({
+      title: '放弃隧道修改？',
+      description: '当前隧道还有未保存的修改，关闭后这些内容不会保留。',
+      confirmLabel: '放弃修改',
+      tone: 'danger',
+    }).then((confirmed) => {
+      if (confirmed) onClose()
+    })
   }
   const toggleMode = () => {
-    if (mode === 'edit' && editorDirty && !window.confirm('当前隧道还有未保存的修改，确定放弃吗？')) return
-    setMode(mode === 'edit' ? 'details' : 'edit')
+    if (mode !== 'edit' || !editorDirty) {
+      setMode(mode === 'edit' ? 'details' : 'edit')
+      return
+    }
+    void confirmAction({
+      title: '放弃隧道修改？',
+      description: '返回详情后，当前未保存的修改不会保留。',
+      confirmLabel: '放弃修改',
+      tone: 'danger',
+    }).then((confirmed) => {
+      if (confirmed) setMode('details')
+    })
   }
 
   return (
@@ -364,9 +400,14 @@ function TunnelDetailModal({ tunnelId, onClose }: { tunnelId: string; onClose: (
           <button
             className="ghost danger"
             type="button"
-            onClick={() => {
-              if (window.confirm(`确定删除隧道“${tunnel.name}”吗？`)) remove.mutate()
-            }}
+            onClick={() => void confirmAction({
+              title: '删除隧道？',
+              description: `隧道“${tunnel.name}”将被永久删除，相关节点配置会重新下发。`,
+              confirmLabel: '删除隧道',
+              tone: 'danger',
+            }).then((confirmed) => {
+              if (confirmed) remove.mutate()
+            })}
             disabled={remove.isPending || editorDirty}
           >
             <Trash2 size={16} />

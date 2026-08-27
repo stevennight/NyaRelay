@@ -1,9 +1,9 @@
 import { useQuery } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
-import { Plus } from 'lucide-react'
+import { Activity, GitCommit, Plus, Route, Server, Waypoints } from 'lucide-react'
 import { api } from '../api'
 import type { ControllerInfo, Dashboard } from '../types'
-import { Banner, DetailGrid, PageFrame, Panel, Stat, formatTime } from '../components/ui'
+import { Banner, DetailGrid, LoadingState, PageFrame, Panel, Stat, formatTime } from '../components/ui'
 
 export function DashboardPage() {
   const dashboardQuery = useQuery({
@@ -22,7 +22,7 @@ export function DashboardPage() {
   return (
     <PageFrame
       title="概览"
-      subtitle="控制面和数据面分离，节点主动连接，配置由控制器签名下发。"
+      subtitle="节点状态、转发运行情况与当前配置版本。"
       action={
         <Link to="/forwards/new" className="button-link">
           <Plus size={16} />
@@ -32,13 +32,17 @@ export function DashboardPage() {
     >
       {error && <Banner text={error instanceof Error ? error.message : '加载失败'} />}
       {controllerQuery.error && <Banner text={controllerQuery.error instanceof Error ? controllerQuery.error.message : '版本信息加载失败'} />}
-      <div className="stats">
-        <Stat label="在线节点" value={`${data?.online_nodes ?? 0}/${data?.nodes ?? 0}`} />
-        <Stat label="活跃转发" value={String(data?.active_forwards ?? 0)} />
-        <Stat label="隧道数量" value={String(data?.tunnels ?? 0)} />
-        <Stat label="转发数量" value={String(data?.forwards ?? 0)} />
-        <Stat label="配置版本" value={String(data?.revision ?? 0)} />
-      </div>
+      {dashboardQuery.isLoading ? (
+        <LoadingState label="正在汇总运行状态" rows={3} />
+      ) : (
+        <div className="stats dashboard-stats">
+          <Stat label="在线节点" value={`${data?.online_nodes ?? 0}/${data?.nodes ?? 0}`} icon={<Server size={18} />} tone="success" />
+          <Stat label="活跃转发" value={String(data?.active_forwards ?? 0)} icon={<Activity size={18} />} tone="teal" />
+          <Stat label="隧道数量" value={String(data?.tunnels ?? 0)} icon={<Waypoints size={18} />} tone="violet" />
+          <Stat label="转发数量" value={String(data?.forwards ?? 0)} icon={<Route size={18} />} tone="amber" />
+          <Stat label="配置版本" value={String(data?.revision ?? 0)} icon={<GitCommit size={18} />} />
+        </div>
+      )}
       <Panel className="dashboard-version-panel">
         <div className="section-heading">
           <div>

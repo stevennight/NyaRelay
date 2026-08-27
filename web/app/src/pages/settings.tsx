@@ -3,7 +3,7 @@ import { Link, Navigate } from '@tanstack/react-router'
 import { useEffect, useState } from 'react'
 import { api, post } from '../api'
 import type { ControllerInfo, HistoryCleanupConfig } from '../types'
-import { Banner, DetailGrid, Field, FieldGrid, FormActions, InlineActions, PageFrame, Panel, Subnav } from '../components/ui'
+import { Banner, DetailGrid, Field, FieldGrid, FormActions, InlineActions, PageFrame, Panel, Subnav, useConfirm } from '../components/ui'
 
 export function SettingsIndexPage() {
   return <Navigate to="/settings/security" replace />
@@ -11,6 +11,7 @@ export function SettingsIndexPage() {
 
 export function SecuritySettingsPage() {
   const queryClient = useQueryClient()
+  const confirmAction = useConfirm()
   const [totp, setTotp] = useState<{ secret: string; url: string } | null>(null)
   const [code, setCode] = useState('')
   const [message, setMessage] = useState('')
@@ -46,9 +47,14 @@ export function SecuritySettingsPage() {
           <button onClick={() => setup.mutate()} disabled={setup.isPending}>生成 TOTP 密钥</button>
           <button
             className="ghost danger"
-            onClick={() => {
-              if (window.confirm('确定关闭 TOTP 双因素认证吗？')) disable.mutate()
-            }}
+            onClick={() => void confirmAction({
+              title: '关闭双因素认证？',
+              description: '关闭后，登录将不再要求 TOTP 验证码。',
+              confirmLabel: '关闭 TOTP',
+              tone: 'danger',
+            }).then((confirmed) => {
+              if (confirmed) disable.mutate()
+            })}
             disabled={disable.isPending}
           >
             关闭 TOTP

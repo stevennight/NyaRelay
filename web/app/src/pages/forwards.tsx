@@ -13,12 +13,14 @@ import {
   FieldGrid,
   FormActions,
   InlineActions,
+  LoadingState,
   Modal,
   PageFrame,
   StatusPill,
   SortableTable,
   ToggleField,
   formatTime,
+  useConfirm,
   useSessionState,
 } from '../components/ui'
 
@@ -220,7 +222,9 @@ function ForwardsListView({
       }
     >
       {forwardsQuery.error && <Banner text={forwardsQuery.error instanceof Error ? forwardsQuery.error.message : '加载失败'} />}
-      {forwards.length === 0 ? (
+      {forwardsQuery.isLoading ? (
+        <LoadingState label="正在加载转发" />
+      ) : forwardsQuery.error ? null : forwards.length === 0 ? (
         <EmptyState
           title="还没有转发"
           text="先创建隧道，再为入口节点分配监听端口。"
@@ -330,10 +334,21 @@ function ForwardsListView({
 function ForwardCreateModal({ onClose }: { onClose: () => void }) {
   const queryClient = useQueryClient()
   const navigate = useNavigate()
+  const confirmAction = useConfirm()
   const [editorDirty, setEditorDirty] = useState(false)
   const handleClose = () => {
-    if (editorDirty && !window.confirm('当前转发还有未保存的修改，确定关闭吗？')) return
-    onClose()
+    if (!editorDirty) {
+      onClose()
+      return
+    }
+    void confirmAction({
+      title: '放弃转发修改？',
+      description: '当前转发还有未保存的修改，关闭后这些内容不会保留。',
+      confirmLabel: '放弃修改',
+      tone: 'danger',
+    }).then((confirmed) => {
+      if (confirmed) onClose()
+    })
   }
 
   return (
@@ -358,6 +373,7 @@ function ForwardCreateModal({ onClose }: { onClose: () => void }) {
 function ForwardDetailModal({ forwardId, onClose }: { forwardId: string; onClose: () => void }) {
   const queryClient = useQueryClient()
   const navigate = useNavigate()
+  const confirmAction = useConfirm()
   const [mode, setMode] = useState<'details' | 'edit'>('details')
   const [editorDirty, setEditorDirty] = useState(false)
   const [message, setMessage] = useState('')
@@ -409,12 +425,32 @@ function ForwardDetailModal({ forwardId, onClose }: { forwardId: string; onClose
     },
   })
   const handleClose = () => {
-    if (mode === 'edit' && editorDirty && !window.confirm('当前转发还有未保存的修改，确定关闭吗？')) return
-    onClose()
+    if (mode !== 'edit' || !editorDirty) {
+      onClose()
+      return
+    }
+    void confirmAction({
+      title: '放弃转发修改？',
+      description: '当前转发还有未保存的修改，关闭后这些内容不会保留。',
+      confirmLabel: '放弃修改',
+      tone: 'danger',
+    }).then((confirmed) => {
+      if (confirmed) onClose()
+    })
   }
   const toggleMode = () => {
-    if (mode === 'edit' && editorDirty && !window.confirm('当前转发还有未保存的修改，确定放弃吗？')) return
-    setMode(mode === 'edit' ? 'details' : 'edit')
+    if (mode !== 'edit' || !editorDirty) {
+      setMode(mode === 'edit' ? 'details' : 'edit')
+      return
+    }
+    void confirmAction({
+      title: '放弃转发修改？',
+      description: '返回详情后，当前未保存的修改不会保留。',
+      confirmLabel: '放弃修改',
+      tone: 'danger',
+    }).then((confirmed) => {
+      if (confirmed) setMode('details')
+    })
   }
 
   return (
@@ -443,9 +479,14 @@ function ForwardDetailModal({ forwardId, onClose }: { forwardId: string; onClose
           <button
             className="ghost danger"
             type="button"
-            onClick={() => {
-              if (window.confirm(`确定删除转发“${forward.name}”吗？`)) remove.mutate()
-            }}
+            onClick={() => void confirmAction({
+              title: '删除转发？',
+              description: `转发“${forward.name}”将被永久删除，入口监听会停止。`,
+              confirmLabel: '删除转发',
+              tone: 'danger',
+            }).then((confirmed) => {
+              if (confirmed) remove.mutate()
+            })}
             disabled={remove.isPending || editorDirty}
           >
             <Trash2 size={16} />

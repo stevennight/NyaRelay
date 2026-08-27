@@ -12,12 +12,14 @@ import {
   FieldGrid,
   FormActions,
   InlineActions,
+  LoadingState,
   Modal,
   PageFrame,
   Panel,
   StatusPill,
   SortableTable,
   formatTime,
+  useConfirm,
   useSessionState,
 } from '../components/ui'
 
@@ -163,7 +165,9 @@ function NodesListView({
       {query.error && <Banner text={query.error instanceof Error ? query.error.message : '加载失败'} />}
       {updateNode.error && <Banner text={updateNode.error instanceof Error ? updateNode.error.message : '更新下发失败'} />}
       {updateAll.error && <Banner text={updateAll.error instanceof Error ? updateAll.error.message : '批量更新失败'} />}
-      {nodes.length === 0 ? (
+      {query.isLoading ? (
+        <LoadingState label="正在加载节点" />
+      ) : query.error ? null : nodes.length === 0 ? (
         <EmptyState
           title="还没有节点"
           text="先添加节点，然后让 node 服务主动连到控制器。"
@@ -267,13 +271,24 @@ function NodesListView({
 
 function NodeCreateModal({ onClose }: { onClose: () => void }) {
   const queryClient = useQueryClient()
+  const confirmAction = useConfirm()
   const [form, setForm] = useState<NodeForm>(emptyForm)
   const [editorDirty, setEditorDirty] = useState(false)
   const [error, setError] = useState('')
   const [result, setResult] = useState<NodeInstallInfo | null>(null)
   const handleClose = () => {
-    if (editorDirty && !window.confirm('当前节点还有未保存的修改，确定关闭吗？')) return
-    onClose()
+    if (!editorDirty) {
+      onClose()
+      return
+    }
+    void confirmAction({
+      title: '放弃节点修改？',
+      description: '当前节点还有未保存的修改，关闭后这些内容不会保留。',
+      confirmLabel: '放弃修改',
+      tone: 'danger',
+    }).then((confirmed) => {
+      if (confirmed) onClose()
+    })
   }
 
   const create = useMutation({
@@ -321,6 +336,7 @@ function NodeCreateModal({ onClose }: { onClose: () => void }) {
 function NodeDetailModal({ nodeId, onClose }: { nodeId: string; onClose: () => void }) {
   const queryClient = useQueryClient()
   const navigate = useNavigate()
+  const confirmAction = useConfirm()
   const [mode, setMode] = useState<'details' | 'edit'>('details')
   const [editorDirty, setEditorDirty] = useState(false)
   const [installOpen, setInstallOpen] = useState(false)
@@ -389,12 +405,32 @@ function NodeDetailModal({ nodeId, onClose }: { nodeId: string; onClose: () => v
   }, [editorDirty, node])
 
   const handleClose = () => {
-    if (mode === 'edit' && editorDirty && !window.confirm('当前节点还有未保存的修改，确定关闭吗？')) return
-    onClose()
+    if (mode !== 'edit' || !editorDirty) {
+      onClose()
+      return
+    }
+    void confirmAction({
+      title: '放弃节点修改？',
+      description: '当前节点还有未保存的修改，关闭后这些内容不会保留。',
+      confirmLabel: '放弃修改',
+      tone: 'danger',
+    }).then((confirmed) => {
+      if (confirmed) onClose()
+    })
   }
   const toggleMode = () => {
-    if (mode === 'edit' && editorDirty && !window.confirm('当前节点还有未保存的修改，确定放弃吗？')) return
-    setMode(mode === 'edit' ? 'details' : 'edit')
+    if (mode !== 'edit' || !editorDirty) {
+      setMode(mode === 'edit' ? 'details' : 'edit')
+      return
+    }
+    void confirmAction({
+      title: '放弃节点修改？',
+      description: '返回详情后，当前未保存的修改不会保留。',
+      confirmLabel: '放弃修改',
+      tone: 'danger',
+    }).then((confirmed) => {
+      if (confirmed) setMode('details')
+    })
   }
 
   return (
@@ -430,9 +466,14 @@ function NodeDetailModal({ nodeId, onClose }: { nodeId: string; onClose: () => v
           <button
             className="ghost danger"
             type="button"
-            onClick={() => {
-              if (window.confirm(`确定吊销节点“${node.name}”吗？`)) revoke.mutate()
-            }}
+            onClick={() => void confirmAction({
+              title: '吊销节点？',
+              description: `节点“${node.name}”将无法继续连接控制器。`,
+              confirmLabel: '吊销节点',
+              tone: 'danger',
+            }).then((confirmed) => {
+              if (confirmed) revoke.mutate()
+            })}
             disabled={revoke.isPending || editorDirty}
           >
             <Trash2 size={16} />
