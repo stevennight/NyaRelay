@@ -300,8 +300,8 @@ export function StatusPill({ value }: { value: string }) {
   )
 }
 
-export function FieldGrid({ children }: { children: ReactNode }) {
-  return <div className="field-grid">{children}</div>
+export function FieldGrid({ children, className = '' }: { children: ReactNode; className?: string }) {
+  return <div className={`field-grid ${className}`.trim()}>{children}</div>
 }
 
 export function Field({

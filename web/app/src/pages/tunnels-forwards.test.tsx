@@ -415,6 +415,7 @@ describe('tunnels and forwards pages', () => {
     fireEvent.change(screen.getByLabelText('名称'), { target: { value: 'candidate-order' } })
     fireEvent.change(screen.getByLabelText('候选节点 1-1'), { target: { value: 'cn-1' } })
     fireEvent.click(screen.getByRole('button', { name: '添加候选' }))
+    expect(within(screen.getByLabelText('候选节点 1-2')).getByRole('option', { name: 'China Edge' })).toBeDisabled()
     fireEvent.change(screen.getByLabelText('候选节点 1-2'), { target: { value: 'sg-1' } })
 
     const dataTransfer = createDataTransfer()
@@ -678,6 +679,9 @@ describe('tunnels and forwards pages', () => {
     fireEvent.change(screen.getByLabelText('隧道'), { target: { value: 'tun-1' } })
     fireEvent.change(screen.getByLabelText('监听端口'), { target: { value: '8443' } })
     fireEvent.change(screen.getByLabelText('目标地址'), { target: { value: '10.0.0.8:443' } })
+    fireEvent.click(screen.getByRole('button', { name: '复制目标 1' }))
+    expect(screen.getByLabelText('目标地址 2')).toHaveValue('10.0.0.8:443')
+    fireEvent.click(screen.getByRole('button', { name: '移除目标 2' }))
     fireEvent.click(screen.getByRole('button', { name: '保存转发' }))
 
     await waitFor(() => {

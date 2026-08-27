@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate } from '@tanstack/react-router'
-import { GripVertical, Pause, Play, Plus, RefreshCw, Settings, Trash2 } from 'lucide-react'
+import { ArrowDown, ArrowUp, ChevronRight, GripVertical, LogIn, LogOut, Milestone, Pause, Play, Plus, RefreshCw, Server, Settings, Trash2 } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { api, post } from '../api'
 import type { ForwardProtocol, NodeInfo, TunnelInfo, TunnelStageRole, TunnelTransport, TunnelType } from '../types'
@@ -280,7 +280,7 @@ function TunnelCreateModal({ onClose }: { onClose: () => void }) {
   return (
     <Modal
       title="新建隧道"
-      subtitle="隧道由一层或多层 stage 组成，每层可放多个候选节点。"
+      subtitle="隧道由一层或多层路由层组成，每层可放多个候选节点。"
       onClose={handleClose}
       size="lg"
     >
@@ -473,13 +473,13 @@ function TunnelDetailsContent({
         />
       </section>
       <section className="modal-section">
-        <h3>Stages</h3>
+        <h3>路由层</h3>
         <div className="hop-list">
-          {tunnel.stages.map((stage) => (
+          {tunnel.stages.map((stage, stageIndex) => (
             <div className="hop" key={stage.id}>
               <span>{stage.index + 1}</span>
-              <strong>{stage.role}</strong>
-              <small>TCP {stage.tcp_strategy || stage.strategy || 'single'} · UDP {stage.udp_strategy || stage.strategy || 'single'}</small>
+              <strong>{stageLabel(tunnel.type, stageIndex, tunnel.stages.length)}</strong>
+              <small>TCP {strategyLabel(stage.tcp_strategy || stage.strategy)} · UDP {strategyLabel(stage.udp_strategy || stage.strategy)}</small>
               <small>{stage.nodes.map((node) => `${nodeDisplayName(node.node_id, nodes)} (${formatProtocols(normalizeNodeProtocols(node.protocols))})`).join(' / ')}</small>
             </div>
           ))}
@@ -670,9 +670,12 @@ function TunnelEditor({
           onChange={(checked) => updateForm((current) => ({ ...current, enabled: checked }))}
         />
       </FieldGrid>
-      <section className="form-section">
-        <div className="form-section-header">
-          <h2>Stages</h2>
+      <section className="form-section route-editor">
+        <div className="form-section-header multi-editor-heading">
+          <div>
+            <h2>路由路径</h2>
+            <p>按入口到出口的顺序管理每层节点和选择策略。</p>
+          </div>
           {form.type === 'chain' ? (
             <button
               type="button"
@@ -687,15 +690,41 @@ function TunnelEditor({
             </button>
           ) : null}
         </div>
+        <div className="route-stage-map" aria-label="隧道路由路径">
+          {form.stages.map((stage, stageIndex) => {
+            const role = stageRoleFor(form.type, stageIndex, form.stages.length)
+            const RoleIcon = stageRoleIcon(role)
+            return (
+              <div className={`route-stage-map-item role-${role}`} key={stage.clientID}>
+                {stageIndex > 0 && <ChevronRight className="route-stage-connector" size={16} aria-hidden="true" />}
+                <span><RoleIcon size={16} /></span>
+                <strong>{stageLabel(form.type, stageIndex, form.stages.length)}</strong>
+                <small>{stage.nodes.length} 个节点</small>
+              </div>
+            )
+          })}
+        </div>
+        {nodesQuery.isSuccess && nodes.length === 0 && (
+          <div className="form-notice" role="status">
+            <Server size={17} />
+            <span>当前没有可用于隧道的节点。</span>
+          </div>
+        )}
         <div className="hop-list">
           {form.stages.map((stage, stageIndex) => {
             const label = stageLabel(form.type, stageIndex, form.stages.length)
+            const role = stageRoleFor(form.type, stageIndex, form.stages.length)
+            const RoleIcon = stageRoleIcon(role)
             return (
-              <div key={stage.clientID} className="stage-editor">
+              <section key={stage.clientID} className={`stage-editor role-${role}`}>
                 <div className="stage-header">
-                  <div className="stage-title">
-                    <strong>{label}</strong>
-                    <small>{stageRoleFor(form.type, stageIndex, form.stages.length)} · {stage.nodes.length} 个候选</small>
+                  <div className="stage-ident">
+                    <span className="stage-role-icon"><RoleIcon size={18} /></span>
+                    <div className="stage-title">
+                      <strong>{label}</strong>
+                      <small>{stageRoleLabel(role)}</small>
+                    </div>
+                    <span className="stage-count">{stage.nodes.length} 个候选</span>
                   </div>
                   <InlineActions>
                     <button
@@ -714,21 +743,50 @@ function TunnelEditor({
                       添加候选
                     </button>
                     {form.type === 'chain' && stageIndex > 0 && stageIndex < form.stages.length - 1 ? (
-                      <button
-                        type="button"
-                        className="ghost danger"
-                        onClick={() => updateForm((current) => ({
-                          ...current,
-                          stages: current.stages.filter((_, idx) => idx !== stageIndex),
-                        }))}
-                      >
-                        <Trash2 size={16} />
-                        删除层
-                      </button>
+                      <>
+                        <button
+                          type="button"
+                          className="ghost icon-button"
+                          aria-label={`上移${label}`}
+                          title="上移中间层"
+                          disabled={stageIndex === 1}
+                          onClick={() => updateForm((current) => ({
+                            ...current,
+                            stages: moveArrayItem(current.stages, stageIndex, stageIndex - 1),
+                          }))}
+                        >
+                          <ArrowUp size={16} />
+                        </button>
+                        <button
+                          type="button"
+                          className="ghost icon-button"
+                          aria-label={`下移${label}`}
+                          title="下移中间层"
+                          disabled={stageIndex === form.stages.length - 2}
+                          onClick={() => updateForm((current) => ({
+                            ...current,
+                            stages: moveArrayItem(current.stages, stageIndex, stageIndex + 1),
+                          }))}
+                        >
+                          <ArrowDown size={16} />
+                        </button>
+                        <button
+                          type="button"
+                          className="ghost danger icon-button"
+                          aria-label={`删除${label}`}
+                          title="删除中间层"
+                          onClick={() => updateForm((current) => ({
+                            ...current,
+                            stages: current.stages.filter((_, idx) => idx !== stageIndex),
+                          }))}
+                        >
+                          <Trash2 size={16} />
+                        </button>
+                      </>
                     ) : null}
                   </InlineActions>
                 </div>
-                <FieldGrid>
+                <FieldGrid className="stage-strategy-grid">
                   <Field label="TCP 策略">
                     <select
                       value={stage.tcp_strategy || stage.strategy || 'single'}
@@ -761,12 +819,15 @@ function TunnelEditor({
                       <option value="random">随机</option>
                     </select>
                   </Field>
-                  <Field label="候选数量">
-                    <input value={String(stage.nodes.length)} readOnly />
-                  </Field>
                 </FieldGrid>
+                <div className="candidate-list-heading">
+                  <strong>候选节点</strong>
+                  <span>顺序用于故障切换，也可用方向按钮调整。</span>
+                </div>
                 <div className="hop-list">
-                  {stage.nodes.map((nodeForm, nodeIndex) => (
+                  {stage.nodes.map((nodeForm, nodeIndex) => {
+                    const selectedNode = nodes.find((node) => node.id === nodeForm.node_id)
+                    return (
                     <div
                       className={`hop candidate-row${draggingCandidate?.stageIndex === stageIndex && draggingCandidate.nodeIndex === nodeIndex ? ' dragging' : ''}`}
                       key={nodeForm.clientID}
@@ -794,126 +855,172 @@ function TunnelEditor({
                         setDraggingCandidate(null)
                       }}
                     >
-                      <span>{nodeIndex + 1}</span>
-                      <button
-                        type="button"
-                        className="ghost icon-button candidate-drag-handle"
-                        aria-label={`拖拽排序候选 ${stageIndex + 1}-${nodeIndex + 1}`}
-                        disabled={stage.nodes.length === 1}
-                        draggable={stage.nodes.length > 1}
-                        onDragStart={(event) => {
-                          if (stage.nodes.length === 1) return
-                          event.dataTransfer.effectAllowed = 'move'
-                          event.dataTransfer.setData('text/plain', `${stageIndex}:${nodeIndex}`)
-                          setDraggingCandidate({ stageIndex, nodeIndex })
-                        }}
-                        onDragEnd={() => setDraggingCandidate(null)}
-                      >
-                        <GripVertical size={16} />
-                      </button>
-                      <select
-                        aria-label={`候选节点 ${stageIndex + 1}-${nodeIndex + 1}`}
-                        value={nodeForm.node_id}
-                        onChange={(event) => updateForm((current) => ({
-                          ...current,
-                          stages: current.stages.map((item, idx) => (
-                            idx === stageIndex
-                              ? {
-                                ...item,
-                                nodes: item.nodes.map((candidate, cIndex) => (
-                                  cIndex === nodeIndex ? { ...candidate, node_id: event.target.value } : candidate
-                                )),
-                              }
-                              : item
-                          )),
-                        }))}
-                      >
-                        <option value="">选择节点</option>
-                        {nodes.map((node) => (
-                          <option key={node.id} value={node.id}>
-                            {node.name}
-                          </option>
-                        ))}
-                      </select>
-                      <label className="candidate-weight">
-                        <span>权重</span>
-                        <input
-                          aria-label={`候选权重 ${stageIndex + 1}-${nodeIndex + 1}`}
-                          type="number"
-                          min={1}
-                          value={String(nodeForm.weight)}
-                          onChange={(event) => updateForm((current) => ({
-                            ...current,
-                            stages: current.stages.map((item, idx) => (
-                              idx === stageIndex
-                                ? {
-                                  ...item,
-                                  nodes: item.nodes.map((candidate, cIndex) => (
-                                    cIndex === nodeIndex
-                                      ? {
-                                        ...candidate,
-                                        weight: Math.max(1, Number(event.target.value) || 1),
-                                      }
-                                      : candidate
-                                  )),
-                                }
-                                : item
-                            )),
-                          }))}
-                        />
-                      </label>
-                      <div className="candidate-protocols">
-                        {(['tcp', 'udp'] as const).map((protocol) => (
-                          <label key={protocol}>
-                            <input
-                              type="checkbox"
-                              checked={nodeForm.protocols.includes(protocol)}
-                              onChange={(event) => updateForm((current) => ({
-                                ...current,
-                                stages: current.stages.map((item, idx) => (
-                                  idx === stageIndex
-                                    ? {
-                                      ...item,
-                                      nodes: item.nodes.map((candidate, cIndex) => (
-                                        cIndex === nodeIndex
-                                          ? {
-                                            ...candidate,
-                                            protocols: toggleNodeProtocol(candidate.protocols, protocol, event.target.checked),
-                                          }
-                                          : candidate
-                                      )),
-                                    }
-                                    : item
-                                )),
-                              }))}
-                            />
-                            {protocol.toUpperCase()}
-                          </label>
-                        ))}
+                      <div className="candidate-card-header">
+                        <div className="candidate-card-ident">
+                          <span className="item-index">{nodeIndex + 1}</span>
+                          <div>
+                            <strong>{selectedNode?.name || `候选 ${nodeIndex + 1}`}</strong>
+                            <small>{selectedNode ? nodeAddressLabel(selectedNode) : '尚未选择节点'}</small>
+                          </div>
+                        </div>
+                        <InlineActions>
+                          <button
+                            type="button"
+                            className="ghost icon-button candidate-drag-handle"
+                            aria-label={`拖拽排序候选 ${stageIndex + 1}-${nodeIndex + 1}`}
+                            title="拖拽排序"
+                            disabled={stage.nodes.length === 1}
+                            draggable={stage.nodes.length > 1}
+                            onDragStart={(event) => {
+                              if (stage.nodes.length === 1) return
+                              event.dataTransfer.effectAllowed = 'move'
+                              event.dataTransfer.setData('text/plain', `${stageIndex}:${nodeIndex}`)
+                              setDraggingCandidate({ stageIndex, nodeIndex })
+                            }}
+                            onDragEnd={() => setDraggingCandidate(null)}
+                          >
+                            <GripVertical size={16} />
+                          </button>
+                          <button
+                            type="button"
+                            className="ghost icon-button"
+                            aria-label={`上移候选 ${stageIndex + 1}-${nodeIndex + 1}`}
+                            title="上移候选"
+                            disabled={nodeIndex === 0}
+                            onClick={() => moveCandidate(updateForm, stageIndex, nodeIndex, nodeIndex - 1)}
+                          >
+                            <ArrowUp size={16} />
+                          </button>
+                          <button
+                            type="button"
+                            className="ghost icon-button"
+                            aria-label={`下移候选 ${stageIndex + 1}-${nodeIndex + 1}`}
+                            title="下移候选"
+                            disabled={nodeIndex === stage.nodes.length - 1}
+                            onClick={() => moveCandidate(updateForm, stageIndex, nodeIndex, nodeIndex + 1)}
+                          >
+                            <ArrowDown size={16} />
+                          </button>
+                          <button
+                            type="button"
+                            className="ghost danger icon-button"
+                            aria-label={`移除候选 ${stageIndex + 1}-${nodeIndex + 1}`}
+                            title="移除候选"
+                            disabled={stage.nodes.length === 1}
+                            onClick={() => updateForm((current) => ({
+                              ...current,
+                              stages: current.stages.map((item, idx) => (
+                                idx === stageIndex
+                                  ? {
+                                    ...item,
+                                    nodes: item.nodes.filter((_, cIndex) => cIndex !== nodeIndex),
+                                  }
+                                  : item
+                              )),
+                            }))}
+                          >
+                            <Trash2 size={16} />
+                          </button>
+                        </InlineActions>
                       </div>
-                      <button
-                        type="button"
-                        className="ghost danger"
-                        disabled={stage.nodes.length === 1}
-                        onClick={() => updateForm((current) => ({
-                          ...current,
-                          stages: current.stages.map((item, idx) => (
-                            idx === stageIndex
-                              ? {
-                                ...item,
-                                nodes: item.nodes.filter((_, cIndex) => cIndex !== nodeIndex),
-                              }
-                              : item
-                          )),
-                        }))}
-                      >
-                        <Trash2 size={16} />
-                        移除
-                      </button>
+                      <div className="candidate-card-fields">
+                        <label className="candidate-field candidate-node-field">
+                          <span>节点</span>
+                          <select
+                            aria-label={`候选节点 ${stageIndex + 1}-${nodeIndex + 1}`}
+                            value={nodeForm.node_id}
+                            onChange={(event) => updateForm((current) => ({
+                              ...current,
+                              stages: current.stages.map((item, idx) => (
+                                idx === stageIndex
+                                  ? {
+                                    ...item,
+                                    nodes: item.nodes.map((candidate, cIndex) => (
+                                      cIndex === nodeIndex ? { ...candidate, node_id: event.target.value } : candidate
+                                    )),
+                                  }
+                                  : item
+                              )),
+                            }))}
+                          >
+                            <option value="">选择节点</option>
+                            {nodes.map((node) => (
+                              <option
+                                key={node.id}
+                                value={node.id}
+                                disabled={node.id !== nodeForm.node_id && stage.nodes.some((candidate) => candidate.node_id === node.id)}
+                              >
+                                {node.name}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label className="candidate-field candidate-weight">
+                          <span>权重</span>
+                          <input
+                            aria-label={`候选权重 ${stageIndex + 1}-${nodeIndex + 1}`}
+                            type="number"
+                            min={1}
+                            value={String(nodeForm.weight)}
+                            onChange={(event) => updateForm((current) => ({
+                              ...current,
+                              stages: current.stages.map((item, idx) => (
+                                idx === stageIndex
+                                  ? {
+                                    ...item,
+                                    nodes: item.nodes.map((candidate, cIndex) => (
+                                      cIndex === nodeIndex
+                                        ? {
+                                          ...candidate,
+                                          weight: Math.max(1, Number(event.target.value) || 1),
+                                        }
+                                        : candidate
+                                    )),
+                                  }
+                                  : item
+                              )),
+                            }))}
+                          />
+                        </label>
+                        <div className="candidate-field candidate-protocol-field">
+                          <span>协议</span>
+                          <div className="candidate-protocols">
+                            {(['tcp', 'udp'] as const).map((protocol) => (
+                              <label key={protocol}>
+                                <input
+                                  aria-label={protocol.toUpperCase()}
+                                  type="checkbox"
+                                  checked={nodeForm.protocols.includes(protocol)}
+                                  onChange={(event) => updateForm((current) => ({
+                                    ...current,
+                                    stages: current.stages.map((item, idx) => (
+                                      idx === stageIndex
+                                        ? {
+                                          ...item,
+                                          nodes: item.nodes.map((candidate, cIndex) => (
+                                            cIndex === nodeIndex
+                                              ? {
+                                                ...candidate,
+                                                protocols: toggleNodeProtocol(candidate.protocols, protocol, event.target.checked),
+                                              }
+                                              : candidate
+                                          )),
+                                        }
+                                        : item
+                                    )),
+                                  }))}
+                                />
+                                {protocol.toUpperCase()}
+                              </label>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
                     </div>
-                  ))}
+                    )
+                  })}
                 </div>
-              </div>
+              </section>
             )
           })}
         </div>
@@ -1013,6 +1120,29 @@ function stageRoleFor(type: TunnelType, index: number, stageCount: number): Tunn
   return 'middle'
 }
 
+function stageRoleIcon(role: TunnelStageRole) {
+  if (role === 'entry') return LogIn
+  if (role === 'exit') return LogOut
+  return Milestone
+}
+
+function stageRoleLabel(role: TunnelStageRole): string {
+  if (role === 'entry') return '接收外部流量'
+  if (role === 'exit') return '连接最终目标'
+  return '中继并转发流量'
+}
+
+function strategyLabel(strategy?: string): string {
+  if (strategy === 'failover') return '故障切换'
+  if (strategy === 'round_robin') return '轮询'
+  if (strategy === 'random') return '随机'
+  return '单候选'
+}
+
+function nodeAddressLabel(node: NodeInfo): string {
+  return node.public_host || node.system?.ip || node.system?.hostname || '未配置公开地址'
+}
+
 function insertMiddleStage(stages: TunnelStageForm[]): TunnelStageForm[] {
   if (stages.length <= 1) {
     return [...stages, emptyStageForm()]
@@ -1042,6 +1172,22 @@ function moveArrayItem<T>(items: T[], fromIndex: number, toIndex: number): T[] {
   const [moved] = next.splice(fromIndex, 1)
   next.splice(toIndex, 0, moved)
   return next
+}
+
+function moveCandidate(
+  setForm: React.Dispatch<React.SetStateAction<TunnelForm>>,
+  stageIndex: number,
+  fromIndex: number,
+  toIndex: number,
+) {
+  setForm((current) => ({
+    ...current,
+    stages: current.stages.map((stage, index) => (
+      index === stageIndex
+        ? { ...stage, nodes: moveArrayItem(stage.nodes, fromIndex, toIndex) }
+        : stage
+    )),
+  }))
 }
 
 function normalizeNodeProtocols(protocols?: ForwardProtocol[]): ForwardProtocol[] {

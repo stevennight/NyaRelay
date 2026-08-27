@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate } from '@tanstack/react-router'
-import { ArrowDown, ArrowUp, Pause, Play, Plus, RotateCcw, Settings, Trash2 } from 'lucide-react'
+import { ArrowDown, ArrowUp, Copy, Pause, Play, Plus, RotateCcw, Settings, Trash2 } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { Dispatch, SetStateAction } from 'react'
 import { api, post } from '../api'
@@ -656,20 +656,18 @@ function ForwardEditor({
     onError: (err) => setError(err instanceof Error ? err.message : '保存失败'),
   })
 
-  const previousTargetCount = useRef(form.targets.length)
+  const previousTargetIDs = useRef(new Set(form.targets.map((target) => target.clientID)))
   const targetRefs = useRef<Record<string, HTMLDivElement | null>>({})
 
   useEffect(() => {
-    if (form.targets.length > previousTargetCount.current) {
-      const newTarget = form.targets[form.targets.length - 1]
-      if (newTarget) {
-        const scrollToTarget = () => targetRefs.current[newTarget.clientID]?.scrollIntoView?.({ block: 'nearest' })
-        if (typeof window.requestAnimationFrame === 'function') window.requestAnimationFrame(scrollToTarget)
-        else window.setTimeout(scrollToTarget, 0)
-      }
+    const newTarget = form.targets.find((target) => !previousTargetIDs.current.has(target.clientID))
+    previousTargetIDs.current = new Set(form.targets.map((target) => target.clientID))
+    if (newTarget) {
+      const scrollToTarget = () => targetRefs.current[newTarget.clientID]?.scrollIntoView?.({ block: 'nearest' })
+      if (typeof window.requestAnimationFrame === 'function') window.requestAnimationFrame(scrollToTarget)
+      else window.setTimeout(scrollToTarget, 0)
     }
-    previousTargetCount.current = form.targets.length
-  }, [form.targets.length])
+  }, [form.targets])
 
   return (
     <form
@@ -704,22 +702,6 @@ function ForwardEditor({
             placeholder="8443"
           />
         </Field>
-        <Field label="TCP 策略">
-          <select
-            value={form.tcp_strategy}
-            onChange={(event) => updateForm((current) => ({ ...current, tcp_strategy: event.target.value as SelectionStrategy }))}
-          >
-            {strategyOptions()}
-          </select>
-        </Field>
-        <Field label="UDP 策略">
-          <select
-            value={form.udp_strategy}
-            onChange={(event) => updateForm((current) => ({ ...current, udp_strategy: event.target.value as SelectionStrategy }))}
-          >
-            {strategyOptions()}
-          </select>
-        </Field>
         <ToggleField
           label="启用"
           ariaLabel="启用转发"
@@ -728,10 +710,10 @@ function ForwardEditor({
           onChange={(checked) => updateForm((current) => ({ ...current, enabled: checked }))}
         />
       </FieldGrid>
-      <section className="form-section">
-        <div className="section-heading">
+      <section className="form-section target-pool-editor">
+        <div className="form-section-header multi-editor-heading">
           <div>
-            <h3>目标池</h3>
+            <h2>目标池</h2>
             <p>TCP 按连接选择，UDP 按会话保持目标粘滞。</p>
           </div>
           <button
@@ -743,84 +725,136 @@ function ForwardEditor({
             添加目标
           </button>
         </div>
+        <FieldGrid className="target-strategy-grid">
+          <Field label="TCP 策略" hint="决定每个 TCP 连接如何选择目标。">
+            <select
+              value={form.tcp_strategy}
+              onChange={(event) => updateForm((current) => ({ ...current, tcp_strategy: event.target.value as SelectionStrategy }))}
+            >
+              {strategyOptions()}
+            </select>
+          </Field>
+          <Field label="UDP 策略" hint="决定新 UDP 会话如何选择并保持目标。">
+            <select
+              value={form.udp_strategy}
+              onChange={(event) => updateForm((current) => ({ ...current, udp_strategy: event.target.value as SelectionStrategy }))}
+            >
+              {strategyOptions()}
+            </select>
+          </Field>
+        </FieldGrid>
+        <div className="candidate-list-heading target-list-heading">
+          <strong>转发目标</strong>
+          <span>{form.targets.length} 个目标 · 顺序用于故障切换</span>
+        </div>
         <div className="forward-target-list">
           {form.targets.map((target, index) => (
             <div
-              className="hop forward-target-row"
+              className={`forward-target-row${target.enabled ? '' : ' disabled'}`}
               key={target.clientID}
               ref={(element) => { targetRefs.current[target.clientID] = element }}
             >
-              <span>{index + 1}</span>
-              <input
-                aria-label={index === 0 ? '目标地址' : `目标地址 ${index + 1}`}
-                value={target.address}
-                onChange={(event) => updateTarget(updateForm, index, { address: event.target.value })}
-                placeholder="10.0.0.8:443"
-              />
-              <label className="candidate-weight">
-                <span>权重</span>
-                <input
-                  aria-label={`目标权重 ${index + 1}`}
-                  type="number"
-                  min={1}
-                  value={String(target.weight)}
-                  onChange={(event) => updateTarget(updateForm, index, { weight: Math.max(1, Number(event.target.value) || 1) })}
-                />
-              </label>
-              <div className="candidate-protocols">
-                {(['tcp', 'udp'] as const).map((protocol) => (
-                  <label key={protocol}>
-                    <input
-                      type="checkbox"
-                      checked={target.protocols.length === 0 || target.protocols.includes(protocol)}
-                      onChange={(event) => updateTarget(updateForm, index, {
-                        protocols: toggleTargetProtocol(target.protocols, protocol, event.target.checked),
-                      })}
-                    />
-                    {protocol.toUpperCase()}
-                  </label>
-                ))}
+              <div className="target-card-header">
+                <div className="target-card-ident">
+                  <span className="item-index">{index + 1}</span>
+                  <div>
+                    <strong>目标 {index + 1}</strong>
+                    <small>{target.address || '尚未填写目标地址'}</small>
+                  </div>
+                  <span className={`target-state ${target.enabled ? 'enabled' : ''}`}>
+                    {target.enabled ? '已启用' : '已停用'}
+                  </span>
+                </div>
+                <InlineActions>
+                  <button
+                    type="button"
+                    className="ghost icon-button"
+                    aria-label={`复制目标 ${index + 1}`}
+                    title="复制目标"
+                    onClick={() => duplicateTarget(updateForm, index)}
+                  >
+                    <Copy size={16} />
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost icon-button"
+                    aria-label={`上移目标 ${index + 1}`}
+                    title="上移目标"
+                    disabled={index === 0}
+                    onClick={() => moveTarget(updateForm, index, index - 1)}
+                  >
+                    <ArrowUp size={16} />
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost icon-button"
+                    aria-label={`下移目标 ${index + 1}`}
+                    title="下移目标"
+                    disabled={index === form.targets.length - 1}
+                    onClick={() => moveTarget(updateForm, index, index + 1)}
+                  >
+                    <ArrowDown size={16} />
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost danger icon-button"
+                    aria-label={`移除目标 ${index + 1}`}
+                    title="移除目标"
+                    disabled={form.targets.length === 1}
+                    onClick={() => updateForm((current) => ({
+                      ...current,
+                      targets: current.targets.filter((_, targetIndex) => targetIndex !== index),
+                    }))}
+                  >
+                    <Trash2 size={16} />
+                  </button>
+                </InlineActions>
               </div>
-              <ToggleField
-                label="启用"
-                ariaLabel={`启用目标 ${index + 1}`}
-                checked={target.enabled}
-                onChange={(checked) => updateTarget(updateForm, index, { enabled: checked })}
-              />
-              <InlineActions>
-                <button
-                  type="button"
-                  className="ghost icon-button"
-                  aria-label={`上移目标 ${index + 1}`}
-                  title="上移目标"
-                  disabled={index === 0}
-                  onClick={() => moveTarget(updateForm, index, index - 1)}
-                >
-                  <ArrowUp size={16} />
-                </button>
-                <button
-                  type="button"
-                  className="ghost icon-button"
-                  aria-label={`下移目标 ${index + 1}`}
-                  title="下移目标"
-                  disabled={index === form.targets.length - 1}
-                  onClick={() => moveTarget(updateForm, index, index + 1)}
-                >
-                  <ArrowDown size={16} />
-                </button>
-                <button
-                  type="button"
-                  className="ghost danger"
-                  disabled={form.targets.length === 1}
-                  onClick={() => updateForm((current) => ({
-                    ...current,
-                    targets: current.targets.filter((_, targetIndex) => targetIndex !== index),
-                  }))}
-                >
-                  <Trash2 size={16} />
-                  移除
-                </button>
-              </InlineActions>
+              <div className="target-card-fields">
+                <label className="candidate-field target-address-field">
+                  <span>目标地址</span>
+                  <input
+                    aria-label={index === 0 ? '目标地址' : `目标地址 ${index + 1}`}
+                    value={target.address}
+                    onChange={(event) => updateTarget(updateForm, index, { address: event.target.value })}
+                    placeholder="10.0.0.8:443"
+                  />
+                </label>
+                <label className="candidate-field candidate-weight">
+                  <span>权重</span>
+                  <input
+                    aria-label={`目标权重 ${index + 1}`}
+                    type="number"
+                    min={1}
+                    value={String(target.weight)}
+                    onChange={(event) => updateTarget(updateForm, index, { weight: Math.max(1, Number(event.target.value) || 1) })}
+                  />
+                </label>
+                <div className="candidate-field target-protocol-field">
+                  <span>协议</span>
+                  <div className="candidate-protocols">
+                    {(['tcp', 'udp'] as const).map((protocol) => (
+                      <label key={protocol}>
+                        <input
+                          aria-label={`目标 ${index + 1} ${protocol.toUpperCase()}`}
+                          type="checkbox"
+                          checked={target.protocols.length === 0 || target.protocols.includes(protocol)}
+                          onChange={(event) => updateTarget(updateForm, index, {
+                            protocols: toggleTargetProtocol(target.protocols, protocol, event.target.checked),
+                          })}
+                        />
+                        {protocol.toUpperCase()}
+                      </label>
+                    ))}
+                  </div>
+                </div>
+                <ToggleField
+                  label="启用"
+                  ariaLabel={`启用目标 ${index + 1}`}
+                  checked={target.enabled}
+                  onChange={(checked) => updateTarget(updateForm, index, { enabled: checked })}
+                />
+              </div>
             </div>
           ))}
         </div>
@@ -924,6 +958,25 @@ function moveTarget(
     const [target] = targets.splice(from, 1)
     targets.splice(to, 0, target)
     return { ...current, targets }
+  })
+}
+
+function duplicateTarget(
+  setForm: Dispatch<SetStateAction<ForwardForm>>,
+  index: number,
+) {
+  setForm((current) => {
+    const source = current.targets[index]
+    if (!source) return current
+    const copy: ForwardTargetForm = {
+      ...source,
+      id: '',
+      clientID: newFormClientID('target'),
+    }
+    return {
+      ...current,
+      targets: [...current.targets.slice(0, index + 1), copy, ...current.targets.slice(index + 1)],
+    }
   })
 }
 
