@@ -44,14 +44,14 @@ const nodesRoute = createRoute({
 })
 
 const nodeNewRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: 'nodes/new',
+  getParentRoute: () => nodesRoute,
+  path: 'new',
   component: NodeNewPage,
 })
 
 const nodeDetailRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: 'nodes/$nodeId',
+  getParentRoute: () => nodesRoute,
+  path: '$nodeId',
   component: NodeDetailRouteComponent,
 })
 
@@ -67,14 +67,14 @@ const tunnelsRoute = createRoute({
 })
 
 const tunnelNewRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: 'tunnels/new',
+  getParentRoute: () => tunnelsRoute,
+  path: 'new',
   component: TunnelNewPage,
 })
 
 const tunnelDetailRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: 'tunnels/$tunnelId',
+  getParentRoute: () => tunnelsRoute,
+  path: '$tunnelId',
   component: TunnelDetailRouteComponent,
 })
 
@@ -90,14 +90,14 @@ const forwardsRoute = createRoute({
 })
 
 const forwardNewRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: 'forwards/new',
+  getParentRoute: () => forwardsRoute,
+  path: 'new',
   component: ForwardNewPage,
 })
 
 const forwardDetailRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: 'forwards/$forwardId',
+  getParentRoute: () => forwardsRoute,
+  path: '$forwardId',
   component: ForwardDetailRouteComponent,
 })
 
@@ -141,15 +141,9 @@ const routeTree = rootRoute.addChildren([
   setupRoute,
   loginRoute,
   dashboardRoute,
-  nodesRoute,
-  nodeNewRoute,
-  nodeDetailRoute,
-  tunnelsRoute,
-  tunnelNewRoute,
-  tunnelDetailRoute,
-  forwardsRoute,
-  forwardNewRoute,
-  forwardDetailRoute,
+  nodesRoute.addChildren([nodeNewRoute, nodeDetailRoute]),
+  tunnelsRoute.addChildren([tunnelNewRoute, tunnelDetailRoute]),
+  forwardsRoute.addChildren([forwardNewRoute, forwardDetailRoute]),
   trafficRoute,
   auditRoute,
   settingsIndexRoute,

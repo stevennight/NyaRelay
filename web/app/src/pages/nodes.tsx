@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Link, useNavigate } from '@tanstack/react-router'
+import { Link, Outlet, useNavigate } from '@tanstack/react-router'
 import { ClipboardCopy, Download, Plus, RefreshCw, Settings, Trash2 } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { api, post } from '../api'
@@ -63,40 +63,30 @@ function isNodeFilters(value: unknown): value is NodeFilters {
 }
 
 export function NodesPage() {
-  const navigate = useNavigate()
-  return <NodesListView onCloseModal={() => navigate({ to: '/nodes', replace: true, resetScroll: false })} />
+  return (
+    <>
+      <NodesListView />
+      <Outlet />
+    </>
+  )
 }
 
 export function NodeNewPage() {
   const navigate = useNavigate()
-  return (
-    <NodesListView
-      modal="new"
-      onCloseModal={() => navigate({ to: '/nodes', replace: true, resetScroll: false })}
-    />
-  )
+  return <NodeCreateModal onClose={() => navigate({ to: '/nodes', replace: true, resetScroll: false })} />
 }
 
 export function NodeDetailPage({ nodeId }: { nodeId: string }) {
   const navigate = useNavigate()
   return (
-    <NodesListView
-      modal="detail"
+    <NodeDetailModal
       nodeId={nodeId}
-      onCloseModal={() => navigate({ to: '/nodes', replace: true, resetScroll: false })}
+      onClose={() => navigate({ to: '/nodes', replace: true, resetScroll: false })}
     />
   )
 }
 
-function NodesListView({
-  modal,
-  nodeId,
-  onCloseModal,
-}: {
-  modal?: 'new' | 'detail'
-  nodeId?: string
-  onCloseModal: () => void
-}) {
+function NodesListView() {
   const query = useQuery({
     queryKey: ['nodes'],
     queryFn: () => api<NodeInfo[]>('/api/nodes'),
@@ -263,8 +253,6 @@ function NodesListView({
           )}
         </>
       )}
-      {modal === 'new' && <NodeCreateModal onClose={onCloseModal} />}
-      {modal === 'detail' && nodeId && <NodeDetailModal nodeId={nodeId} onClose={onCloseModal} />}
     </PageFrame>
   )
 }

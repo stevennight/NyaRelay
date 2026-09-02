@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Link, useNavigate } from '@tanstack/react-router'
+import { Link, Outlet, useNavigate } from '@tanstack/react-router'
 import { ArrowDown, ArrowUp, ChevronRight, GripVertical, LogIn, LogOut, Milestone, Pause, Play, Plus, RefreshCw, Server, Settings, Trash2 } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { api, post } from '../api'
@@ -81,40 +81,30 @@ const emptyTunnelForm = (): TunnelForm => ({
 })
 
 export function TunnelsPage() {
-  const navigate = useNavigate()
-  return <TunnelsListView onCloseModal={() => navigate({ to: '/tunnels', replace: true, resetScroll: false })} />
+  return (
+    <>
+      <TunnelsListView />
+      <Outlet />
+    </>
+  )
 }
 
 export function TunnelNewPage() {
   const navigate = useNavigate()
-  return (
-    <TunnelsListView
-      modal="new"
-      onCloseModal={() => navigate({ to: '/tunnels', replace: true, resetScroll: false })}
-    />
-  )
+  return <TunnelCreateModal onClose={() => navigate({ to: '/tunnels', replace: true, resetScroll: false })} />
 }
 
 export function TunnelDetailPage({ tunnelId }: { tunnelId: string }) {
   const navigate = useNavigate()
   return (
-    <TunnelsListView
-      modal="detail"
+    <TunnelDetailModal
       tunnelId={tunnelId}
-      onCloseModal={() => navigate({ to: '/tunnels', replace: true, resetScroll: false })}
+      onClose={() => navigate({ to: '/tunnels', replace: true, resetScroll: false })}
     />
   )
 }
 
-function TunnelsListView({
-  modal,
-  tunnelId,
-  onCloseModal,
-}: {
-  modal?: 'new' | 'detail'
-  tunnelId?: string
-  onCloseModal: () => void
-}) {
+function TunnelsListView() {
   const query = useQuery({
     queryKey: ['tunnels'],
     queryFn: () => api<TunnelInfo[]>('/api/tunnels'),
@@ -251,8 +241,6 @@ function TunnelsListView({
           )}
         </>
       )}
-      {modal === 'new' && <TunnelCreateModal onClose={onCloseModal} />}
-      {modal === 'detail' && tunnelId && <TunnelDetailModal tunnelId={tunnelId} onClose={onCloseModal} />}
     </PageFrame>
   )
 }

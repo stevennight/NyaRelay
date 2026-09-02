@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Link, useNavigate } from '@tanstack/react-router'
+import { Link, Outlet, useNavigate } from '@tanstack/react-router'
 import { ArrowDown, ArrowUp, Copy, Pause, Play, Plus, RotateCcw, Settings, Trash2 } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { Dispatch, SetStateAction } from 'react'
@@ -99,40 +99,30 @@ const emptyForwardFilters = (): ForwardFilters => ({
 })
 
 export function ForwardsPage() {
-  const navigate = useNavigate()
-  return <ForwardsListView onCloseModal={() => navigate({ to: '/forwards', replace: true, resetScroll: false })} />
+  return (
+    <>
+      <ForwardsListView />
+      <Outlet />
+    </>
+  )
 }
 
 export function ForwardNewPage() {
   const navigate = useNavigate()
-  return (
-    <ForwardsListView
-      modal="new"
-      onCloseModal={() => navigate({ to: '/forwards', replace: true, resetScroll: false })}
-    />
-  )
+  return <ForwardCreateModal onClose={() => navigate({ to: '/forwards', replace: true, resetScroll: false })} />
 }
 
 export function ForwardDetailPage({ forwardId }: { forwardId: string }) {
   const navigate = useNavigate()
   return (
-    <ForwardsListView
-      modal="detail"
+    <ForwardDetailModal
       forwardId={forwardId}
-      onCloseModal={() => navigate({ to: '/forwards', replace: true, resetScroll: false })}
+      onClose={() => navigate({ to: '/forwards', replace: true, resetScroll: false })}
     />
   )
 }
 
-function ForwardsListView({
-  modal,
-  forwardId,
-  onCloseModal,
-}: {
-  modal?: 'new' | 'detail'
-  forwardId?: string
-  onCloseModal: () => void
-}) {
+function ForwardsListView() {
   const forwardsQuery = useQuery({
     queryKey: ['forwards'],
     queryFn: () => api<ForwardInfo[]>('/api/forwards'),
@@ -325,8 +315,6 @@ function ForwardsListView({
           )}
         </>
       )}
-      {modal === 'new' && <ForwardCreateModal onClose={onCloseModal} />}
-      {modal === 'detail' && forwardId && <ForwardDetailModal forwardId={forwardId} onClose={onCloseModal} />}
     </PageFrame>
   )
 }
