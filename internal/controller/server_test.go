@@ -3,6 +3,7 @@ package controller
 import (
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +20,51 @@ import (
 	sharedprotocol "nyarelay/internal/shared/protocol"
 	"nyarelay/internal/shared/validate"
 )
+
+func TestWithAuthAcceptsSessionAfterStoreReopen(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nyarelay.db")
+	key := sha256.Sum256([]byte("with-auth-persistence-test"))
+	st, err := store.OpenWithSecretKey(ctx, path, key[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := st.CreateUser(ctx, "admin", "password-hash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := auth.NewSession(user.ID, user.Username, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveSession(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err = store.OpenWithSecretKey(ctx, path, key[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	s := &Server{store: st}
+	handler := s.withAuth(func(w http.ResponseWriter, _ *http.Request, got auth.Session) {
+		if got.UserID != user.ID || got.Username != user.Username {
+			t.Fatalf("authenticated session = %#v", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	req := httptest.NewRequest(http.MethodGet, "/api/me", nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: session.ID})
+	rec := httptest.NewRecorder()
+	handler(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status after store reopen = %d, want %d", rec.Code, http.StatusNoContent)
+	}
+}
 
 func TestLoginLimitKeyIgnoresRemotePort(t *testing.T) {
 	reqA := httptest.NewRequest(http.MethodPost, "/api/auth/login", nil)

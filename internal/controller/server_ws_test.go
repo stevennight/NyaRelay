@@ -35,12 +35,11 @@ func TestNodeWebSocketReceivesConfigPush(t *testing.T) {
 		cfg: Config{
 			PublicURL: "https://panel.example",
 		},
-		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
-		store:    st,
-		sessions: auth.NewSessions(time.Hour),
-		limiter:  auth.NewLoginLimiter(),
-		hub:      nodehub.New(),
-		mux:      http.NewServeMux(),
+		log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:   st,
+		limiter: auth.NewLoginLimiter(),
+		hub:     nodehub.New(),
+		mux:     http.NewServeMux(),
 	}
 	if err := s.ensureSigningKey(ctx); err != nil {
 		t.Fatal(err)
@@ -140,13 +139,12 @@ func TestNodeHTTPConfigNegotiatesLongLease(t *testing.T) {
 	defer closeTestStore(t, st)
 
 	s := &Server{
-		cfg:      Config{PublicURL: "https://panel.example"},
-		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
-		store:    st,
-		sessions: auth.NewSessions(time.Hour),
-		limiter:  auth.NewLoginLimiter(),
-		hub:      nodehub.New(),
-		mux:      http.NewServeMux(),
+		cfg:     Config{PublicURL: "https://panel.example"},
+		log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:   st,
+		limiter: auth.NewLoginLimiter(),
+		hub:     nodehub.New(),
+		mux:     http.NewServeMux(),
 	}
 	if err := s.ensureSigningKey(ctx); err != nil {
 		t.Fatal(err)
@@ -230,12 +228,11 @@ func TestRevokedNodeCannotConnectWebSocket(t *testing.T) {
 		cfg: Config{
 			PublicURL: "https://panel.example",
 		},
-		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
-		store:    st,
-		sessions: auth.NewSessions(time.Hour),
-		limiter:  auth.NewLoginLimiter(),
-		hub:      nodehub.New(),
-		mux:      http.NewServeMux(),
+		log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:   st,
+		limiter: auth.NewLoginLimiter(),
+		hub:     nodehub.New(),
+		mux:     http.NewServeMux(),
 	}
 	if err := s.ensureSigningKey(ctx); err != nil {
 		t.Fatal(err)
@@ -276,13 +273,12 @@ func TestRevokingConnectedNodeClosesWebSocket(t *testing.T) {
 	defer closeTestStore(t, st)
 
 	s := &Server{
-		cfg:      Config{PublicURL: "https://panel.example"},
-		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
-		store:    st,
-		sessions: auth.NewSessions(time.Hour),
-		limiter:  auth.NewLoginLimiter(),
-		hub:      nodehub.New(),
-		mux:      http.NewServeMux(),
+		cfg:     Config{PublicURL: "https://panel.example"},
+		log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:   st,
+		limiter: auth.NewLoginLimiter(),
+		hub:     nodehub.New(),
+		mux:     http.NewServeMux(),
 	}
 	if err := s.ensureSigningKey(ctx); err != nil {
 		t.Fatal(err)

@@ -60,16 +60,16 @@ func newControllerHarnessInDir(t *testing.T, dir, listenAddr string) *controller
 	}
 	srv := &Server{
 		cfg: Config{
-			ListenAddr: listenAddr,
-			DataDir:    dir,
-			DBPath:     dbPath,
+			ListenAddr:      listenAddr,
+			DataDir:         dir,
+			DBPath:          dbPath,
+			SessionLifetime: time.Hour,
 		},
-		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
-		store:    st,
-		sessions: auth.NewSessions(time.Hour),
-		limiter:  auth.NewLoginLimiter(),
-		hub:      nodehub.New(),
-		mux:      http.NewServeMux(),
+		log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:   st,
+		limiter: auth.NewLoginLimiter(),
+		hub:     nodehub.New(),
+		mux:     http.NewServeMux(),
 	}
 	if err := srv.ensureSigningKey(context.Background()); err != nil {
 		t.Fatal(err)

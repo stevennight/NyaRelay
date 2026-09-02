@@ -87,7 +87,6 @@ type Server struct {
 	cfg             Config
 	log             *slog.Logger
 	store           *store.Store
-	sessions        *auth.Sessions
 	limiter         *auth.LoginLimiter
 	nodeLimiter     *auth.LoginLimiter
 	hub             *nodehub.Hub
@@ -131,7 +130,6 @@ func Run(ctx context.Context, args []string) error {
 		cfg:             cfg,
 		log:             logging.New(cfg.LogLevel),
 		store:           st,
-		sessions:        auth.NewSessions(cfg.SessionLifetime),
 		limiter:         auth.NewLoginLimiter(),
 		nodeLimiter:     auth.NewLoginLimiter(),
 		hub:             nodehub.New(),
@@ -344,8 +342,12 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	}
 	s.limiter.Success(setupKey)
 	_ = s.store.AddAudit(r.Context(), user.Username, "setup.complete", "controller", map[string]string{"username": user.Username})
-	session, err := s.sessions.Create(user.ID, user.Username)
+	session, err := auth.NewSession(user.ID, user.Username, s.cfg.SessionLifetime)
 	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	if err := s.store.SaveSession(r.Context(), session); err != nil {
 		writeError(w, err, http.StatusInternalServerError)
 		return
 	}
@@ -405,8 +407,12 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	session, err := s.sessions.Create(user.ID, user.Username)
+	session, err := auth.NewSession(user.ID, user.Username, s.cfg.SessionLifetime)
 	if err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
+	if err := s.store.SaveSession(r.Context(), session); err != nil {
 		writeError(w, err, http.StatusInternalServerError)
 		return
 	}
@@ -467,7 +473,10 @@ func (s *Server) handleTOTPDisable(w http.ResponseWriter, r *http.Request, sessi
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, session auth.Session) {
-	s.sessions.Delete(session.ID)
+	if err := s.store.DeleteSession(r.Context(), session.ID); err != nil {
+		writeError(w, err, http.StatusInternalServerError)
+		return
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    "",
@@ -2529,7 +2538,11 @@ func (s *Server) withAuth(next func(http.ResponseWriter, *http.Request, auth.Ses
 			writeError(w, errors.New("authentication required"), http.StatusUnauthorized)
 			return
 		}
-		session, ok := s.sessions.Get(cookie.Value)
+		session, ok, err := s.store.Session(r.Context(), cookie.Value)
+		if err != nil {
+			writeError(w, err, http.StatusInternalServerError)
+			return
+		}
 		if !ok {
 			writeError(w, errors.New("authentication required"), http.StatusUnauthorized)
 			return
