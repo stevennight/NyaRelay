@@ -563,6 +563,11 @@ function ForwardEditor({
     queryKey: ['tunnels'],
     queryFn: () => api<TunnelInfo[]>('/api/tunnels'),
   })
+  const nodesQuery = useQuery({
+    queryKey: ['nodes'],
+    queryFn: () => api<NodeInfo[]>('/api/nodes'),
+  })
+  const nodeMap = useMemo(() => indexByID(nodesQuery.data ?? []), [nodesQuery.data])
   const tunnels = useMemo(() => {
     const all = tunnelsQuery.data ?? []
     if (!initialForward?.tunnel_id) {
@@ -657,6 +662,12 @@ function ForwardEditor({
     }
   }, [form.targets])
 
+  const entryNode = entryNodeForTunnel(tunnels.find((tunnel) => tunnel.id === form.tunnel_id), nodeMap)
+  const listenHint = entryNode?.port_min && entryNode?.port_max
+    ? `留空自动分配；也可以填写端口号，需在入口节点的可用端口范围 ${entryNode.port_min}-${entryNode.port_max} 内。`
+    : '留空自动分配；也可以填写一个端口号，需在入口节点的可用端口范围内。'
+  const listenPlaceholder = entryNode?.port_min ? String(entryNode.port_min) : '自动分配'
+
   return (
     <form
       className="form"
@@ -683,11 +694,11 @@ function ForwardEditor({
             {tunnels.map((tunnel) => <option key={tunnel.id} value={tunnel.id}>{tunnel.name}</option>)}
           </select>
         </Field>
-        <Field label="监听端口" hint="留空自动分配；填写 8443 即监听该端口。">
+        <Field label="监听端口" hint={listenHint}>
           <input
             value={form.listen}
             onChange={(event) => updateForm((current) => ({ ...current, listen: event.target.value }))}
-            placeholder="8443"
+            placeholder={listenPlaceholder}
           />
         </Field>
         <ToggleField
@@ -903,7 +914,14 @@ function formatStrategy(tcpStrategy?: string, udpStrategy?: string, legacyStrate
   const fallback = strategyValue(legacyStrategy)
   const tcp = strategyValue(tcpStrategy, fallback)
   const udp = strategyValue(udpStrategy, fallback)
-  return `TCP ${tcp} / UDP ${udp}`
+  return `TCP ${strategyLabel(tcp)} / UDP ${strategyLabel(udp)}`
+}
+
+function strategyLabel(strategy: SelectionStrategy): string {
+  if (strategy === 'failover') return '故障切换'
+  if (strategy === 'round_robin') return '轮询'
+  if (strategy === 'random') return '随机'
+  return '单候选'
 }
 
 function TargetDetails({ targets }: { targets: ForwardTargetInfo[] }) {
@@ -1010,10 +1028,14 @@ function entryHostForTunnel(tunnel?: TunnelInfo, nodes?: Map<string, NodeInfo>) 
   const explicitHost = tunnel?.entry_address?.trim()
   if (explicitHost) return explicitHost
 
-  const entryNodeID = tunnel?.stages.find((stage) => stage.role === 'entry')?.nodes[0]?.node_id
-  if (!entryNodeID) return ''
-  const entryNode = nodes?.get(entryNodeID)
+  const entryNode = entryNodeForTunnel(tunnel, nodes)
   return entryNode?.public_host || entryNode?.system?.ip || ''
+}
+
+function entryNodeForTunnel(tunnel?: TunnelInfo, nodes?: Map<string, NodeInfo>) {
+  const entryNodeID = tunnel?.stages.find((stage) => stage.role === 'entry')?.nodes[0]?.node_id
+  if (!entryNodeID) return undefined
+  return nodes?.get(entryNodeID)
 }
 
 function listenInputValue(listen: string) {

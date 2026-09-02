@@ -588,7 +588,7 @@ export function Subnav({
 export function formatTime(value?: string) {
   if (!value) return '-'
   const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return '-'
+  if (Number.isNaN(date.getTime()) || date.getUTCFullYear() <= 1) return '-'
   return date.toLocaleString()
 }
 

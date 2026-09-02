@@ -25,17 +25,14 @@ export function TrafficPage() {
     queryKey: ['traffic'],
     queryFn: () => api<TrafficSummary>('/api/traffic'),
   })
-  const objectQueryEnabled = Boolean(trafficQuery.data?.items.length)
   const forwardsQuery = useQuery({
     queryKey: ['forwards'],
     queryFn: () => api<ForwardInfo[]>('/api/forwards'),
-    enabled: objectQueryEnabled,
     staleTime: 60_000,
   })
   const tunnelsQuery = useQuery({
     queryKey: ['tunnels'],
     queryFn: () => api<TunnelInfo[]>('/api/tunnels'),
-    enabled: objectQueryEnabled,
     staleTime: 60_000,
   })
 
@@ -50,7 +47,9 @@ export function TrafficPage() {
     return result
   }, [forwardsQuery.data, tunnelsQuery.data])
   const filteredItems = useMemo(
-    () => items.filter((item) => kindFilter === 'all' || item.kind === kindFilter),
+    () => items
+      .filter((item) => kindFilter === 'all' || item.kind === kindFilter)
+      .sort((left, right) => (right.bytes_in + right.bytes_out) - (left.bytes_in + left.bytes_out)),
     [items, kindFilter],
   )
 
